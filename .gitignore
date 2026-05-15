@@ -1,0 +1,15 @@
+.env
+.DS_Store
+.codebuddy/
+.workbuddy/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+
+/frontend/node_modules/
+/frontend/dist/
+coverage/
+.vite/

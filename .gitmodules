@@ -1,0 +1,4 @@
+[submodule "third_party/references/QuantDinger"]
+	path = third_party/references/QuantDinger
+	url = https://github.com/brokermr810/QuantDinger.git
+
