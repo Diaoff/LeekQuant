@@ -121,6 +121,31 @@ def _filters_from_dict(filters: dict[str, Any]) -> StockFilters:
     )
 
 
+async def list_stocks_for_pool(session: AsyncSession, filters: StockFilters) -> list[dict[str, Any]]:
+    """Return all stocks matching filters, no pagination limit. Used for pool rebuilds."""
+    clauses, params = _stock_where(filters)
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+
+    result = await session.execute(
+        text(
+            f"""
+            SELECT s.ts_code, s.symbol, s.name, s.exchange, s.industry, s.is_st, s.is_delisted,
+                   f.pe_ttm, f.pb, f.market_cap, f.report_date
+            FROM stock_basic s
+            LEFT JOIN (
+                SELECT DISTINCT ON (ts_code) *
+                FROM stock_fundamentals
+                ORDER BY ts_code, report_date DESC
+            ) f ON f.ts_code = s.ts_code
+            {where_sql}
+            ORDER BY s.symbol
+            """
+        ),
+        params,
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
 async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 1, page_size: int = 50) -> dict[str, Any]:
     page = max(page, 1)
     page_size = min(max(page_size, 1), 200)
@@ -470,8 +495,7 @@ async def rebuild_pool(session: AsyncSession, pool_id: int, user_id: int = LOCAL
     if pool is None:
         return None
     filters = _filters_from_dict(pool["filters"] or {})
-    stock_result = await list_stocks(session, filters, page=1, page_size=2000)
-    items = stock_result["items"]
+    items = await list_stocks_for_pool(session, filters)
     await session.execute(text("DELETE FROM stock_pool_items WHERE pool_id = :pool_id"), {"pool_id": pool_id})
     if items:
         await session.execute(

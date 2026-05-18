@@ -10,7 +10,7 @@ celery_app = Celery(
     "leek_quant",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.data_tasks"],
+    include=["app.tasks.data_tasks", "app.backtest.tasks"],
 )
 celery_app.conf.update(
     task_track_started=True,

@@ -1,0 +1,288 @@
+import React from 'react'
+import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshCw, Server, Table2, CalendarDays } from 'lucide-react'
+import App, { fetchJson, formatDate, formatDateTime, formatNumber } from '../App'
+
+type HealthState = 'checking' | 'ok' | 'error'
+type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'fundamentals'
+
+interface EndpointHealth {
+  state: HealthState
+  message: string
+}
+
+interface TaskRun {
+  id: number
+  task_name: string
+  task_id: string | null
+  status: string
+  started_at: string
+  finished_at: string | null
+  duration_ms: number | null
+  error_message: string | null
+}
+
+interface AlertEvent {
+  id: number
+  level: string
+  category: string
+  title: string
+  message: string | null
+  created_at: string
+  is_resolved: boolean
+}
+
+interface DataStatus {
+  stock_basic_count: number
+  trade_calendar_count: number
+  latest_trade_calendar_date: string | null
+  daily_kline_count: number
+  latest_kline_trade_date: string | null
+  recent_tasks: TaskRun[]
+  recent_alerts: AlertEvent[]
+}
+
+const initialHealth: EndpointHealth = { state: 'checking', message: '检查中' }
+
+function statusClasses(state: HealthState): string {
+  if (state === 'ok') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
+  if (state === 'error') return 'border-red-200 bg-red-50 text-red-900'
+  return 'border-amber-200 bg-amber-50 text-amber-900'
+}
+
+function statusText(state: HealthState): string {
+  if (state === 'ok') return '正常'
+  if (state === 'error') return '异常'
+  return '检查中'
+}
+
+function taskStatusClasses(status: string): string {
+  if (status === 'success') return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+  if (status === 'failed') return 'border-red-200 bg-red-50 text-red-800'
+  if (status === 'running' || status === 'pending') return 'border-amber-200 bg-amber-50 text-amber-800'
+  return 'border-slate-200 bg-slate-50 text-slate-700'
+}
+
+function MetricCard({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail: string }) {
+  return (
+    <section className="rounded-lg border border-line bg-white p-4 shadow-sm">
+      <div className="flex items-center gap-2 text-sm font-medium text-slate-600">
+        {icon}
+        <span>{label}</span>
+      </div>
+      <p className="mt-3 text-2xl font-semibold tabular-nums text-ink">{value}</p>
+      <p className="mt-1 min-h-5 text-sm text-slate-600">{detail}</p>
+    </section>
+  )
+}
+
+function HealthPill({ icon, label, health }: { icon: React.ReactNode; label: string; health: EndpointHealth }) {
+  return (
+    <div className="flex min-h-24 items-start justify-between gap-3 rounded-lg border border-line bg-white p-4 shadow-sm">
+      <div className="flex min-w-0 gap-3">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-surface text-accent">
+          {icon}
+        </div>
+        <div className="min-w-0">
+          <p className="font-medium text-ink">{label}</p>
+          <p className="mt-1 break-words text-sm leading-6 text-slate-600">{health.message}</p>
+        </div>
+      </div>
+      <span className={`shrink-0 rounded-full border px-3 py-1 text-sm font-medium ${statusClasses(health.state)}`}>
+        {statusText(health.state)}
+      </span>
+    </div>
+  )
+}
+
+function ActionButton({
+  action,
+  activeAction,
+  icon,
+  label,
+  onClick,
+}: {
+  action: ActionKey
+  activeAction: ActionKey | null
+  icon: React.ReactNode
+  label: string
+  onClick: () => void
+}) {
+  const isActive = activeAction === action
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={activeAction !== null}
+      className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+    >
+      {isActive ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : icon}
+      {label}
+    </button>
+  )
+}
+
+export default function StatusPage() {
+  const [apiHealth, setApiHealth] = React.useState<EndpointHealth>(initialHealth)
+  const [dbHealth, setDbHealth] = React.useState<EndpointHealth>(initialHealth)
+  const [dataStatus, setDataStatus] = React.useState<DataStatus | null>(null)
+  const [lastCheckedAt, setLastCheckedAt] = React.useState<string>('尚未完成')
+  const [isRefreshing, setIsRefreshing] = React.useState(false)
+  const [activeAction, setActiveAction] = React.useState<ActionKey | null>(null)
+  const [notice, setNotice] = React.useState<string | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+
+  const refreshStatus = React.useCallback(async () => {
+    setIsRefreshing(true)
+    setApiHealth(initialHealth)
+    setDbHealth(initialHealth)
+    setError(null)
+    const [apiResult, dbResult, dataResult] = await Promise.allSettled([
+      fetchJson<{ status: string }>('/health'),
+      fetchJson<{ result: number }>('/api/health/db'),
+      fetchJson<DataStatus>('/api/data/status'),
+    ])
+    if (apiResult.status === 'fulfilled') setApiHealth({ state: 'ok', message: `服务状态：${apiResult.value.status}` })
+    else setApiHealth({ state: 'error', message: `无法连接后端：${apiResult.reason.message}` })
+    if (dbResult.status === 'fulfilled') setDbHealth({ state: 'ok', message: `数据库返回：${dbResult.value.result}` })
+    else setDbHealth({ state: 'error', message: `数据库检查失败：${dbResult.reason.message}` })
+    if (dataResult.status === 'fulfilled') setDataStatus(dataResult.value)
+    else setError(`数据状态加载失败：${dataResult.reason.message}`)
+    setLastCheckedAt(new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date()))
+    setIsRefreshing(false)
+  }, [])
+
+  const runAction = React.useCallback(async (action: ActionKey) => {
+    setActiveAction(action)
+    setNotice(null)
+    setError(null)
+    try {
+      if (action === 'stock-basic') {
+        const result = await fetchJson<{ inserted_or_updated: number; source: string }>('/api/data/sync/stock-basic', { method: 'POST' })
+        setNotice(`股票基础信息已同步：${formatNumber(result.inserted_or_updated)} 条，来源 ${result.source}`)
+      }
+      if (action === 'trade-calendar') {
+        const result = await fetchJson<{ inserted_or_updated: number; source: string }>('/api/data/sync/trade-calendar', { method: 'POST' })
+        setNotice(`交易日历已同步：${formatNumber(result.inserted_or_updated)} 条，来源 ${result.source}`)
+      }
+      if (action === 'sample-kline') {
+        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sample-kline', { method: 'POST', body: JSON.stringify({}) })
+        setNotice(`小样本 K 线任务已提交：${result.task_id}`)
+      }
+      if (action === 'fundamentals') {
+        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/fundamentals', { method: 'POST', body: JSON.stringify({}) })
+        setNotice(`基本面同步任务已提交：${result.task_id}`)
+      }
+      await refreshStatus()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setActiveAction(null)
+    }
+  }, [refreshStatus])
+
+  React.useEffect(() => {
+    void refreshStatus()
+  }, [refreshStatus])
+
+  const metrics = dataStatus ?? {
+    stock_basic_count: 0,
+    trade_calendar_count: 0,
+    latest_trade_calendar_date: null,
+    daily_kline_count: 0,
+    latest_kline_trade_date: null,
+    recent_tasks: [],
+    recent_alerts: [],
+  }
+
+  return (
+    <>
+      {(notice || error) && (
+        <section className={`rounded-lg border p-4 text-sm ${error ? 'border-red-200 bg-red-50 text-red-900' : 'border-emerald-200 bg-emerald-50 text-emerald-900'}`} role="status">
+          <div className="flex items-start gap-2">
+            {error ? <AlertTriangle className="mt-0.5 h-4 w-4" aria-hidden="true" /> : <CheckCircle2 className="mt-0.5 h-4 w-4" aria-hidden="true" />}
+            <span className="break-words">{error ?? notice}</span>
+          </div>
+        </section>
+      )}
+
+      <div className="flex flex-wrap gap-2">
+        <ActionButton action="stock-basic" activeAction={activeAction} icon={<Database className="h-4 w-4" aria-hidden="true" />} label="同步股票" onClick={() => void runAction('stock-basic')} />
+        <ActionButton action="trade-calendar" activeAction={activeAction} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
+        <ActionButton action="sample-kline" activeAction={activeAction} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
+        <ActionButton action="fundamentals" activeAction={activeAction} icon={<Table2 className="h-4 w-4" aria-hidden="true" />} label="同步基本面" onClick={() => void runAction('fundamentals')} />
+        <button
+          type="button"
+          onClick={() => void refreshStatus()}
+          disabled={isRefreshing || activeAction !== null}
+          className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-semibold text-ink transition hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
+          刷新
+        </button>
+      </div>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <HealthPill icon={<Server className="h-5 w-5" aria-hidden="true" />} label="后端 API" health={apiHealth} />
+        <HealthPill icon={<Database className="h-5 w-5" aria-hidden="true" />} label="PostgreSQL" health={dbHealth} />
+      </section>
+
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard icon={<Database className="h-4 w-4 text-accent" aria-hidden="true" />} label="股票基础表" value={formatNumber(metrics.stock_basic_count)} detail="stock_basic" />
+        <MetricCard icon={<CalendarDays className="h-4 w-4 text-mint" aria-hidden="true" />} label="交易日历" value={formatDate(metrics.latest_trade_calendar_date)} detail={`${formatNumber(metrics.trade_calendar_count)} 条记录`} />
+        <MetricCard icon={<Table2 className="h-4 w-4 text-warn" aria-hidden="true" />} label="日 K 行数" value={formatNumber(metrics.daily_kline_count)} detail={`最新交易日 ${formatDate(metrics.latest_kline_trade_date)}`} />
+        <MetricCard icon={<Clock3 className="h-4 w-4 text-slate-600" aria-hidden="true" />} label="最近检查" value={lastCheckedAt} detail="Leek Quant" />
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[1.4fr_1fr]">
+        <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+          <div className="flex items-center gap-2 border-b border-line px-4 py-3">
+            <Activity className="h-4 w-4 text-accent" aria-hidden="true" />
+            <h2 className="text-base font-semibold text-ink">最近数据任务</h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-line text-left text-sm">
+              <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
+                <tr><th className="px-4 py-3">任务</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">开始时间</th><th className="px-4 py-3">耗时</th></tr>
+              </thead>
+              <tbody className="divide-y divide-line">
+                {metrics.recent_tasks.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-slate-500">暂无任务记录</td></tr> : metrics.recent_tasks.map((task) => (
+                  <tr key={task.id}>
+                    <td className="max-w-64 px-4 py-3">
+                      <p className="font-medium text-ink">{task.task_name}</p>
+                      <p className="mt-1 break-all font-mono text-xs text-slate-500">{task.task_id ?? 'local'}</p>
+                      {task.error_message && <p className="mt-1 break-words text-xs text-red-700">{task.error_message}</p>}
+                    </td>
+                    <td className="px-4 py-3"><span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(task.status)}`}>{task.status}</span></td>
+                    <td className="whitespace-nowrap px-4 py-3 text-slate-700">{formatDateTime(task.started_at)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 tabular-nums text-slate-700">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+          <div className="flex items-center gap-2 border-b border-line px-4 py-3">
+            <AlertTriangle className="h-4 w-4 text-warn" aria-hidden="true" />
+            <h2 className="text-base font-semibold text-ink">最近告警</h2>
+          </div>
+          <div className="divide-y divide-line">
+            {metrics.recent_alerts.length === 0 ? <div className="px-4 py-8 text-center text-sm text-slate-500">暂无告警</div> : metrics.recent_alerts.map((alert) => (
+              <article key={alert.id} className="p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="font-medium text-ink">{alert.title}</p>
+                    <p className="mt-1 text-xs uppercase text-slate-500">{alert.category}</p>
+                  </div>
+                  <span className={`shrink-0 rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(alert.level === 'error' ? 'failed' : 'running')}`}>{alert.level}</span>
+                </div>
+                {alert.message && <p className="mt-2 break-words text-sm leading-6 text-slate-700">{alert.message}</p>}
+                <p className="mt-2 text-xs text-slate-500">{formatDateTime(alert.created_at)}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+      </section>
+    </>
+  )
+}
