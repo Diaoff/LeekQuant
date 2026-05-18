@@ -3,6 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.data import router as data_router
+from app.api.pools import router as pools_router
+from app.api.stocks import router as stocks_router
+from app.api.tasks import router as tasks_router
+from app.api.watchlist import router as watchlist_router
 from app.core.config import get_settings
 from app.db.session import get_session
 
@@ -23,6 +28,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(data_router)
+app.include_router(tasks_router)
+app.include_router(stocks_router)
+app.include_router(watchlist_router)
+app.include_router(pools_router)
 
 
 @app.get("/health", tags=["health"])
@@ -51,4 +62,3 @@ async def database_health(
         "database": "postgresql",
         "result": int(result.scalar_one()),
     }
-

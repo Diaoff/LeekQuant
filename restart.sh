@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="$ROOT_DIR/.logs"
+PID_DIR="$ROOT_DIR/.pids"
+
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+
+WITH_CELERY=0
+SKIP_BACKEND=0
+SKIP_FRONTEND=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./restart.sh [options]
+
+Options:
+  --with-celery      Also restart celery worker and beat.
+  --skip-backend     Do not start FastAPI.
+  --skip-frontend    Do not start Vite.
+  -h, --help         Show this help.
+
+Environment:
+  BACKEND_HOST       Backend bind host, default 127.0.0.1.
+  BACKEND_PORT       Backend port, default 8000.
+  FRONTEND_HOST      Frontend bind host, default 127.0.0.1.
+  FRONTEND_PORT      Frontend port, default 5173.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-celery)
+      WITH_CELERY=1
+      ;;
+    --skip-backend)
+      SKIP_BACKEND=1
+      ;;
+    --skip-frontend)
+      SKIP_FRONTEND=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+cd "$ROOT_DIR"
+mkdir -p "$LOG_DIR" "$PID_DIR"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
+
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+ALEMBIC_BIN="${ALEMBIC_BIN:-$ROOT_DIR/.venv/bin/alembic}"
+UVICORN_BIN="${UVICORN_BIN:-$ROOT_DIR/.venv/bin/uvicorn}"
+CELERY_BIN="${CELERY_BIN:-$ROOT_DIR/.venv/bin/celery}"
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_file() {
+  if [[ ! -x "$1" ]]; then
+    echo "Missing executable: $1" >&2
+    exit 1
+  fi
+}
+
+wait_http() {
+  local name="$1"
+  local url="$2"
+  local log_file="$3"
+  local attempts="${4:-30}"
+
+  for _ in $(seq 1 "$attempts"); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "$name is ready: $url"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "$name failed to become ready: $url" >&2
+  if [[ -f "$log_file" ]]; then
+    echo "Last $name log lines:" >&2
+    tail -80 "$log_file" >&2 || true
+  fi
+  exit 1
+}
+
+kill_pid_file() {
+  local name="$1"
+  local file="$PID_DIR/$name.pid"
+
+  if [[ -f "$file" ]]; then
+    local pid
+    pid="$(cat "$file")"
+    if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+      echo "Stopping $name pid=$pid"
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+    rm -f "$file"
+  fi
+}
+
+kill_port() {
+  local port="$1"
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local pids
+  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -z "$pids" ]]; then
+    return 0
+  fi
+
+  echo "Stopping process(es) listening on port $port: $pids"
+  for pid in $pids; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+
+  sleep 1
+  pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    echo "Force stopping process(es) on port $port: $pids"
+    for pid in $pids; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+start_backend() {
+  require_file "$ALEMBIC_BIN"
+  require_file "$UVICORN_BIN"
+
+  echo "Running Alembic migrations"
+  (
+    cd "$ROOT_DIR/backend"
+    "$ALEMBIC_BIN" upgrade head
+  )
+
+  echo "Starting backend on http://$BACKEND_HOST:$BACKEND_PORT"
+  (
+    cd "$ROOT_DIR/backend"
+    nohup "$UVICORN_BIN" app.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" \
+      >"$LOG_DIR/backend.log" 2>&1 &
+    echo "$!" > "$PID_DIR/backend.pid"
+  )
+}
+
+start_frontend() {
+  require_cmd npm
+
+  echo "Starting frontend on http://$FRONTEND_HOST:$FRONTEND_PORT"
+  (
+    cd "$ROOT_DIR/frontend"
+    export VITE_API_BASE_URL
+    nohup npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" \
+      >"$LOG_DIR/frontend.log" 2>&1 &
+    echo "$!" > "$PID_DIR/frontend.pid"
+  )
+}
+
+start_celery() {
+  require_file "$CELERY_BIN"
+
+  echo "Starting celery worker"
+  (
+    cd "$ROOT_DIR/backend"
+    nohup "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO \
+      >"$LOG_DIR/celery-worker.log" 2>&1 &
+    echo "$!" > "$PID_DIR/celery-worker.pid"
+  )
+
+  echo "Starting celery beat"
+  (
+    cd "$ROOT_DIR/backend"
+    nohup "$CELERY_BIN" -A app.tasks.celery_app:celery_app beat --loglevel=INFO \
+      >"$LOG_DIR/celery-beat.log" 2>&1 &
+    echo "$!" > "$PID_DIR/celery-beat.pid"
+  )
+}
+
+if [[ "$SKIP_BACKEND" -eq 0 ]]; then
+  kill_pid_file backend
+  kill_port "$BACKEND_PORT"
+fi
+
+if [[ "$SKIP_FRONTEND" -eq 0 ]]; then
+  kill_pid_file frontend
+  kill_port "$FRONTEND_PORT"
+fi
+
+if [[ "$WITH_CELERY" -eq 1 ]]; then
+  kill_pid_file celery-worker
+  kill_pid_file celery-beat
+fi
+
+if [[ "$SKIP_BACKEND" -eq 0 ]]; then
+  start_backend
+fi
+
+if [[ "$WITH_CELERY" -eq 1 ]]; then
+  start_celery
+fi
+
+if [[ "$SKIP_FRONTEND" -eq 0 ]]; then
+  start_frontend
+fi
+
+if [[ "$SKIP_BACKEND" -eq 0 ]]; then
+  wait_http "Backend" "http://$BACKEND_HOST:$BACKEND_PORT/health" "$LOG_DIR/backend.log"
+fi
+
+if [[ "$SKIP_FRONTEND" -eq 0 ]]; then
+  wait_http "Frontend" "http://$FRONTEND_HOST:$FRONTEND_PORT/" "$LOG_DIR/frontend.log"
+fi
+
+echo
+echo "Restart complete."
+if [[ "$SKIP_BACKEND" -eq 0 ]]; then
+  echo "Backend:  http://$BACKEND_HOST:$BACKEND_PORT"
+fi
+if [[ "$SKIP_FRONTEND" -eq 0 ]]; then
+  echo "Frontend: http://$FRONTEND_HOST:$FRONTEND_PORT"
+fi
+echo "Logs:     $LOG_DIR"

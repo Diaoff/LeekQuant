@@ -13,3 +13,6 @@ __pycache__/
 /frontend/dist/
 coverage/
 .vite/
+.logs/
+.pids/
+backend/celerybeat-schedule*

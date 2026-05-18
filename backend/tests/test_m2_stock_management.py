@@ -1,0 +1,291 @@
+from datetime import date
+from decimal import Decimal
+import importlib.util
+import json
+from unittest.mock import Mock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.data.models import StockFundamental
+from app.data.normalizers import normalize_stock_fundamental
+from app.data.repository import upsert_stock_fundamentals
+from app.data.stock_service import (
+    StockFilters,
+    add_watchlist_item,
+    create_pool,
+    delete_watchlist_item,
+    list_stocks,
+    rebuild_pool,
+    sync_fundamentals,
+    update_watchlist_item,
+)
+from app.db.session import get_session
+from app.main import app
+
+class FakeResult:
+    def __init__(self, rows=None, scalar=None, rowcount=1):
+        self._rows = rows or []
+        self._scalar = scalar
+        self.rowcount = rowcount
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def one(self):
+        return self._rows[0]
+
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+    def scalar_one(self):
+        return self._scalar if self._scalar is not None else self._rows[0]
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+
+class CaptureSession:
+    def __init__(self, results=None):
+        self.statements = []
+        self.params = []
+        self.commits = 0
+        self.results = list(results or [])
+
+    async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
+        self.params.append(params or {})
+        if self.results:
+            return self.results.pop(0)
+        return FakeResult([])
+
+    async def commit(self):
+        self.commits += 1
+
+    async def rollback(self):
+        return None
+
+
+def test_m2_migration_contains_stock_management_tables_and_local_user_seed() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "m2_migration",
+        "backend/alembic/versions/202605180001_m2_stock_management.py",
+    )
+    assert spec is not None and spec.loader is not None
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    sql = "\n".join(migration.UPGRADE_STATEMENTS)
+
+    assert "INSERT INTO users (id, username" in sql
+    assert "stock_fundamentals" in sql
+    assert "watchlist" in sql
+    assert "stock_pools" in sql
+    assert "stock_pool_items" in sql
+    assert "UNIQUE (user_id, group_name, ts_code)" in sql
+    assert "PRIMARY KEY (pool_id, ts_code)" in sql
+
+
+def test_normalize_stock_fundamental_maps_aliases_and_missing_fields() -> None:
+    record = normalize_stock_fundamental(
+        {
+            "code": "sh.600000",
+            "date": "2026-05-18",
+            "peTTM": "8.25",
+            "pbMRQ": "0.72",
+            "市销率-TTM": "",
+            "总市值": "123456.78",
+        },
+        "baostock",
+    )
+
+    assert record.ts_code == "600000.SH"
+    assert record.report_date == date(2026, 5, 18)
+    assert record.pe_ttm == Decimal("8.25")
+    assert record.pb == Decimal("0.72")
+    assert record.ps_ttm is None
+    assert record.market_cap == Decimal("123456.78")
+
+
+@pytest.mark.asyncio
+async def test_upsert_stock_fundamentals_is_idempotent_and_coalesces_nulls() -> None:
+    session = CaptureSession()
+
+    count = await upsert_stock_fundamentals(
+        session,
+        [
+            StockFundamental(
+                ts_code="000001.SZ",
+                report_date=date(2026, 5, 18),
+                pe_ttm=Decimal("9.1"),
+                income_statement={"营业收入": "1"},
+            )
+        ],
+    )
+
+    assert count == 1
+    assert session.params[0][0]["ts_code"] == "000001.SZ"
+    assert json.loads(session.params[0][0]["income_statement"]) == {"营业收入": "1"}
+    assert "ON CONFLICT (ts_code, report_date)" in session.statements[0]
+    assert "pe_ttm = COALESCE(EXCLUDED.pe_ttm, stock_fundamentals.pe_ttm)" in session.statements[0]
+
+
+@pytest.mark.asyncio
+async def test_list_stocks_filters_exclude_st_and_null_numeric_ranges() -> None:
+    session = CaptureSession(
+        [
+            FakeResult(scalar=1),
+            FakeResult(
+                [
+                    {
+                        "ts_code": "000001.SZ",
+                        "symbol": "000001",
+                        "name": "平安银行",
+                        "pe_ttm": Decimal("8.1"),
+                    }
+                ]
+            ),
+        ]
+    )
+
+    result = await list_stocks(
+        session,
+        StockFilters(exclude_st=True, industry="银行", pe_min=Decimal("0"), pe_max=Decimal("12")),
+    )
+
+    sql = "\n".join(session.statements)
+    assert result["total"] == 1
+    assert "s.is_st = FALSE" in sql
+    assert "s.industry = :industry" in sql
+    assert "f.pe_ttm IS NOT NULL" in sql
+    assert session.params[0]["pe_min"] == Decimal("0")
+    assert session.params[0]["pe_max"] == Decimal("12")
+
+
+@pytest.mark.asyncio
+async def test_watchlist_add_update_delete_flow() -> None:
+    session = CaptureSession(
+        [
+            FakeResult(scalar=1),
+            FakeResult([{"id": 3, "group_name": "价值", "ts_code": "000001.SZ", "note": "low pe", "sort_order": 2}]),
+            FakeResult([{"id": 3, "group_name": "银行", "ts_code": "000001.SZ", "note": "low pe", "sort_order": 1}]),
+            FakeResult(rowcount=1),
+        ]
+    )
+
+    added = await add_watchlist_item(session, ts_code="000001.SZ", group_name="价值", note="low pe", sort_order=2)
+    updated = await update_watchlist_item(session, 3, group_name="银行", sort_order=1)
+    deleted = await delete_watchlist_item(session, 3)
+
+    assert added["id"] == 3
+    assert updated["group_name"] == "银行"
+    assert deleted is True
+    assert "ON CONFLICT (user_id, group_name, ts_code)" in session.statements[1]
+    assert "group_name = :group_name" in session.statements[2]
+
+
+@pytest.mark.asyncio
+async def test_watchlist_rejects_unknown_ts_code() -> None:
+    session = CaptureSession([FakeResult(scalar=None)])
+
+    with pytest.raises(ValueError, match="unknown ts_code"):
+        await add_watchlist_item(session, ts_code="000001.SZ")
+
+
+@pytest.mark.asyncio
+async def test_pool_create_rebuild_and_replace_members() -> None:
+    session = CaptureSession(
+        [
+            FakeResult([{"id": 5, "name": "低估值", "filters": {"exclude_st": True}, "is_dynamic": True}]),
+            FakeResult([{"id": 5, "name": "低估值", "filters": {"exclude_st": True}, "is_dynamic": True}]),
+            FakeResult(scalar=2),
+            FakeResult([{"ts_code": "000001.SZ"}, {"ts_code": "600000.SH"}]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
+    )
+
+    created = await create_pool(session, name="低估值", description=None, filters={"exclude_st": True})
+    rebuilt = await rebuild_pool(session, 5)
+
+    assert created["id"] == 5
+    assert rebuilt == {"pool_id": 5, "item_count": 2}
+    assert any("DELETE FROM stock_pool_items" in statement for statement in session.statements)
+    assert any("INSERT INTO stock_pool_items" in statement for statement in session.statements)
+
+
+@pytest.mark.asyncio
+async def test_sync_fundamentals_allows_partial_failures(monkeypatch) -> None:
+    import app.data.stock_service as service
+
+    class Provider:
+        name = "baostock"
+
+        def fetch_stock_fundamentals(self, ts_codes, start_date, end_date):
+            if ts_codes == ["600000.SH"]:
+                raise RuntimeError("offline")
+            return [StockFundamental(ts_code=ts_codes[0], report_date=start_date, pe_ttm=Decimal("9"))]
+
+    calls = {"upsert": 0, "success": 0, "failure": 0, "alerts": 0}
+
+    async def fake_upsert(_session, records):
+        calls["upsert"] += len(records)
+        return len(records)
+
+    async def fake_success(*_args, **_kwargs):
+        calls["success"] += 1
+
+    async def fake_failure(*_args, **_kwargs):
+        calls["failure"] += 1
+
+    async def fake_alert(*_args, **_kwargs):
+        calls["alerts"] += 1
+
+    monkeypatch.setattr(service, "upsert_stock_fundamentals", fake_upsert)
+    monkeypatch.setattr(service, "record_update_success", fake_success)
+    monkeypatch.setattr(service, "record_update_failure", fake_failure)
+    monkeypatch.setattr(service, "create_alert", fake_alert)
+
+    result = await sync_fundamentals(
+        CaptureSession(),
+        ["000001.SZ", "600000.SH"],
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[Provider()],
+    )
+
+    assert result["inserted_or_updated"] == 1
+    assert result["failures"][0]["ts_code"] == "600000.SH"
+    assert calls == {"upsert": 1, "success": 1, "failure": 1, "alerts": 1}
+
+
+def test_fundamentals_task_writes_pending_task_run(monkeypatch) -> None:
+    from app.api import tasks as task_api
+
+    fake_session = CaptureSession([FakeResult([1])])
+
+    async def override_session():
+        yield fake_session
+
+    monkeypatch.setattr(task_api, "uuid4", lambda: type("FakeUUID", (), {"hex": "task-456"})())
+    apply_async = Mock()
+    monkeypatch.setattr(task_api.sync_fundamentals_task, "apply_async", apply_async)
+    app.dependency_overrides[get_session] = override_session
+
+    try:
+        client = TestClient(app)
+        response = client.post("/api/tasks/data/fundamentals", json={"ts_codes": ["000001.SZ"]})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"task_id": "task-456", "status": "pending"}
+    assert fake_session.params[0]["task_name"] == "sync_fundamentals"
+    apply_async.assert_called_once_with(
+        kwargs={"ts_codes": ["000001.SZ"], "start_date": None, "end_date": None},
+        task_id="task-456",
+    )

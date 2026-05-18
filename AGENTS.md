@@ -76,6 +76,24 @@ None configured yet. When adding tooling, follow QuantDinger conventions (see `t
 - `mcp_server/` — MCP protocol server (pyproject.toml deps: mcp>=1.2.0, httpx>=0.27.0)
 - `.github/workflows/` — basic-ci, docker-publish, update-frontend
 
+## Implementation guidance
+
+**功能实现可以先从 QuantDinger 寻找灵感。** 在开始任何功能模块的实现前：
+
+1. **先读 QuantDinger**：浏览 `third_party/references/QuantDinger/` 中对应模块的源码，搞清楚"他们是怎么做的"
+2. **再适配 Leek Quant**：根据本项目的架构约束（PostgreSQL 统一存储、纯A股、无云端）做裁剪和适配
+3. **避免重复造轮子**：数据模型、API 路由、Celery 任务、WebSocket 推送、模拟交易闭环等核心逻辑，QuantDinger 已有成熟实现可直接参考
+
+| 功能领域 | QuantDinger 参考路径 | 适配要点 |
+|---|---|---|
+| Docker Compose 全家桶 | `docker-compose.yml` | 移除非A股市场服务 |
+| FastAPI 路由与依赖注入 | `backend_api_python/` | 保持 PostgreSQL + Celery 架构 |
+| 前端组件结构 | `frontend/` | 复用 Vite + React + shadcn/ui 模式 |
+| MCP Server | `mcp_server/` | 按需裁剪工具集 |
+| Alembic 迁移 | `backend_api_python/alembic/` | 迁移文件可直接复用表结构逻辑 |
+
+> 核心原则：**参考不是复制**。目标是理解设计思路后，用 Leek Quant 的技术栈（PostgreSQL / FastAPI / Celery / React）重新实现，而不是直接 fork 或导入 QuantDinger 代码。
+
 ## Chinese-market data caveats
 
 - All data sources are free Chinese financial data APIs
