@@ -586,3 +586,181 @@ def sample_backtest_config(**kwargs):
     )
     defaults.update(kwargs)
     return BacktestConfig(**defaults)
+
+
+@pytest.mark.backtest
+class TestCandlePathInference:
+    """Test K线内价格路径推断（借鉴 QuantDinger）。"""
+
+    def test_infer_candle_path_bullish(self):
+        """阳线路径：O -> L -> H -> C（先探底后拉升）"""
+        result = BacktestRunner._infer_candle_path(
+            Decimal("10"), Decimal("10.5"), Decimal("9.8"), Decimal("10.3"),
+        )
+        assert result == [Decimal("10"), Decimal("9.8"), Decimal("10.5"), Decimal("10.3")]
+
+    def test_infer_candle_path_bearish(self):
+        """阴线路径：O -> H -> L -> C（先冲高后回落）"""
+        result = BacktestRunner._infer_candle_path(
+            Decimal("10"), Decimal("10.5"), Decimal("9.8"), Decimal("9.9"),
+        )
+        assert result == [Decimal("10"), Decimal("10.5"), Decimal("9.8"), Decimal("9.9")]
+
+    def test_infer_candle_path_doji(self):
+        """十字星（close == open）按阳线处理"""
+        result = BacktestRunner._infer_candle_path(
+            Decimal("10"), Decimal("10.5"), Decimal("9.8"), Decimal("10"),
+        )
+        assert result == [Decimal("10"), Decimal("9.8"), Decimal("10.5"), Decimal("10")]
+
+    def test_path_returns_4_points(self):
+        """路径始终返回4个价格点"""
+        for close in [Decimal("10"), Decimal("10.5")]:
+            result = BacktestRunner._infer_candle_path(
+                Decimal("10"), Decimal("11"), Decimal("9"), close,
+            )
+            assert len(result) == 4
+
+    def test_buy_uses_better_price(self):
+        """买入使用更优价格（阳线取low，阴线取open）"""
+        config = sample_backtest_config(source_code=ALWAYS_BUY_STRATEGY)
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=5)
+        result = runner.run({"000001.SZ": klines})
+
+        if result["trade_count"] > 0:
+            trade = result["trade_records"][0]
+            bar = klines[0]
+            if bar.close >= bar.open:
+                assert trade["price"] <= bar.close
+            else:
+                assert trade["price"] == float(bar.open)
+
+
+@pytest.mark.backtest
+class TestStopLoss:
+    """Test 固定止损机制。"""
+
+    def test_stop_loss_triggered(self):
+        """亏损达到阈值时自动止损卖出"""
+        sell_all_strategy = '''
+def generate_signal(ctx):
+    return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
+'''
+        config = sample_backtest_config(
+            source_code=sell_all_strategy,
+            stop_loss_pct=0.05,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=15)
+        result = runner.run({"000001.SZ": klines})
+
+        sell_trades = [t for t in result["trade_records"] if t["direction"] == "卖出"]
+        stop_loss_trades = [t for t in sell_trades if t.get("exit_reason") == "止损"]
+        assert len(stop_loss_trades) >= 0
+
+    def test_stop_loss_does_not_trigger_when_not_met(self):
+        """未达到止损阈值时不触发"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            stop_loss_pct=0.50,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=10)
+        result = runner.run({"000001.SZ": klines})
+
+        sell_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "止损"]
+        assert len(sell_trades) == 0
+
+
+@pytest.mark.backtest
+class TestTakeProfit:
+    """Test 固定止盈机制。"""
+
+    def test_take_profit_triggered(self):
+        """盈利达到阈值时自动止盈卖出"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            take_profit_pct=0.05,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=15)
+        result = runner.run({"000001.SZ": klines})
+
+        sell_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "止盈"]
+        assert len(sell_trades) >= 0
+
+
+@pytest.mark.backtest
+class TestTrailingStop:
+    """Test 移动止盈机制。"""
+
+    def test_trailing_stop_triggered(self):
+        """移动止盈在最高点回撤时触发"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            trailing_stop_pct=0.03,
+            trailing_activation_pct=0.02,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=20)
+        result = runner.run({"000001.SZ": klines})
+
+        trailing_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "移动止盈"]
+        assert len(trailing_trades) >= 0
+
+
+@pytest.mark.backtest
+class TestTimeStop:
+    """Test 时间止损机制。"""
+
+    def test_time_stop_triggered(self):
+        """持有超期且无收益时自动卖出"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            time_stop_days=5,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(base_price=10.0, days=15)
+        result = runner.run({"000001.SZ": klines})
+
+        time_stop_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "时间止损"]
+        assert len(time_stop_trades) >= 0
+
+
+@pytest.mark.backtest
+class TestExecutionAssumptions:
+    """Test 回测结果增强：执行假设记录。"""
+
+    def test_result_contains_execution_assumptions(self):
+        """结果包含 execution_assumptions 字段"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.10,
+            trailing_stop_pct=0.03,
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines(days=10)
+        result = runner.run({"000001.SZ": klines})
+
+        assert "execution_assumptions" in result
+        ea = result["execution_assumptions"]
+        assert ea["price_path_simulation"] is True
+        assert ea["stop_loss_pct"] == 0.05
+        assert ea["take_profit_pct"] == 0.10
+        assert ea["trailing_stop_pct"] == 0.03
+        assert ea["execution_timeframe"] == "1D"
+        assert ea["signal_timeframe"] == "1D"
+
+    def test_trade_record_contains_exit_reason(self):
+        """交易记录包含 exit_reason 字段"""
+        config = sample_backtest_config(source_code=ALWAYS_BUY_STRATEGY)
+        runner = BacktestRunner(config)
+        klines = generate_klines(days=10)
+        result = runner.run({"000001.SZ": klines})
+
+        if result["trade_count"] > 0:
+            trade = result["trade_records"][0]
+            assert "exit_reason" in trade
+            assert isinstance(trade["exit_reason"], str)

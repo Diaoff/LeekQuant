@@ -1,7 +1,15 @@
 import React from 'react'
-import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity } from 'lucide-react'
+import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2 } from 'lucide-react'
 import { createChart, ColorType, LineSeries, CandlestickSeries } from 'lightweight-charts'
 import { fetchJson, formatNumber, formatDateTime } from '../App'
+
+async function deleteBacktest(id: number) {
+  const response = await fetch(`${import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'}/api/backtests/${id}`, { method: 'DELETE' })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new Error(body?.detail ?? `${response.status} ${response.statusText}`)
+  }
+}
 
 interface BacktestResult {
   id: number
@@ -56,9 +64,11 @@ interface TradeRecord {
 export default function BacktestPage() {
   const [results, setResults] = React.useState<BacktestResult[]>([])
   const [selected, setSelected] = React.useState<BacktestResult | null>(null)
+  const [detailLoading, setDetailLoading] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const [deleting, setDeleting] = React.useState<number | null>(null)
 
   const loadResults = React.useCallback(async () => {
     setLoading(true)
@@ -73,8 +83,31 @@ export default function BacktestPage() {
     }
   }, [])
 
-  const openResult = (r: BacktestResult) => {
-    setSelected(r)
+  const handleDelete = async (r: BacktestResult) => {
+    if (!confirm('确认删除该回测结果？')) return
+    setDeleting(r.id)
+    try {
+      await deleteBacktest(r.id)
+      if (selected?.id === r.id) setSelected(null)
+      void loadResults()
+      setNotice('回测结果已删除')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setDeleting(null)
+    }
+  }
+
+  const openResult = async (r: BacktestResult) => {
+    setDetailLoading(true)
+    try {
+      const detail = await fetchJson<BacktestResult>(`/api/backtests/${r.id}`)
+      setSelected(detail)
+    } catch {
+      setSelected(r)
+    } finally {
+      setDetailLoading(false)
+    }
   }
 
   React.useEffect(() => { void loadResults() }, [loadResults])
@@ -114,10 +147,18 @@ export default function BacktestPage() {
                         <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>{r.status}</span>
                       </td>
                       <td className={`whitespace-nowrap px-4 py-3 tabular-nums font-medium ${String(totalReturn).startsWith('-') ? 'text-emerald-600' : totalReturn !== '—' ? 'text-red-600' : ''}`}>{totalReturn !== '—' ? `${totalReturn}%` : '—'}</td>
-                      <td className="px-4 py-3">
-                        {r.status === 'success' && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
-                        {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600" title={r.error_message}>失败</span>}
-                      </td>
+                       <td className="px-4 py-3 flex items-center gap-2">
+                         {r.status === 'success' && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
+                         {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600" title={r.error_message}>失败</span>}
+                         <button
+                           onClick={() => void handleDelete(r)}
+                           disabled={deleting === r.id}
+                           className="text-sm font-medium text-red-500 hover:underline disabled:opacity-40 disabled:cursor-not-allowed"
+                           title="删除回测结果"
+                         >
+                           {deleting === r.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                         </button>
+                       </td>
                     </tr>
                   )
                 })}
@@ -128,6 +169,12 @@ export default function BacktestPage() {
       )}
 
       {selected && <BacktestDetail result={selected} onBack={() => setSelected(null)} />}
+      {detailLoading && (
+        <section className="flex items-center justify-center rounded-lg border border-line bg-white p-12 shadow-sm">
+          <Loader2 className="mr-2 h-5 w-5 animate-spin text-accent" />
+          <span className="text-sm text-slate-600">加载回测详情…</span>
+        </section>
+      )}
     </>
   )
 }
@@ -353,13 +400,13 @@ function TradeRecordsTable({ trades }: { trades: TradeRecord[] }) {
                   ) : '—'}
                 </td>
                 <td className="whitespace-nowrap px-2 py-2 tabular-nums">
-                  {t.pnl != null ? (
-                    <span className={`font-semibold ${t.pnl > 0 ? 'text-red-600' : t.pnl < 0 ? 'text-emerald-600' : 'text-slate-500'}`}>
-                      {t.pnl > 0 ? '+' : ''}¥{formatNumber(Math.abs(t.pnl), 2)}
+                  {Math.abs(t.pnl ?? 0) > 0 ? (
+                    <span className={`font-semibold ${(t.pnl ?? 0) > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                      {(t.pnl ?? 0) > 0 ? '+' : ''}¥{formatNumber(Math.abs(t.pnl ?? 0), 2)}
                     </span>
                   ) : '—'}
                 </td>
-                <td className="hidden whitespace-nowrap px-2 py-2 tabular-nums sm:table-cell">{t.holding_days != null ? `${t.holding_days}天` : '—'}</td>
+                <td className="hidden whitespace-nowrap px-2 py-2 tabular-nums sm:table-cell">{(t.holding_days ?? 0) > 0 ? `${t.holding_days}天` : '—'}</td>
                 <td className="hidden whitespace-nowrap px-2 py-2 tabular-nums sm:table-cell">¥{formatNumber(t.total_fee, 2)}</td>
                 <td className="hidden whitespace-nowrap px-2 py-2 tabular-nums md:table-cell">{t.balance_after != null ? `¥${formatNumber(t.balance_after, 2)}` : '—'}</td>
               </tr>

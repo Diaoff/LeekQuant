@@ -82,7 +82,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                         SELECT ts_code FROM stock_basic
                         WHERE is_delisted = FALSE
                         ORDER BY symbol
-                        LIMIT 20
                         """
                     )
                 )
@@ -148,6 +147,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             else:
                 fee_cfg = FeeConfig()
 
+            risk_cfg = strategy_config.get("risk_config", {})
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -157,11 +157,50 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 initial_cash=Decimal(str(bt_row["initial_cash"])),
                 fee_config=fee_cfg,
                 benchmark_code=bt_row.get("benchmark_code"),
+                stop_loss_pct=float(risk_cfg.get("stop_loss_pct", 0.0)),
+                take_profit_pct=float(risk_cfg.get("take_profit_pct", 0.0)),
+                trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0.0)),
+                trailing_activation_pct=float(risk_cfg.get("trailing_activation_pct", 0.0)),
+                time_stop_days=int(risk_cfg.get("time_stop_days", 0)),
             )
 
             try:
-                runner = BacktestRunner(config)
-                results = runner.run(all_klines)
+                # Engine selection: Hikyuu preferred, Python fallback
+                use_hikyuu = False
+                try:
+                    from app.backtest.hikyuu_adapter import HikyuuBacktestAdapter, HIKYUU_AVAILABLE
+                    if HIKYUU_AVAILABLE:
+                        adapter = HikyuuBacktestAdapter(session)
+                        hikyuu_config = {
+                            "strategy_id": bt_row["strategy_id"],
+                            "source_code": bt_row["source_code"],
+                            "stock_pool": list(all_klines.keys()),
+                            "start_date": bt_row["start_date"],
+                            "end_date": bt_row["end_date"],
+                            "initial_cash": Decimal(str(bt_row["initial_cash"])),
+                            "fee_config": fee_cfg,
+                            "benchmark_code": bt_row.get("benchmark_code"),
+                        }
+                        results = adapter.run(hikyuu_config)
+                        use_hikyuu = True
+                except ImportError as e:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Hikyuu not available (%s), falling back to Python engine for backtest %s",
+                        e, backtest_id,
+                    )
+                    use_hikyuu = False
+
+                if not use_hikyuu:
+                    # Fallback to Python-native BacktestRunner
+                    runner = BacktestRunner(config)
+                    results = runner.run(all_klines)
+
+                # Tag result with engine identifier
+                engine = "hikyuu" if use_hikyuu else "python"
+                results["engine"] = engine
+                if "performance" in results and isinstance(results["performance"], dict):
+                    results["performance"]["engine"] = engine
             except Exception as exc:
                 import traceback
                 err_msg = f"{exc.__class__.__name__}: {exc}\n{traceback.format_exc()}"

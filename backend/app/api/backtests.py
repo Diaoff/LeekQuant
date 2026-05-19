@@ -226,6 +226,23 @@ async def get_backtest(
     return dict(row)
 
 
+@router.delete("/{backtest_id}")
+async def delete_backtest(
+    backtest_id: int,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    user_id = _extract_user_id(req)
+    result = await session.execute(
+        text("DELETE FROM backtest_results WHERE id = :id AND user_id = :user_id"),
+        {"id": backtest_id, "user_id": user_id},
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
+    await session.commit()
+    return {"status": "ok"}
+
+
 @router.get("/{backtest_id}/status")
 async def backtest_status(backtest_id: str) -> dict[str, Any]:
     async_result = AsyncResult(backtest_id, app=celery_app)

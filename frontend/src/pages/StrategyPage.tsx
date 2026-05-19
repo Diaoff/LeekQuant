@@ -3,8 +3,33 @@ import { AlertTriangle, Plus, Play, Save, Trash2, Loader2 } from 'lucide-react'
 import Editor, { loader } from '@monaco-editor/react'
 import * as monaco from 'monaco-editor'
 import { fetchJson, formatDateTime, formatNumber } from '../App'
+import { MYTT_FUNCTIONS, MYTT_CATEGORY_LABELS, createCompletionItem, createSignatureHelpProvider } from '../lib/mytt-completions'
 
 loader.config({ monaco })
+
+let myttProvidersRegistered = false
+
+function registerMyTTProviders() {
+  if (myttProvidersRegistered) return
+  myttProvidersRegistered = true
+
+  monaco.languages.registerCompletionItemProvider('python', {
+    triggerCharacters: ['.', ' ', '('],
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position)
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      }
+      const items = MYTT_FUNCTIONS.map((f) => createCompletionItem(monaco, f, range))
+      return { suggestions: items }
+    },
+  })
+
+  monaco.languages.registerSignatureHelpProvider('python', createSignatureHelpProvider(monaco))
+}
 
 interface Strategy {
   id: number
@@ -307,12 +332,16 @@ export default function StrategyPage() {
                   value={sourceCode}
                   onChange={(v) => setSourceCode(v ?? '')}
                   theme="vs-light"
+                  onMount={() => registerMyTTProviders()}
                   options={{
                     minimap: { enabled: false },
                     fontSize: 13,
                     lineNumbers: 'on',
                     scrollBeyondLastLine: false,
                     automaticLayout: true,
+                    quickSuggestions: true,
+                    parameterHints: { enabled: true },
+                    suggestOnTriggerCharacters: true,
                   }}
                 />
               </div>

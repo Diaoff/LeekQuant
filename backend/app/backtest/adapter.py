@@ -1,10 +1,10 @@
 """Python-native backtest engine.
 
 Reads K-line data from PostgreSQL, executes user strategy code with MyTT
-injected, and simulates daily trading using closing prices.
+injected, and simulates daily trading using candle-path price inference.
 
-This is the M3 first-pass engine. Hikyuu C++ kernel integration is a
-future enhancement.
+Supports stop-loss, take-profit, trailing stop, and time-based stop.
+Hikyuu C++ kernel integration is a future enhancement.
 """
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ class TradeRecord:
     balance_before: Decimal = Decimal("0")  # 交易前总资产
     balance_after: Decimal = Decimal("0")   # 交易后总资产
     holding_days: int = 0       # 持仓天数（仅卖出时有意义）
+    exit_reason: str = ""       # 卖出原因: "策略信号" / "止损" / "止盈" / "移动止盈" / "时间止损"
 
 
 @dataclass(slots=True)
@@ -75,6 +76,15 @@ class BacktestConfig:
     initial_cash: Decimal = Decimal("100000")
     fee_config: FeeConfig = field(default_factory=FeeConfig)
     benchmark_code: str | None = None
+
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
+    trailing_stop_pct: float = 0.0
+    trailing_activation_pct: float = 0.0
+    time_stop_days: int = 0
+
+    execution_timeframe: str = "1D"
+    signal_timeframe: str = "1D"
 
 
 class BacktestContext:
@@ -132,7 +142,44 @@ class BacktestRunner:
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[dict[str, Any]] = []
         self.signals: list[dict[str, Any]] = []
-        self._entry_dates: dict[str, date] = {}  # 记录每只股票的最近买入日期
+        self._entry_dates: dict[str, date] = {}
+        self._entry_prices: dict[str, Decimal] = {}
+        self._highest_since_entry: dict[str, Decimal] = {}
+        self._lowest_since_entry: dict[str, Decimal] = {}
+
+    @staticmethod
+    def _infer_candle_path(open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> list[Decimal]:
+        if close >= open_:
+            return [open_, low, high, close]
+        else:
+            return [open_, high, low, close]
+
+    def _check_exit_conditions(self, ts_code: str, price: Decimal, bar: KBar) -> str | None:
+        entry_price = self._entry_prices.get(ts_code)
+        if entry_price is None or entry_price <= 0:
+            return None
+        if self.config.stop_loss_pct > 0:
+            loss_pct = float((entry_price - price) / entry_price)
+            if loss_pct >= self.config.stop_loss_pct:
+                return "止损"
+        if self.config.take_profit_pct > 0:
+            profit_pct = float((price - entry_price) / entry_price)
+            if profit_pct >= self.config.take_profit_pct:
+                return "止盈"
+        if self.config.trailing_stop_pct > 0 and self.config.trailing_activation_pct > 0:
+            highest = self._highest_since_entry.get(ts_code, entry_price)
+            activated = float((highest - entry_price) / entry_price) >= self.config.trailing_activation_pct
+            if activated:
+                trail_pct = float((highest - price) / highest)
+                if trail_pct >= self.config.trailing_stop_pct:
+                    return "移动止盈"
+        if self.config.time_stop_days > 0:
+            entry_date = self._entry_dates.get(ts_code)
+            if entry_date is not None and (bar.trade_date - entry_date).days >= self.config.time_stop_days:
+                pnl_pct = float((price - entry_price) / entry_price)
+                if pnl_pct <= 0:
+                    return "时间止损"
+        return None
 
     def run(self, all_klines: dict[str, list[KBar]]) -> dict[str, Any]:
         """Run backtest for all stocks in the pool."""
@@ -157,6 +204,20 @@ class BacktestRunner:
 
                 bar = window[-1]
                 if bar.is_suspended:
+                    continue
+
+                price_path = self._infer_candle_path(bar.open, bar.high, bar.low, bar.close)
+
+                if ts_code in self.positions and self.positions[ts_code].shares > 0:
+                    cur_high = self._highest_since_entry.get(ts_code, bar.high)
+                    cur_low = self._lowest_since_entry.get(ts_code, bar.low)
+                    self._highest_since_entry[ts_code] = max(cur_high, bar.high)
+                    self._lowest_since_entry[ts_code] = min(cur_low, bar.low)
+
+                exit_reason = self._check_exit_conditions(ts_code, price_path[0], bar)
+                if exit_reason:
+                    exec_action = SignalOutput(action="SELL_ALL", target_position=0.0)
+                    self._execute_action(exec_action, ts_code, bar, total_asset, signal=None, exit_reason=exit_reason)
                     continue
 
                 ctx = BacktestContext(window, self.positions, total_asset)
@@ -244,6 +305,12 @@ class BacktestRunner:
         )
         return float(pos_value / total_asset)
 
+    def _book_asset(self) -> Decimal:
+        """Total asset using avg_cost (book value) for consistent position ratio."""
+        return self.cash + sum(
+            p.avg_cost * p.shares for p in self.positions.values() if p.shares > 0
+        )
+
     def _apply_rules(
         self,
         action: SignalOutput,
@@ -271,9 +338,16 @@ class BacktestRunner:
         bar: KBar,
         total_asset: Decimal,
         signal: dict | None = None,
+        exit_reason: str | None = None,
     ) -> None:
-        price = bar.close
+        price_path = self._infer_candle_path(bar.open, bar.high, bar.low, bar.close)
+
+        # 选择买入时更优的价格（阳线取low，阴线取open）
+        buy_price = price_path[1] if bar.close >= bar.open else price_path[0]
+        sell_price = price_path[2] if bar.close >= bar.open else price_path[1]
+
         if action.action == "BUY":
+            price = buy_price
             target_value = total_asset * Decimal(str(action.target_position))
             current_value = Decimal("0")
             pos = self.positions.get(ts_code)
@@ -296,6 +370,9 @@ class BacktestRunner:
                 cost = self.calculator.calculate("买入", price * volume)
                 total_cost = price * volume + cost.total_fee
 
+            balance_before = self._book_asset()
+            pos_ratio_before = self._position_ratio(balance_before) if balance_before > 0 else 0
+
             self.cash -= total_cost
             if ts_code not in self.positions:
                 self.positions[ts_code] = Position(ts_code=ts_code)
@@ -304,17 +381,14 @@ class BacktestRunner:
             pos.avg_cost = (pos.avg_cost * pos.shares + price * volume) / total_shares if total_shares > 0 else price
             pos.shares = total_shares
 
-            pos_ratio_before = self._position_ratio(total_asset)
-            balance_before = total_asset
-
-            pos_ratio_after = self._position_ratio(
-                self.cash + sum(p.avg_cost * p.shares for p in self.positions.values() if p.shares > 0)
-            )
-            balance_after = self.cash + sum(
-                pos.avg_cost * pos.shares for pos in self.positions.values() if pos.shares > 0
-            )
+            balance_after = self._book_asset()
+            pos_ratio_after = self._position_ratio(balance_after) if balance_after > 0 else 0
 
             self._entry_dates[ts_code] = bar.trade_date
+            self._entry_prices[ts_code] = price
+            self._highest_since_entry[ts_code] = bar.high
+            self._lowest_since_entry[ts_code] = bar.low
+            sig_reason = (signal.get("reason", "") if signal else "") or "信号触发: 买入"
 
             self.trades.append(TradeRecord(
                 ts_code=ts_code,
@@ -326,6 +400,7 @@ class BacktestRunner:
                 cost=cost,
                 signal_type="买入",
                 action="BUY",
+                signal_reason=sig_reason,
                 target_position=float(action.target_position),
                 position_before=pos_ratio_before,
                 position_after=pos_ratio_after,
@@ -333,9 +408,11 @@ class BacktestRunner:
                 balance_before=balance_before,
                 balance_after=balance_after,
                 holding_days=0,
+                exit_reason="",
             ))
 
         elif action.action in ("SELL_ALL", "SELL_PARTIAL"):
+            price = sell_price
             pos = self.positions.get(ts_code)
             if not pos or pos.shares <= 0:
                 return
@@ -356,28 +433,31 @@ class BacktestRunner:
 
             cost = self.calculator.calculate("卖出", price * volume)
             net_amount = price * volume - cost.total_fee
+
+            balance_before = self._book_asset()
+            pos_ratio_before = self._position_ratio(balance_before) if balance_before > 0 else 0
+
             self.cash += net_amount
             pos.shares -= volume
 
-            pos_ratio_before = self._position_ratio(total_asset)
-            balance_before = total_asset
-
             pnl = (price - pos.avg_cost) * volume - cost.total_fee
 
-            pos_ratio_after = self._position_ratio(
-                self.cash + sum(p.avg_cost * p.shares for p in self.positions.values() if p.shares > 0)
-            )
-            balance_after = self.cash + sum(
-                pos.avg_cost * pos.shares for pos in self.positions.values() if pos.shares > 0
-            )
+            balance_after = self._book_asset()
+            pos_ratio_after = self._position_ratio(balance_after) if balance_after > 0 else 0
 
             entry_date = self._entry_dates.get(ts_code, bar.trade_date)
             holding_days = (bar.trade_date - entry_date).days
 
-            if pos and pos.shares <= 0:
+            if pos.shares <= 0:
                 self._entry_dates.pop(ts_code, None)
+                self._entry_prices.pop(ts_code, None)
+                self._highest_since_entry.pop(ts_code, None)
+                self._lowest_since_entry.pop(ts_code, None)
 
-            direction = "全部卖出" if action.action == "SELL_ALL" else "部分卖出"
+            sig_reason = (signal.get("reason", "") if signal else "") or f"信号触发: {signal.get('signal_type', '卖出')}"
+            reason = exit_reason or "策略信号"
+            sig_type = signal.get("signal_type", "卖出") if signal else reason
+            direction = "卖出"
             self.trades.append(TradeRecord(
                 ts_code=ts_code,
                 trade_date=bar.trade_date,
@@ -386,8 +466,9 @@ class BacktestRunner:
                 volume=volume,
                 amount=price * volume,
                 cost=cost,
-                signal_type=signal.get("signal_type", "卖出") if signal else "卖出",
+                signal_type=sig_type,
                 action=action.action,
+                signal_reason=sig_reason,
                 target_position=float(action.target_position),
                 position_before=pos_ratio_before,
                 position_after=pos_ratio_after,
@@ -395,6 +476,7 @@ class BacktestRunner:
                 balance_before=balance_before,
                 balance_after=balance_after,
                 holding_days=holding_days,
+                exit_reason=reason,
             ))
 
             if pos.shares == 0:
@@ -512,8 +594,18 @@ class BacktestRunner:
                     "balance_before": float(t.balance_before),
                     "balance_after": float(t.balance_after),
                     "holding_days": t.holding_days,
+                    "exit_reason": t.exit_reason,
                 }
                 for t in self.trades
             ],
             "equity_curve": self.equity_curve,
+            "execution_assumptions": {
+                "execution_timeframe": self.config.execution_timeframe,
+                "signal_timeframe": self.config.signal_timeframe,
+                "price_path_simulation": True,
+                "stop_loss_pct": self.config.stop_loss_pct,
+                "take_profit_pct": self.config.take_profit_pct,
+                "trailing_stop_pct": self.config.trailing_stop_pct,
+                "time_stop_days": self.config.time_stop_days,
+            },
         }
