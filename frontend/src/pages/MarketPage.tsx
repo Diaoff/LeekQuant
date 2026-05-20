@@ -1,5 +1,5 @@
 import React from 'react'
-import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw } from 'lucide-react'
+import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw, Star } from 'lucide-react'
 import { fetchJson, formatMarketCap, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
@@ -40,6 +40,11 @@ interface StocksApiResponse {
 }
 
 type TabKey = 'basic' | 'daily'
+
+type RowActionStock = {
+  ts_code: string
+  name: string
+}
 
 type MarketFilterState = {
   market: string
@@ -158,6 +163,8 @@ export default function MarketPage() {
   const [loading, setLoading] = React.useState(true)
   const [dailyLoading, setDailyLoading] = React.useState(false)
   const [syncing, setSyncing] = React.useState(false)
+  const [addingWatchlistCode, setAddingWatchlistCode] = React.useState<string | null>(null)
+  const [syncingKlineCode, setSyncingKlineCode] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [query, setQuery] = React.useState('')
@@ -225,6 +232,46 @@ export default function MarketPage() {
     }
   }, [loadDaily])
 
+  const refreshActiveTab = React.useCallback(async () => {
+    if (tab === 'basic') await loadStocks()
+    else await loadDaily()
+  }, [loadDaily, loadStocks, tab])
+
+  const addToWatchlist = React.useCallback(async (stock: RowActionStock) => {
+    setAddingWatchlistCode(stock.ts_code)
+    setNotice(null)
+    setError(null)
+    try {
+      await fetchJson('/api/watchlist', {
+        method: 'POST',
+        body: JSON.stringify({ ts_code: stock.ts_code, group_name: '默认' }),
+      })
+      setNotice(`已添加 ${stock.ts_code} 到默认自选`)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setAddingWatchlistCode(null)
+    }
+  }, [])
+
+  const syncRowKline = React.useCallback(async (stock: RowActionStock) => {
+    setSyncingKlineCode(stock.ts_code)
+    setNotice(null)
+    setError(null)
+    try {
+      await fetchJson('/api/data/sync/kline', {
+        method: 'POST',
+        body: JSON.stringify({ ts_codes: [stock.ts_code] }),
+      })
+      setNotice(`${stock.ts_code} K线同步完成`)
+      await refreshActiveTab()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setSyncingKlineCode(null)
+    }
+  }, [refreshActiveTab])
+
   const handleDailySort = (key: keyof MarketStock) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
     else {
@@ -255,6 +302,35 @@ export default function MarketPage() {
   const resetFilters = () => {
     setFilters(DEFAULT_FILTERS)
     setDailyPage(1)
+  }
+
+  const renderRowActions = (stock: RowActionStock) => {
+    const adding = addingWatchlistCode === stock.ts_code
+    const rowSyncing = syncingKlineCode === stock.ts_code
+    return (
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={() => void addToWatchlist(stock)}
+          disabled={adding}
+          className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-line px-2.5 text-xs font-semibold text-ink transition hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-60"
+          title={`添加 ${stock.ts_code} 到默认自选`}
+        >
+          <Star className="h-3.5 w-3.5" />
+          {adding ? '添加中' : '加自选'}
+        </button>
+        <button
+          type="button"
+          onClick={() => void syncRowKline(stock)}
+          disabled={rowSyncing}
+          className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-accent px-2.5 text-xs font-semibold text-accent transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60"
+          title={`同步 ${stock.ts_code} K线`}
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${rowSyncing ? 'animate-spin' : ''}`} />
+          同步K线
+        </button>
+      </div>
+    )
   }
 
   React.useEffect(() => { void loadStocks() }, [loadStocks])
@@ -401,10 +477,10 @@ export default function MarketPage() {
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-line text-left text-sm">
                 <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th></tr>
+                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th><th className="px-4 py-3 text-right">操作</th></tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {loading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
+                  {loading ? (<tr><td colSpan={7} className="px-4 py-4"><Skeleton.Table rows={5} columns={7} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
                     <tr key={stock.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
@@ -412,6 +488,7 @@ export default function MarketPage() {
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.list_date ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.exchange ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{stock.latest_close ?? '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3">{renderRowActions(stock)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -448,10 +525,11 @@ export default function MarketPage() {
                         </div>
                       </th>
                     ))}
+                    <th className="px-4 py-3 text-right">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {dailyLoading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : sortedDaily.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : sortedDaily.map((row) => (
+                  {dailyLoading ? (<tr><td colSpan={7} className="px-4 py-4"><Skeleton.Table rows={5} columns={7} /></td></tr>) : sortedDaily.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : sortedDaily.map((row) => (
                     <tr key={row.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{row.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{row.name}</td>
@@ -459,6 +537,7 @@ export default function MarketPage() {
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pe_ttm ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pb ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.market_cap ? formatMarketCap(row.market_cap) : '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3">{renderRowActions(row)}</td>
                     </tr>
                   ))}
                 </tbody>
