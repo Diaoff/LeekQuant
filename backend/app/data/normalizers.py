@@ -66,6 +66,17 @@ def infer_exchange(symbol_or_code: str) -> str:
     return "SZSE"
 
 
+def infer_market(symbol_or_code: str) -> str:
+    code = symbol_or_code.split(".")[0]
+    if code.startswith(("688", "689")):
+        return "科创板"
+    if code.startswith(("30", "301")):
+        return "创业板"
+    if code.startswith(("4", "8")):
+        return "北交所"
+    return "主板"
+
+
 def normalize_ts_code(value: Any) -> str:
     text = str(value).strip().upper()
     if "." in text:
@@ -105,7 +116,7 @@ def normalize_stock_basic(row: Mapping[str, Any], source: str) -> StockBasic:
     ).strip()
     list_date = parse_date(first_value(row, "list_date", "上市日期", "ipo_date"))
     delist_date = parse_date(first_value(row, "delist_date", "退市日期"))
-    market = first_value(row, "market", "type", "板块")
+    market = first_value(row, "market", "type", "板块") or infer_market(ts_code)
     exchange = first_value(row, "exchange", "交易所") or infer_exchange(ts_code)
     is_delisted = delist_date is not None or truthy(first_value(row, "is_delisted", "退市", "delisted"))
 

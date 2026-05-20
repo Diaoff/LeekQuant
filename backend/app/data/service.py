@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback
 from app.data.repository import (
+    backfill_stock_basic_market,
     create_alert,
     record_update_failure,
     record_update_success,
@@ -17,27 +18,85 @@ from app.data.repository import (
 )
 from app.data.validators import validate_daily_kline, validate_stock_basic, validate_trade_calendar
 
+SAMPLE_STOCK_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sz_main", ("000", "001")),
+    ("sz_sme", ("002",)),
+    ("chinext", ("300", "301")),
+    ("sh_main", ("600", "601")),
+    ("sh_secondary", ("603", "605")),
+    ("star", ("688",)),
+)
+
 
 def default_kline_window(today: date | None = None) -> tuple[date, date]:
     end_date = today or datetime.now(tz=UTC).date()
     return end_date - timedelta(days=365), end_date
 
 
+def _row_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, dict):
+        return row.get(key)
+    try:
+        return row[key]
+    except (TypeError, KeyError):
+        try:
+            return row[index]
+        except IndexError:
+            return None
+
+
+def _sample_bucket(symbol: str) -> str:
+    for bucket, prefixes in SAMPLE_STOCK_BUCKETS:
+        if symbol.startswith(prefixes):
+            return bucket
+    return "other"
+
+
+def _balanced_sample_stock_codes(rows: list[Any], limit: int) -> list[str]:
+    limit = max(limit, 0)
+    if limit == 0:
+        return []
+
+    buckets: dict[str, list[tuple[str, str]]] = {bucket: [] for bucket, _ in SAMPLE_STOCK_BUCKETS}
+    buckets["other"] = []
+
+    for row in rows:
+        ts_code = str(_row_value(row, "ts_code", 0))
+        symbol = str(_row_value(row, "symbol", 1) or ts_code.split(".", 1)[0])
+        buckets[_sample_bucket(symbol)].append((ts_code, symbol))
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    bucket_order = [bucket for bucket, _ in SAMPLE_STOCK_BUCKETS] + ["other"]
+    max_bucket_size = max((len(buckets[bucket]) for bucket in bucket_order), default=0)
+    for index in range(max_bucket_size):
+        for bucket in bucket_order:
+            if index >= len(buckets[bucket]):
+                continue
+            ts_code, _symbol = buckets[bucket][index]
+            if ts_code in seen:
+                continue
+            selected.append(ts_code)
+            seen.add(ts_code)
+            if len(selected) >= limit:
+                return selected
+
+    return selected
+
+
 async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> list[str]:
     result = await session.execute(
         text(
             """
-            SELECT ts_code
+            SELECT ts_code, symbol
             FROM stock_basic
             WHERE is_delisted = FALSE
               AND symbol ~ '^[036][0-9]{5}$'
             ORDER BY symbol
-            LIMIT :limit
             """
         ),
-        {"limit": limit},
     )
-    return [row[0] for row in result.all()]
+    return _balanced_sample_stock_codes(result.all(), limit)
 
 
 async def get_data_status(session: AsyncSession) -> dict[str, Any]:
@@ -118,6 +177,7 @@ async def sync_stock_basic(
         raise ValueError(message)
 
     count = await upsert_stock_basic(session, valid_records)
+    await backfill_stock_basic_market(session)
     await record_update_success(session, "stock_basic", source)
     if invalid_records:
         await create_alert(

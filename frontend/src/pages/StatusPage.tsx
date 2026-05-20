@@ -1,6 +1,6 @@
 import React from 'react'
 import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshCw, Server, Table2, CalendarDays } from 'lucide-react'
-import App, { fetchJson, formatDate, formatDateTime, formatNumber } from '../App'
+import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 
 type HealthState = 'checking' | 'ok' | 'error'
 type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'fundamentals'
@@ -64,7 +64,7 @@ function taskStatusClasses(status: string): string {
 
 function MetricCard({ icon, label, value, detail }: { icon: React.ReactNode; label: string; value: string; detail: string }) {
   return (
-    <section className="rounded-lg border border-line bg-white p-4 shadow-sm">
+    <section className="rounded-lg border border-line bg-panel p-4 shadow-sm">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-600">
         {icon}
         <span>{label}</span>
@@ -77,7 +77,7 @@ function MetricCard({ icon, label, value, detail }: { icon: React.ReactNode; lab
 
 function HealthPill({ icon, label, health }: { icon: React.ReactNode; label: string; health: EndpointHealth }) {
   return (
-    <div className="flex min-h-24 items-start justify-between gap-3 rounded-lg border border-line bg-white p-4 shadow-sm">
+    <div className="flex min-h-24 items-start justify-between gap-3 rounded-lg border border-line bg-panel p-4 shadow-sm">
       <div className="flex min-w-0 gap-3">
         <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-surface text-accent">
           {icon}
@@ -195,7 +195,7 @@ export default function StatusPage() {
   }
 
   return (
-    <>
+    <div className="space-y-8">
       {(notice || error) && (
         <section className={`rounded-lg border p-4 text-sm ${error ? 'border-red-200 bg-red-50 text-red-900' : 'border-emerald-200 bg-emerald-50 text-emerald-900'}`} role="status">
           <div className="flex items-start gap-2">
@@ -205,7 +205,7 @@ export default function StatusPage() {
         </section>
       )}
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-3">
         <ActionButton action="stock-basic" activeAction={activeAction} icon={<Database className="h-4 w-4" aria-hidden="true" />} label="同步股票" onClick={() => void runAction('stock-basic')} />
         <ActionButton action="trade-calendar" activeAction={activeAction} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
         <ActionButton action="sample-kline" activeAction={activeAction} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
@@ -214,54 +214,54 @@ export default function StatusPage() {
           type="button"
           onClick={() => void refreshStatus()}
           disabled={isRefreshing || activeAction !== null}
-          className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-semibold text-ink transition hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-semibold text-ink transition hover:bg-surface focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
         >
           <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} aria-hidden="true" />
           刷新
         </button>
       </div>
 
-      <section className="grid gap-4 lg:grid-cols-2">
+      <section className="grid gap-6 lg:grid-cols-2">
         <HealthPill icon={<Server className="h-5 w-5" aria-hidden="true" />} label="后端 API" health={apiHealth} />
         <HealthPill icon={<Database className="h-5 w-5" aria-hidden="true" />} label="PostgreSQL" health={dbHealth} />
       </section>
 
-      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <section className="grid gap-6 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard icon={<Database className="h-4 w-4 text-accent" aria-hidden="true" />} label="股票基础表" value={formatNumber(metrics.stock_basic_count)} detail="stock_basic" />
         <MetricCard icon={<CalendarDays className="h-4 w-4 text-mint" aria-hidden="true" />} label="交易日历" value={formatDate(metrics.latest_trade_calendar_date)} detail={`${formatNumber(metrics.trade_calendar_count)} 条记录`} />
         <MetricCard icon={<Table2 className="h-4 w-4 text-warn" aria-hidden="true" />} label="日 K 行数" value={formatNumber(metrics.daily_kline_count)} detail={`最新交易日 ${formatDate(metrics.latest_kline_trade_date)}`} />
         <MetricCard icon={<Clock3 className="h-4 w-4 text-slate-600" aria-hidden="true" />} label="最近检查" value={lastCheckedAt} detail="Leek Quant" />
       </section>
 
-      <section className="grid gap-4 xl:grid-cols-[1.4fr_1fr]">
-        <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+      <section className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+        <section className="overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
           <div className="flex items-center gap-2 border-b border-line px-4 py-3">
             <Activity className="h-4 w-4 text-accent" aria-hidden="true" />
             <h2 className="text-base font-semibold text-ink">最近数据任务</h2>
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
-              <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
+              <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
                 <tr><th className="px-4 py-3">任务</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">开始时间</th><th className="px-4 py-3">耗时</th></tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {metrics.recent_tasks.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-slate-500">暂无任务记录</td></tr> : metrics.recent_tasks.map((task) => (
+                {metrics.recent_tasks.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-muted">暂无任务记录</td></tr> : metrics.recent_tasks.map((task) => (
                   <tr key={task.id}>
                     <td className="max-w-64 px-4 py-3">
                       <p className="font-medium text-ink">{task.task_name}</p>
-                      <p className="mt-1 break-all font-mono text-xs text-slate-500">{task.task_id ?? 'local'}</p>
+                      <p className="mt-1 break-all font-mono text-xs text-muted">{task.task_id ?? 'local'}</p>
                       {task.error_message && <p className="mt-1 break-words text-xs text-red-700">{task.error_message}</p>}
                     </td>
                     <td className="px-4 py-3"><span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(task.status)}`}>{task.status}</span></td>
-                    <td className="whitespace-nowrap px-4 py-3 text-slate-700">{formatDateTime(task.started_at)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 tabular-nums text-slate-700">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(task.started_at)}</td>
+                    <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
         </section>
-        <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+        <section className="overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
           <div className="flex items-center gap-2 border-b border-line px-4 py-3">
             <AlertTriangle className="h-4 w-4 text-warn" aria-hidden="true" />
             <h2 className="text-base font-semibold text-ink">最近告警</h2>
@@ -283,6 +283,6 @@ export default function StatusPage() {
           </div>
         </section>
       </section>
-    </>
+    </div>
   )
 }

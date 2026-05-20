@@ -1,6 +1,7 @@
 """Celery tasks for backtest execution."""
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -12,6 +13,137 @@ from app.backtest.adapter import BacktestConfig, BacktestRunner, KBar
 from app.backtest.cost import FeeConfig
 from app.db.session import async_session_factory
 from app.tasks.celery_app import celery_app
+
+RISK_CONFIG_FIELDS = (
+    "stop_loss_pct",
+    "take_profit_pct",
+    "trailing_stop_pct",
+    "trailing_activation_pct",
+    "time_stop_days",
+)
+
+MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
+
+
+def _decode_json_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _merge_backtest_config(strategy_config_value: Any, params_snapshot_value: Any) -> dict[str, Any]:
+    """Merge persistent strategy config with per-run backtest config.
+
+    Backtest submission stores per-run options in params_snapshot.config. Those
+    options must override strategy defaults because they come from the run modal.
+    """
+    strategy_config = _decode_json_dict(strategy_config_value)
+    params_snapshot = _decode_json_dict(params_snapshot_value)
+    runtime_config = _decode_json_dict(params_snapshot.get("config"))
+
+    merged = dict(strategy_config)
+    for key, value in runtime_config.items():
+        if key not in RISK_CONFIG_FIELDS and key != "risk_config":
+            merged[key] = value
+
+    risk_config = _decode_json_dict(strategy_config.get("risk_config"))
+    risk_config.update(_decode_json_dict(runtime_config.get("risk_config")))
+    for key in RISK_CONFIG_FIELDS:
+        value = runtime_config.get(key)
+        if value not in (None, ""):
+            risk_config[key] = value
+    if risk_config:
+        merged["risk_config"] = risk_config
+
+    return merged
+
+
+def _has_risk_controls(risk_config: dict[str, Any]) -> bool:
+    for key in RISK_CONFIG_FIELDS:
+        value = risk_config.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if float(value) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _stock_scope_diagnostics(stock_codes: list[str]) -> dict[str, Any]:
+    return {
+        "stock_count": len(stock_codes),
+    }
+
+
+def _target_from_snapshot(params_snapshot_value: Any) -> dict[str, Any]:
+    params_snapshot = _decode_json_dict(params_snapshot_value)
+    target = _decode_json_dict(params_snapshot.get("target"))
+    target_type = target.get("type") or params_snapshot.get("target_type") or "all"
+    target_value = target.get("value") or params_snapshot.get("target_value")
+    if target_type == "market" and target_value not in MARKET_TARGETS:
+        target_type = "all"
+        target_value = None
+    if target_type == "watchlist_group" and not target_value:
+        target_type = "all"
+    return {"type": target_type, "value": target_value}
+
+
+async def _resolve_stock_codes(session: AsyncSession, user_id: int, target: dict[str, Any]) -> list[str]:
+    target_type = target["type"]
+    target_value = target["value"]
+
+    if target_type == "market":
+        result = await session.execute(
+            text(
+                """
+                SELECT ts_code
+                FROM stock_basic
+                WHERE market = :market AND is_delisted = FALSE
+                ORDER BY symbol
+                """
+            ),
+            {"market": target_value},
+        )
+        return [r["ts_code"] for r in result.mappings().all()]
+
+    if target_type == "watchlist_group":
+        result = await session.execute(
+            text(
+                """
+                SELECT w.ts_code
+                FROM watchlist w
+                JOIN stock_basic s ON s.ts_code = w.ts_code
+                WHERE w.user_id = :user_id
+                  AND w.group_name = :group_name
+                  AND s.is_delisted = FALSE
+                ORDER BY w.sort_order, w.added_at
+                """
+            ),
+            {"user_id": user_id, "group_name": target_value},
+        )
+        return [r["ts_code"] for r in result.mappings().all()]
+
+    result = await session.execute(
+        text(
+            """
+            SELECT ts_code
+            FROM stock_basic
+            WHERE is_delisted = FALSE
+            ORDER BY symbol
+            """
+        )
+    )
+    return [r["ts_code"] for r in result.mappings().all()]
 
 
 def _parse_kline_rows(rows: list[dict[str, Any]]) -> list[KBar]:
@@ -45,13 +177,12 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             bt = await session.execute(
                 text(
                     """
-                    SELECT b.id, b.strategy_id, b.pool_id, b.start_date, b.end_date,
-                           b.initial_cash, b.benchmark_code,
+                    SELECT b.id, b.strategy_id, b.start_date, b.end_date,
+                           b.initial_cash, b.benchmark_code, b.params_snapshot,
                            s.source_code, s.name AS strategy_name, s.config,
-                           p.name AS pool_name
+                           s.user_id
                     FROM backtest_results b
                     JOIN strategies s ON s.id = b.strategy_id
-                    LEFT JOIN stock_pools p ON p.id = b.pool_id
                     WHERE b.id = :id
                     """
                 ),
@@ -67,35 +198,18 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             )
             await session.commit()
 
-            stock_codes = []
-            if bt_row["pool_id"]:
-                pool_result = await session.execute(
-                    text("SELECT ts_code FROM stock_pool_items WHERE pool_id = :pool_id"),
-                    {"pool_id": bt_row["pool_id"]},
-                )
-                stock_codes = [r["ts_code"] for r in pool_result.mappings().all()]
-
-            if not stock_codes:
-                default_result = await session.execute(
-                    text(
-                        """
-                        SELECT ts_code FROM stock_basic
-                        WHERE is_delisted = FALSE
-                        ORDER BY symbol
-                        """
-                    )
-                )
-                stock_codes = [r["ts_code"] for r in default_result.mappings().all()]
+            target = _target_from_snapshot(bt_row.get("params_snapshot"))
+            stock_codes = await _resolve_stock_codes(session, bt_row["user_id"], target)
 
             if not stock_codes:
                 await session.execute(
                     text(
                         "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
                     ),
-                    {"err": "no stocks available for backtest", "id": backtest_id},
+                    {"err": "no stocks available for selected target", "id": backtest_id},
                 )
                 await session.commit()
-                return {"error": "no stocks available"}
+                return {"error": "no stocks available for selected target"}
 
             all_klines: dict[str, list[KBar]] = {}
             for code in stock_codes:
@@ -131,10 +245,10 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no K-line data"}
 
-            strategy_config = bt_row.get("config") or {}
-            if isinstance(strategy_config, str):
-                import json
-                strategy_config = json.loads(strategy_config)
+            strategy_config = _merge_backtest_config(
+                bt_row.get("config"),
+                bt_row.get("params_snapshot"),
+            )
 
             fee_cfg_dict = strategy_config.get("fee_config", {})
             if fee_cfg_dict:
@@ -148,6 +262,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 fee_cfg = FeeConfig()
 
             risk_cfg = strategy_config.get("risk_config", {})
+            risk_controls_enabled = _has_risk_controls(risk_cfg)
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -169,7 +284,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 use_hikyuu = False
                 try:
                     from app.backtest.hikyuu_adapter import HikyuuBacktestAdapter, HIKYUU_AVAILABLE
-                    if HIKYUU_AVAILABLE:
+                    if HIKYUU_AVAILABLE and not risk_controls_enabled:
                         adapter = HikyuuBacktestAdapter(session)
                         hikyuu_config = {
                             "strategy_id": bt_row["strategy_id"],
@@ -201,6 +316,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 results["engine"] = engine
                 if "performance" in results and isinstance(results["performance"], dict):
                     results["performance"]["engine"] = engine
+                    results["performance"].update(_stock_scope_diagnostics(list(all_klines.keys())))
             except Exception as exc:
                 import traceback
                 err_msg = f"{exc.__class__.__name__}: {exc}\n{traceback.format_exc()}"
@@ -212,8 +328,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 )
                 await session.commit()
                 return {"error": err_msg}
-
-            import json
 
             await session.execute(
                 text(

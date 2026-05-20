@@ -5,7 +5,7 @@ import json
 import pytest
 
 from app.data.models import DailyKline, StockBasic
-from app.data.repository import upsert_daily_kline, upsert_stock_basic
+from app.data.repository import backfill_stock_basic_market, upsert_daily_kline, upsert_stock_basic
 
 pytestmark = pytest.mark.asyncio
 
@@ -31,6 +31,16 @@ async def test_upsert_stock_basic_does_not_require_raw_payload() -> None:
     assert count == 1
     assert session.params[0]["ts_code"] == "000001.SZ"
     assert "raw_payload" not in session.params[0]
+
+
+async def test_backfill_stock_basic_market_updates_empty_values() -> None:
+    session = CaptureSession()
+
+    count = await backfill_stock_basic_market(session)
+
+    assert count == 0
+    assert "UPDATE stock_basic" in str(session.statement)
+    assert "WHERE market IS NULL OR market = ''" in str(session.statement)
 
 
 async def test_upsert_daily_kline_serializes_raw_payload() -> None:

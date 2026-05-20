@@ -5,16 +5,59 @@
 :root {
   color-scheme: light;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f7f8fb;
+
+  --color-ink: #172033;
+  --color-surface: #f7f8fb;
+  --color-panel: #ffffff;
+  --color-line: #d9dee8;
+  --color-accent: #1967d2;
+  --color-mint: #0f8b6f;
+  --color-warn: #b26a00;
+  --color-bg: #f7f8fb;
+  --color-muted: #5f6f87;
+  --color-table-head: #f1f5f9;
+  --color-row-hover: #f8fafc;
+  --color-row-alt: #f8fafc;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-ink: #e8eaed;
+  --color-surface: #172033;
+  --color-panel: #172033;
+  --color-line: #2a3a52;
+  --color-accent: #5b9df5;
+  --color-mint: #34d399;
+  --color-warn: #f59e0b;
+  --color-bg: #0f1729;
+  --color-muted: #a8b3c7;
+  --color-table-head: #1f2a3d;
+  --color-row-hover: #223049;
+  --color-row-alt: #19243a;
 }
 
 body {
   margin: 0;
   min-width: 320px;
+  background-color: var(--color-bg);
+  color: var(--color-ink);
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 button {
   touch-action: manipulation;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton-shimmer {
+  background: linear-gradient(90deg, var(--color-line) 25%, var(--color-surface) 50%, var(--color-line) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -27,4 +70,3 @@ button {
     transition-duration: 0.01ms !important;
   }
 }
-

@@ -454,9 +454,12 @@ class BacktestRunner:
                 self._highest_since_entry.pop(ts_code, None)
                 self._lowest_since_entry.pop(ts_code, None)
 
-            sig_reason = (signal.get("reason", "") if signal else "") or f"信号触发: {signal.get('signal_type', '卖出')}"
             reason = exit_reason or "策略信号"
             sig_type = signal.get("signal_type", "卖出") if signal else reason
+            sig_reason = (
+                (signal.get("reason", "") if signal else "")
+                or (f"风险控制: {reason}" if exit_reason else f"信号触发: {sig_type}")
+            )
             direction = "卖出"
             self.trades.append(TradeRecord(
                 ts_code=ts_code,

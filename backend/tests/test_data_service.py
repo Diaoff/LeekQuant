@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from app.data.models import DailyKline, StockBasic
-from app.data.service import sync_kline, sync_stock_basic
+from app.data.service import select_sample_stock_codes, sync_kline, sync_stock_basic
 
 pytestmark = pytest.mark.asyncio
 
@@ -57,6 +57,14 @@ class FakeSession:
         self.commits += 1
 
 
+class StaticStockSession:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def execute(self, statement, params=None):
+        return FakeResult(self.rows)
+
+
 async def test_sync_kline_bootstraps_stock_basic_when_sample_is_empty(monkeypatch) -> None:
     import app.data.service as service
 
@@ -90,6 +98,49 @@ async def test_sync_kline_bootstraps_stock_basic_when_sample_is_empty(monkeypatc
     assert result["inserted_or_updated"] == 1
 
 
+async def test_select_sample_stock_codes_balances_across_code_segments() -> None:
+    rows = [
+        ("000001.SZ", "000001"),
+        ("000002.SZ", "000002"),
+        ("001200.SZ", "001200"),
+        ("001201.SZ", "001201"),
+        ("001202.SZ", "001202"),
+        ("002001.SZ", "002001"),
+        ("300001.SZ", "300001"),
+        ("301001.SZ", "301001"),
+        ("600000.SH", "600000"),
+        ("601001.SH", "601001"),
+        ("603000.SH", "603000"),
+        ("605001.SH", "605001"),
+        ("688001.SH", "688001"),
+    ]
+
+    codes = await select_sample_stock_codes(StaticStockSession(rows), limit=6)
+
+    assert codes == [
+        "000001.SZ",
+        "002001.SZ",
+        "300001.SZ",
+        "600000.SH",
+        "603000.SH",
+        "688001.SH",
+    ]
+
+
+async def test_select_sample_stock_codes_fills_when_segments_are_sparse() -> None:
+    rows = [
+        ("001200.SZ", "001200"),
+        ("001201.SZ", "001201"),
+        ("001202.SZ", "001202"),
+    ]
+
+    assert await select_sample_stock_codes(StaticStockSession(rows), limit=20) == [
+        "001200.SZ",
+        "001201.SZ",
+        "001202.SZ",
+    ]
+
+
 async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
     import app.data.service as service
 
@@ -108,6 +159,10 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
         calls["stock"] += len(records)
         return len(records)
 
+    async def fake_backfill_stock_basic_market(_session):
+        calls["backfill"] = calls.get("backfill", 0) + 1
+        return 0
+
     async def fake_record_update_success(*_args, **_kwargs):
         calls["success"] += 1
 
@@ -115,13 +170,14 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
         calls["alerts"] += 1
 
     monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
+    monkeypatch.setattr(service, "backfill_stock_basic_market", fake_backfill_stock_basic_market)
     monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     result = await sync_stock_basic(FakeSession(), providers=[MixedProvider()])
 
     assert result == {"source": "mixed", "inserted_or_updated": 1, "skipped": 1}
-    assert calls == {"stock": 1, "alerts": 1, "success": 1}
+    assert calls == {"stock": 1, "alerts": 1, "success": 1, "backfill": 1}
 
 
 async def test_sync_stock_basic_fails_when_all_rows_are_invalid(monkeypatch) -> None:

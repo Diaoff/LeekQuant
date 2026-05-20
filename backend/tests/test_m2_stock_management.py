@@ -13,10 +13,9 @@ from app.data.repository import upsert_stock_fundamentals
 from app.data.stock_service import (
     StockFilters,
     add_watchlist_item,
-    create_pool,
     delete_watchlist_item,
+    list_watchlist_groups,
     list_stocks,
-    rebuild_pool,
     sync_fundamentals,
     update_watchlist_item,
 )
@@ -166,6 +165,23 @@ async def test_list_stocks_filters_exclude_st_and_null_numeric_ranges() -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_stocks_filters_by_market_segments() -> None:
+    session = CaptureSession(
+        [
+            FakeResult(scalar=1),
+            FakeResult([{"ts_code": "300001.SZ", "symbol": "300001", "name": "测试股票"}]),
+        ]
+    )
+
+    await list_stocks(session, StockFilters(market=["创业板", "科创板"]))
+
+    sql = "\n".join(session.statements)
+    assert "s.market IN (:market_0, :market_1)" in sql
+    assert session.params[0]["market_0"] == "创业板"
+    assert session.params[0]["market_1"] == "科创板"
+
+
+@pytest.mark.asyncio
 async def test_watchlist_add_update_delete_flow() -> None:
     session = CaptureSession(
         [
@@ -188,34 +204,32 @@ async def test_watchlist_add_update_delete_flow() -> None:
 
 
 @pytest.mark.asyncio
+async def test_watchlist_group_summary_lists_group_counts() -> None:
+    session = CaptureSession(
+        [
+            FakeResult(
+                [
+                    {"group_name": "默认", "item_count": 2},
+                    {"group_name": "成长", "item_count": 1},
+                ]
+            )
+        ]
+    )
+
+    groups = await list_watchlist_groups(session)
+
+    assert groups == [
+        {"group_name": "默认", "item_count": 2},
+        {"group_name": "成长", "item_count": 1},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_watchlist_rejects_unknown_ts_code() -> None:
     session = CaptureSession([FakeResult(scalar=None)])
 
     with pytest.raises(ValueError, match="unknown ts_code"):
         await add_watchlist_item(session, ts_code="000001.SZ")
-
-
-@pytest.mark.asyncio
-async def test_pool_create_rebuild_and_replace_members() -> None:
-    session = CaptureSession(
-        [
-            FakeResult([{"id": 5, "name": "低估值", "filters": {"exclude_st": True}, "is_dynamic": True}]),
-            FakeResult([{"id": 5, "name": "低估值", "filters": {"exclude_st": True}, "is_dynamic": True}]),
-            FakeResult(scalar=2),
-            FakeResult([{"ts_code": "000001.SZ"}, {"ts_code": "600000.SH"}]),
-            FakeResult([]),
-            FakeResult([]),
-            FakeResult([]),
-        ]
-    )
-
-    created = await create_pool(session, name="低估值", description=None, filters={"exclude_st": True})
-    rebuilt = await rebuild_pool(session, 5)
-
-    assert created["id"] == 5
-    assert rebuilt == {"pool_id": 5, "item_count": 2}
-    assert any("DELETE FROM stock_pool_items" in statement for statement in session.statements)
-    assert any("INSERT INTO stock_pool_items" in statement for statement in session.statements)
 
 
 @pytest.mark.asyncio

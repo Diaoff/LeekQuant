@@ -49,6 +49,7 @@ def generate_klines(
     start_date: date | None = None,
     days: int = 15,
     base_price: float = 10.0,
+    price_increment: float = 0.1,
     is_suspended: bool = False,
     is_limit_up: bool = False,
     is_limit_down: bool = False,
@@ -70,7 +71,7 @@ def generate_klines(
 
     for i in range(days):
         trade_date = start + timedelta(days=i)
-        close = Decimal(str(base_price + i * 0.1))
+        close = Decimal(str(base_price + i * price_increment))
         klines.append(KBar(
             ts_code=ts_code,
             trade_date=trade_date,
@@ -101,6 +102,13 @@ def generate_signal(ctx):
 ALWAYS_BUY_STRATEGY = '''
 def generate_signal(ctx):
     return {"signal_type": "买入", "current_position": 0, "target_position": 0.8}
+'''
+
+BUY_ONCE_STRATEGY = '''
+def generate_signal(ctx):
+    if ctx.trade_date.day == 1:
+        return {"signal_type": "买入", "current_position": 0, "target_position": 0.8}
+    return {"signal_type": "观望", "current_position": ctx.current_position}
 '''
 
 DUAL_MA_STRATEGY = '''
@@ -652,12 +660,12 @@ def generate_signal(ctx):
             stop_loss_pct=0.05,
         )
         runner = BacktestRunner(config)
-        klines = generate_klines(base_price=10.0, days=15)
+        klines = generate_klines(base_price=10.0, price_increment=-0.2, days=15)
         result = runner.run({"000001.SZ": klines})
 
         sell_trades = [t for t in result["trade_records"] if t["direction"] == "卖出"]
         stop_loss_trades = [t for t in sell_trades if t.get("exit_reason") == "止损"]
-        assert len(stop_loss_trades) >= 0
+        assert len(stop_loss_trades) >= 1
 
     def test_stop_loss_does_not_trigger_when_not_met(self):
         """未达到止损阈值时不触发"""
@@ -680,7 +688,7 @@ class TestTakeProfit:
     def test_take_profit_triggered(self):
         """盈利达到阈值时自动止盈卖出"""
         config = sample_backtest_config(
-            source_code=ALWAYS_BUY_STRATEGY,
+            source_code=BUY_ONCE_STRATEGY,
             take_profit_pct=0.05,
         )
         runner = BacktestRunner(config)
@@ -688,7 +696,7 @@ class TestTakeProfit:
         result = runner.run({"000001.SZ": klines})
 
         sell_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "止盈"]
-        assert len(sell_trades) >= 0
+        assert len(sell_trades) >= 1
 
 
 @pytest.mark.backtest
@@ -698,8 +706,8 @@ class TestTrailingStop:
     def test_trailing_stop_triggered(self):
         """移动止盈在最高点回撤时触发"""
         config = sample_backtest_config(
-            source_code=ALWAYS_BUY_STRATEGY,
-            trailing_stop_pct=0.03,
+            source_code=BUY_ONCE_STRATEGY,
+            trailing_stop_pct=0.02,
             trailing_activation_pct=0.02,
         )
         runner = BacktestRunner(config)
@@ -707,7 +715,7 @@ class TestTrailingStop:
         result = runner.run({"000001.SZ": klines})
 
         trailing_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "移动止盈"]
-        assert len(trailing_trades) >= 0
+        assert len(trailing_trades) >= 1
 
 
 @pytest.mark.backtest
@@ -717,15 +725,15 @@ class TestTimeStop:
     def test_time_stop_triggered(self):
         """持有超期且无收益时自动卖出"""
         config = sample_backtest_config(
-            source_code=ALWAYS_BUY_STRATEGY,
+            source_code=BUY_ONCE_STRATEGY,
             time_stop_days=5,
         )
         runner = BacktestRunner(config)
-        klines = generate_klines(base_price=10.0, days=15)
+        klines = generate_klines(base_price=10.0, price_increment=-0.05, days=15)
         result = runner.run({"000001.SZ": klines})
 
         time_stop_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "时间止损"]
-        assert len(time_stop_trades) >= 0
+        assert len(time_stop_trades) >= 1
 
 
 @pytest.mark.backtest

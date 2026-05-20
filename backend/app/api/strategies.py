@@ -24,7 +24,6 @@ class StrategyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     source_code: str = Field(min_length=1)
     description: str | None = None
-    pool_id: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     status: str = "draft"
 
@@ -33,7 +32,6 @@ class StrategyUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = None
     source_code: str | None = None
-    pool_id: int | None = None
     config: dict[str, Any] | None = None
     status: str | None = None
 
@@ -67,7 +65,6 @@ async def create_strategy_endpoint(
         name=request.name,
         source_code=request.source_code,
         description=request.description,
-        pool_id=request.pool_id,
         config=request.config,
         status=request.status,
         user_id=LOCAL_USER_ID,
@@ -86,7 +83,6 @@ async def patch_strategy(
         name=request.name,
         description=request.description,
         source_code=request.source_code,
-        pool_id=request.pool_id,
         config=request.config,
         status=request.status,
         user_id=LOCAL_USER_ID,

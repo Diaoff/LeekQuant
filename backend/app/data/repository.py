@@ -46,6 +46,25 @@ async def upsert_stock_basic(session: AsyncSession, records: list[StockBasic]) -
     return len(records)
 
 
+async def backfill_stock_basic_market(session: AsyncSession) -> int:
+    result = await session.execute(
+        text(
+            """
+            UPDATE stock_basic
+            SET market = CASE
+                WHEN ts_code LIKE '688%%' OR ts_code LIKE '689%%' THEN '科创板'
+                WHEN ts_code LIKE '30%%' OR ts_code LIKE '301%%' THEN '创业板'
+                WHEN ts_code LIKE '4%%' OR ts_code LIKE '8%%' THEN '北交所'
+                ELSE '主板'
+            END,
+                updated_at = NOW()
+            WHERE market IS NULL OR market = ''
+            """
+        )
+    )
+    return getattr(result, "rowcount", 0) or 0
+
+
 async def upsert_trade_calendar(session: AsyncSession, records: list[TradeCalendarDay]) -> int:
     if not records:
         return 0

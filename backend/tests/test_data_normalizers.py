@@ -65,6 +65,29 @@ def test_normalize_stock_basic_maps_baostock_prefixed_code() -> None:
 
     assert record.ts_code == "600000.SH"
     assert record.symbol == "600000"
+    assert record.market == "主板"
+
+
+@pytest.mark.parametrize(
+    ("ts_code", "expected_market"),
+    [
+        ("600000.SH", "主板"),
+        ("300001.SZ", "创业板"),
+        ("688001.SH", "科创板"),
+        ("430001.BJ", "北交所"),
+        ("830001.BJ", "北交所"),
+    ],
+)
+def test_normalize_stock_basic_infers_market_from_ts_code(ts_code: str, expected_market: str) -> None:
+    record = normalize_stock_basic(
+        {
+            "ts_code": ts_code,
+            "name": "测试股票",
+        },
+        "adata",
+    )
+
+    assert record.market == expected_market
 
 
 def test_normalize_daily_kline_maps_akshare_fields() -> None:

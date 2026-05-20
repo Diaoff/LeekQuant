@@ -24,6 +24,7 @@ class StockListResponse(BaseModel):
 @router.get("", response_model=StockListResponse)
 async def stocks(
     query: str | None = None,
+    market: str | None = None,
     exchange: str | None = None,
     industry: str | None = None,
     exclude_st: bool = False,
@@ -40,6 +41,7 @@ async def stocks(
 ) -> dict[str, Any]:
     filters = StockFilters(
         query=query,
+        market=market,
         exchange=exchange,
         industry=industry,
         exclude_st=exclude_st,
@@ -64,3 +66,26 @@ async def stock_klines(
     if start_date and end_date and start_date > end_date:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_date must be before end_date")
     return {"items": await get_klines(session, ts_code, start_date, end_date)}
+
+
+@router.get("/{ts_code}/kline")
+async def stock_kline(
+    ts_code: str,
+    start_date: date = Query(...),
+    end_date: date = Query(...),
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    if start_date > end_date:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="start_date must be before end_date")
+    items = await get_klines(session, ts_code, start_date, end_date)
+    return [
+        {
+            "date": str(item["trade_date"]),
+            "open": float(item["open"]),
+            "high": float(item["high"]),
+            "low": float(item["low"]),
+            "close": float(item["close"]),
+            "volume": int(item["volume"]),
+        }
+        for item in items
+    ]

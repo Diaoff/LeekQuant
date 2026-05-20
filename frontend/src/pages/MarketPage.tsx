@@ -1,6 +1,7 @@
 import React from 'react'
 import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown } from 'lucide-react'
-import { fetchJson, formatMarketCap, formatNumber } from '../App'
+import { fetchJson, formatMarketCap, formatNumber } from '../lib/utils'
+import Skeleton from '../components/Skeleton'
 
 interface StockBasic {
   ts_code: string
@@ -156,18 +157,18 @@ export default function MarketPage() {
         </section>
       )}
 
-      <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+      <section className="overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
         <div className="flex items-center gap-3 border-b border-line px-4 py-3">
           <div className="flex rounded-md border border-line p-0.5">
             <button
               onClick={() => setTab('basic')}
-              className={`rounded-sm px-3 py-1.5 text-sm font-medium transition ${tab === 'basic' ? 'bg-surface text-ink' : 'text-slate-500 hover:text-ink'}`}
+              className={`rounded-sm px-3 py-1.5 text-sm font-medium transition ${tab === 'basic' ? 'bg-surface text-ink' : 'text-muted hover:text-ink'}`}
             >
               股票列表
             </button>
             <button
               onClick={() => setTab('daily')}
-              className={`rounded-sm px-3 py-1.5 text-sm font-medium transition ${tab === 'daily' ? 'bg-surface text-ink' : 'text-slate-500 hover:text-ink'}`}
+              className={`rounded-sm px-3 py-1.5 text-sm font-medium transition ${tab === 'daily' ? 'bg-surface text-ink' : 'text-muted hover:text-ink'}`}
             >
               最新行情
             </button>
@@ -176,7 +177,7 @@ export default function MarketPage() {
             value={tab === 'basic' ? query : dailyQuery}
             onChange={(e) => (tab === 'basic' ? setQuery(e.target.value) : setDailyQuery(e.target.value))}
             placeholder="输入代码或名称"
-            className="ml-auto h-9 rounded-md border border-line bg-white px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+            className="ml-auto h-9 rounded-md border border-line bg-panel px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
           />
           {tab === 'daily' && (
             <button
@@ -195,24 +196,24 @@ export default function MarketPage() {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-line text-left text-sm">
-                <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
+                <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
                   <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th></tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {loading ? <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-500">加载中</td></tr> : filteredStocks.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-500">暂无数据</td></tr> : filteredStocks.map((stock) => (
-                    <tr key={stock.ts_code} className="hover:bg-slate-50/60">
+                  {loading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : filteredStocks.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : filteredStocks.map((stock) => (
+                    <tr key={stock.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-slate-700">{stock.industry ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-slate-700">{stock.list_date ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-slate-700">{stock.exchange ?? '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.industry ?? '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.list_date ?? '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.exchange ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{stock.latest_close ?? '—'}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-line px-4 py-3 text-sm text-slate-500">
+            <div className="border-t border-line px-4 py-3 text-sm text-muted">
               共 {formatNumber(totalStocks)} 只股票，当前展示 {formatNumber(filteredStocks.length)} 条
             </div>
           </>
@@ -222,7 +223,7 @@ export default function MarketPage() {
           <>
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-line text-left text-sm">
-                <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
+                <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
                   <tr>
                     {[
                       ['ts_code', '代码'],
@@ -234,7 +235,7 @@ export default function MarketPage() {
                     ].map(([key, label]) => (
                       <th
                         key={key}
-                        className="cursor-pointer select-none px-4 py-3 hover:bg-slate-100"
+                        className="cursor-pointer select-none px-4 py-3 hover:bg-rowHover"
                         onClick={() => handleDailySort(key as keyof MarketStock)}
                       >
                         <div className="flex items-center gap-1">
@@ -246,8 +247,8 @@ export default function MarketPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {dailyLoading ? <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-500">加载中</td></tr> : filteredDaily.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-slate-500">暂无数据，请先同步 K 线</td></tr> : filteredDaily.map((row) => (
-                    <tr key={row.ts_code} className="hover:bg-slate-50/60">
+                  {dailyLoading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : filteredDaily.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : filteredDaily.map((row) => (
+                    <tr key={row.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{row.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{row.name}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.latest_close ?? '—'}</td>
@@ -260,7 +261,7 @@ export default function MarketPage() {
               </table>
             </div>
             <div className="flex items-center justify-between border-t border-line px-4 py-3">
-              <span className="text-sm text-slate-500">
+              <span className="text-sm text-muted">
                 共 {formatNumber(dailyTotal)} 只，当前展示 {formatNumber(filteredDaily.length)} 行
               </span>
               <div className="flex items-center gap-2">

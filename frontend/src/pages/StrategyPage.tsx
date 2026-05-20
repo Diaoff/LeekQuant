@@ -2,8 +2,9 @@ import React from 'react'
 import { AlertTriangle, Plus, Play, Save, Trash2, Loader2 } from 'lucide-react'
 import Editor, { loader } from '@monaco-editor/react'
 import * as monaco from 'monaco-editor'
-import { fetchJson, formatDateTime, formatNumber } from '../App'
+import { fetchJson, formatDateTime, formatNumber } from '../lib/utils'
 import { MYTT_FUNCTIONS, MYTT_CATEGORY_LABELS, createCompletionItem, createSignatureHelpProvider } from '../lib/mytt-completions'
+import Skeleton from '../components/Skeleton'
 
 loader.config({ monaco })
 
@@ -35,8 +36,6 @@ interface Strategy {
   id: number
   name: string
   description: string | null
-  pool_id: number | null
-  pool_name: string | null
   status: string
   created_at: string
   updated_at: string
@@ -46,8 +45,6 @@ interface StrategyDetail {
   id: number
   name: string
   description: string | null
-  pool_id: number | null
-  pool_name: string | null
   status: string
   source_code: string
   created_at: string
@@ -64,9 +61,10 @@ interface BacktestSubmitResponse {
 interface BacktestListResult {
   id: number
   strategy_id: number
-  pool_id: number | null
-  pool_name: string | null
   strategy_name: string | null
+  target_type?: 'all' | 'market' | 'watchlist_group'
+  target_value?: string | null
+  target_label?: string | null
   start_date: string
   end_date: string
   initial_cash: string
@@ -85,13 +83,24 @@ interface BacktestListResult {
   finished_at: string | null
 }
 
-interface Pool {
-  id: number
-  name: string
-  description: string | null
-  is_dynamic: boolean
+interface BacktestParams {
+  start_date: string
+  end_date: string
+  initial_cash: number
+  target_type: 'all' | 'market' | 'watchlist_group'
+  target_value: string
+  stop_loss_pct: string
+  take_profit_pct: string
+  trailing_stop_pct: string
+  time_stop_days: string
+}
+
+interface WatchlistGroupOption {
+  group_name: string
   item_count: number
 }
+
+const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所'] as const
 
 type ViewKey = 'list' | 'edit'
 
@@ -123,7 +132,6 @@ def generate_signal(ctx):
 export default function StrategyPage() {
   const [view, setView] = React.useState<ViewKey>('list')
   const [strategies, setStrategies] = React.useState<Strategy[]>([])
-  const [pools, setPools] = React.useState<Pool[]>([])
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [notice, setNotice] = React.useState<string | null>(null)
@@ -132,9 +140,22 @@ export default function StrategyPage() {
   const [name, setName] = React.useState('')
   const [description, setDescription] = React.useState('')
   const [sourceCode, setSourceCode] = React.useState(DEFAULT_CODE)
-  const [selectedPoolId, setSelectedPoolId] = React.useState<number | null>(null)
+  const [watchlistGroups, setWatchlistGroups] = React.useState<WatchlistGroupOption[]>([])
   const [runHistory, setRunHistory] = React.useState<BacktestListResult[]>([])
   const [loadingRuns, setLoadingRuns] = React.useState(false)
+  const [showBacktestModal, setShowBacktestModal] = React.useState(false)
+  const [targetStrategy, setTargetStrategy] = React.useState<Strategy | null>(null)
+  const [backtestParams, setBacktestParams] = React.useState<BacktestParams>({
+    start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
+    end_date: new Date().toISOString().split('T')[0],
+    initial_cash: 100000,
+    target_type: 'all',
+    target_value: '',
+    stop_loss_pct: '',
+    take_profit_pct: '',
+    trailing_stop_pct: '',
+    time_stop_days: '',
+  })
 
   const loadStrategies = React.useCallback(async () => {
     setLoading(true)
@@ -149,12 +170,12 @@ export default function StrategyPage() {
     }
   }, [])
 
-  const loadPools = React.useCallback(async () => {
+  const loadWatchlistGroups = React.useCallback(async () => {
     try {
-      const data = await fetchJson<Pool[]>('/api/pools')
-      setPools(data)
+      const data = await fetchJson<WatchlistGroupOption[]>('/api/watchlist/groups')
+      setWatchlistGroups(data)
     } catch {
-      setPools([])
+      setWatchlistGroups([])
     }
   }, [])
 
@@ -163,7 +184,6 @@ export default function StrategyPage() {
     setName('')
     setDescription('')
     setSourceCode(DEFAULT_CODE)
-    setSelectedPoolId(null)
     setView('edit')
   }
 
@@ -174,7 +194,6 @@ export default function StrategyPage() {
       setName(detail.name)
       setDescription(detail.description ?? '')
       setSourceCode(detail.source_code)
-      setSelectedPoolId(detail.pool_id)
       setView('edit')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -186,7 +205,7 @@ export default function StrategyPage() {
     setSaving(true)
     setError(null)
     try {
-      const body = { name: name.trim(), description: description.trim() || null, source_code: sourceCode, pool_id: selectedPoolId }
+      const body = { name: name.trim(), description: description.trim() || null, source_code: sourceCode }
       if (editing) {
         await fetchJson(`/api/strategies/${editing.id}`, { method: 'PATCH', body: JSON.stringify(body) })
         setNotice('策略已更新')
@@ -216,16 +235,54 @@ export default function StrategyPage() {
   }
 
   const runBacktest = async (strategy: Strategy) => {
+    setTargetStrategy(strategy)
+    setBacktestParams({
+      start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
+      end_date: new Date().toISOString().split('T')[0],
+      initial_cash: 100000,
+      target_type: 'all',
+      target_value: '',
+      stop_loss_pct: '',
+      take_profit_pct: '',
+      trailing_stop_pct: '',
+      time_stop_days: '',
+    })
+    setShowBacktestModal(true)
+  }
+
+  const confirmBacktest = async () => {
+    if (!targetStrategy) return
     setError(null)
     setNotice(null)
     try {
-      const result = await fetchJson<BacktestSubmitResponse>(`/api/backtests/${strategy.id}/run`, { method: 'POST' })
-      setNotice(`回测任务已提交: ${result.backtest_id}`)
+      const config: Record<string, unknown> = {}
+      if (backtestParams.stop_loss_pct) config.stop_loss_pct = parseFloat(backtestParams.stop_loss_pct) / 100
+      if (backtestParams.take_profit_pct) config.take_profit_pct = parseFloat(backtestParams.take_profit_pct) / 100
+      if (backtestParams.trailing_stop_pct) config.trailing_stop_pct = parseFloat(backtestParams.trailing_stop_pct) / 100
+      if (backtestParams.time_stop_days) config.time_stop_days = parseInt(backtestParams.time_stop_days, 10)
+      const body = {
+        strategy_id: targetStrategy.id,
+        start_date: backtestParams.start_date,
+        end_date: backtestParams.end_date,
+        initial_cash: backtestParams.initial_cash,
+        config: Object.keys(config).length > 0 ? config : undefined,
+        target_type: backtestParams.target_type,
+        target_value: backtestParams.target_type === 'all' ? null : backtestParams.target_value,
+      }
+      await fetchJson('/api/backtests', { method: 'POST', body: JSON.stringify(body) })
+      setNotice('回测任务已提交')
+      setShowBacktestModal(false)
+      setTargetStrategy(null)
       await loadRunHistory()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
   }
+
+  const isBacktestTargetValid =
+    backtestParams.target_type === 'all' ||
+    (backtestParams.target_type === 'market' && backtestParams.target_value.trim().length > 0) ||
+    (backtestParams.target_type === 'watchlist_group' && backtestParams.target_value.trim().length > 0)
 
   const loadRunHistory = async () => {
     setLoadingRuns(true)
@@ -240,7 +297,7 @@ export default function StrategyPage() {
   }
 
   React.useEffect(() => { void loadStrategies() }, [loadStrategies])
-  React.useEffect(() => { void loadPools() }, [loadPools])
+  React.useEffect(() => { void loadWatchlistGroups() }, [loadWatchlistGroups])
   React.useEffect(() => { void loadRunHistory() }, [])
 
   return (
@@ -255,7 +312,7 @@ export default function StrategyPage() {
       )}
 
       {view === 'list' && (
-        <section className="overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+        <section className="overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
           <div className="flex items-center gap-3 border-b border-line px-4 py-3">
             <h2 className="text-base font-semibold text-ink">我的策略</h2>
             <button onClick={createNew} className="ml-auto inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700">
@@ -265,18 +322,23 @@ export default function StrategyPage() {
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
-              <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
-                <tr><th className="px-4 py-3">名称</th><th className="px-4 py-3">股票池</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">更新时间</th><th className="px-4 py-3">操作</th></tr>
+              <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
+                <tr><th className="px-4 py-3">名称</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">更新时间</th><th className="px-4 py-3">操作</th></tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {loading ? <tr><td colSpan={5} className="px-4 py-8 text-center text-slate-500">加载中</td></tr> : strategies.length === 0 ? <tr><td colSpan={5} className="px-4 py-8 text-center text-slate-500">暂无策略，点击上方按钮创建</td></tr> : strategies.map((s) => (
-                  <tr key={s.id} className="hover:bg-slate-50/60">
-                    <td className="px-4 py-3 font-medium">{s.name}</td>
-                    <td className="px-4 py-3 text-slate-700">{s.pool_name ?? '全市场'}</td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${s.status === 'active' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>{s.status}</span>
+                {loading ? (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-4">
+                      <Skeleton.Table rows={3} columns={4} />
                     </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-slate-700">{formatDateTime(s.updated_at)}</td>
+                  </tr>
+                ) : strategies.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-muted">暂无策略，点击上方按钮创建</td></tr> : strategies.map((s) => (
+                  <tr key={s.id} className="hover:bg-rowHover">
+                    <td className="px-4 py-3 font-medium">{s.name}</td>
+                    <td className="px-4 py-3">
+                      <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${s.status === 'active' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-line bg-tableHead text-muted'}`}>{s.status}</span>
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(s.updated_at)}</td>
                     <td className="px-4 py-3">
                       <div className="flex gap-2">
                         <button onClick={() => editStrategy(s)} className="text-sm font-medium text-accent hover:underline">编辑</button>
@@ -303,19 +365,6 @@ export default function StrategyPage() {
               <div>
                 <label className="mb-1 block text-sm font-medium text-slate-700">策略名称</label>
                 <input value={name} onChange={(e) => setName(e.target.value)} placeholder="输入策略名称" className="w-full h-10 rounded-md border border-line bg-white px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-slate-700">股票池（可选）</label>
-                <select
-                  value={selectedPoolId ?? ''}
-                  onChange={(e) => setSelectedPoolId(e.target.value ? Number(e.target.value) : null)}
-                  className="w-full h-10 rounded-md border border-line bg-white px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
-                >
-                  <option value="">全市场</option>
-                  {pools.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name} ({p.item_count} 只)</option>
-                  ))}
-                </select>
               </div>
               <div>
                 <label className="mb-1 block text-sm font-medium text-slate-700">描述（可选）</label>
@@ -359,32 +408,127 @@ export default function StrategyPage() {
       )}
 
       {runHistory.length > 0 && (
-        <section className="mt-6 overflow-hidden rounded-lg border border-line bg-white shadow-sm">
+        <section className="mt-6 overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
           <div className="flex items-center gap-3 border-b border-line px-4 py-3">
             <h2 className="text-base font-semibold text-ink">回测历史</h2>
             <button onClick={() => void loadRunHistory()} className="ml-auto text-sm font-medium text-accent hover:underline">刷新</button>
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
-              <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-600">
-                <tr><th className="px-4 py-3">策略</th><th className="px-4 py-3">股票池</th><th className="px-4 py-3">区间</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">完成时间</th></tr>
+              <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
+                <tr><th className="px-4 py-3">策略</th><th className="px-4 py-3">标的</th><th className="px-4 py-3">区间</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">收益率</th><th className="px-4 py-3">完成时间</th></tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {loadingRuns ? <tr><td colSpan={5} className="px-4 py-8 text-center text-slate-500">加载中</td></tr> : runHistory.map((r) => (
-                  <tr key={r.id} className="hover:bg-slate-50/60">
-                    <td className="px-4 py-3 font-medium">{r.strategy_name ?? '—'}</td>
-                    <td className="px-4 py-3 text-slate-700">{r.pool_name ?? '全市场'}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-slate-700">{r.start_date} ~ {r.end_date}</td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>{r.status}</span>
+                {loadingRuns ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-4">
+                      <Skeleton.Table rows={3} columns={6} />
                     </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-slate-700">{r.finished_at ? formatDateTime(r.finished_at) : '—'}</td>
                   </tr>
-                ))}
+                ) : runHistory.map((r) => {
+                  const perf = r.performance as Record<string, string> | null
+                  const totalReturn = perf?.total_return ?? r.total_return ?? null
+                  return (
+                  <tr key={r.id} className="hover:bg-rowHover">
+                    <td className="px-4 py-3 font-medium">{r.strategy_name ?? '—'}</td>
+                    <td className="px-4 py-3 text-muted">{r.target_label ?? '全市场'}</td>
+                    <td className="whitespace-nowrap px-4 py-3 text-muted">{r.start_date} ~ {r.end_date}</td>
+                    <td className="px-4 py-3">
+                      <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-line bg-tableHead text-muted'}`}>{r.status}</span>
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 tabular-nums font-medium">
+                      {totalReturn !== null && totalReturn !== '—' ? (
+                        <span className={Number(totalReturn) >= 0 ? 'text-red-600' : 'text-emerald-600'}>
+                          {totalReturn.toString().startsWith('-') || Number(totalReturn) < 0 ? '' : ''}{totalReturn.toString().includes('%') ? totalReturn : `${(Number(totalReturn) * 100).toFixed(2)}%`}
+                        </span>
+                      ) : '—'}
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-muted">{r.finished_at ? formatDateTime(r.finished_at) : '—'}</td>
+                  </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
         </section>
+      )}
+
+      {showBacktestModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowBacktestModal(false)}>
+          <div className={`w-full max-w-md rounded-lg p-6 ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'bg-slate-800 text-slate-100' : 'bg-white text-ink'}`} onClick={(e) => e.stopPropagation()}>
+            <h3 className="mb-4 text-lg font-semibold">回测参数设置</h3>
+            <div className="space-y-4">
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-600">标的范围</label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'all', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'all' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>全市场</button>
+                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'market', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'market' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>市场板块</button>
+                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'watchlist_group', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'watchlist_group' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>自选分组</button>
+                </div>
+              </div>
+              {backtestParams.target_type === 'market' && (
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">市场板块</label>
+                  <select value={backtestParams.target_value} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`}>
+                    <option value="">请选择</option>
+                    {MARKET_OPTIONS.map((market) => (
+                      <option key={market} value={market}>{market}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {backtestParams.target_type === 'watchlist_group' && (
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">自选股分组</label>
+                  <select value={backtestParams.target_value} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} disabled={watchlistGroups.length === 0}>
+                    <option value="">{watchlistGroups.length === 0 ? '暂无分组' : '请选择'}</option>
+                    {watchlistGroups.map((group) => (
+                      <option key={group.group_name} value={group.group_name}>{group.group_name} ({group.item_count} 只)</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">开始日期</label>
+                  <input type="date" value={backtestParams.start_date} onChange={(e) => setBacktestParams({ ...backtestParams, start_date: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">结束日期</label>
+                  <input type="date" value={backtestParams.end_date} onChange={(e) => setBacktestParams({ ...backtestParams, end_date: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+              </div>
+              <div>
+                <label className="mb-1 block text-sm font-medium text-slate-600">初始资金</label>
+                <input type="number" value={backtestParams.initial_cash} onChange={(e) => setBacktestParams({ ...backtestParams, initial_cash: Number(e.target.value) })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">止损 %（可选）</label>
+                  <input type="number" step="0.1" placeholder="例如 5" value={backtestParams.stop_loss_pct} onChange={(e) => setBacktestParams({ ...backtestParams, stop_loss_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">止盈 %（可选）</label>
+                  <input type="number" step="0.1" placeholder="例如 10" value={backtestParams.take_profit_pct} onChange={(e) => setBacktestParams({ ...backtestParams, take_profit_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">移动止损 %（可选）</label>
+                  <input type="number" step="0.1" placeholder="例如 3" value={backtestParams.trailing_stop_pct} onChange={(e) => setBacktestParams({ ...backtestParams, trailing_stop_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+                <div>
+                  <label className="mb-1 block text-sm font-medium text-slate-600">最大持仓天数（可选）</label>
+                  <input type="number" step="1" placeholder="例如 20" value={backtestParams.time_stop_days} onChange={(e) => setBacktestParams({ ...backtestParams, time_stop_days: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
+                </div>
+              </div>
+            </div>
+            <div className="mt-6 flex gap-3">
+              <button onClick={() => setShowBacktestModal(false)} className={`flex-1 h-10 rounded-md border px-4 text-sm font-semibold transition ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 text-slate-300 hover:bg-slate-700' : 'border-line text-slate-700 hover:bg-slate-50'}`}>取消</button>
+              <button onClick={() => void confirmBacktest()} disabled={!isBacktestTargetValid} className="flex-1 h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60">确认回测</button>
+            </div>
+          </div>
+        </div>
       )}
     </>
   )

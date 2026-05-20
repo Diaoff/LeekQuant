@@ -4,9 +4,16 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.stock_service import add_watchlist_item, delete_watchlist_item, list_watchlist, update_watchlist_item
+from app.data.stock_service import (
+    add_watchlist_item,
+    delete_watchlist_item,
+    list_watchlist,
+    list_watchlist_groups,
+    update_watchlist_item,
+)
 from app.db.session import get_session
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
@@ -26,8 +33,11 @@ class WatchlistUpdateRequest(BaseModel):
 
 
 @router.get("")
-async def get_watchlist(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    return await list_watchlist(session)
+async def get_watchlist(
+    group_name: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    return await list_watchlist(session, group_name=group_name)
 
 
 @router.post("")
@@ -72,3 +82,36 @@ async def delete_watchlist(item_id: int, session: AsyncSession = Depends(get_ses
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="watchlist item not found")
     return {"deleted": True}
+
+
+@router.get("/summary")
+async def get_watchlist_summary(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Return watchlist overview for dashboard: total count and today's gainers/losers."""
+    result = await session.execute(
+        text(
+            """
+            SELECT
+                COUNT(DISTINCT w.id) AS total_count,
+                COALESCE(SUM(CASE WHEN dk.close > dk.pre_close THEN 1 ELSE 0 END), 0) AS today_gainers,
+                COALESCE(SUM(CASE WHEN dk.close < dk.pre_close THEN 1 ELSE 0 END), 0) AS today_losers,
+                COALESCE(SUM(CASE WHEN dk.close = dk.pre_close THEN 1 ELSE 0 END), 0) AS today_flat
+            FROM watchlist w
+            LEFT JOIN daily_kline dk ON dk.ts_code = w.ts_code
+                AND dk.trade_date = (
+                    SELECT MAX(trade_date) FROM daily_kline dk2 WHERE dk2.ts_code = w.ts_code
+                )
+            """
+        ),
+    )
+    row = result.mappings().first()
+    return {
+        "total_count": row["total_count"] if row else 0,
+        "today_gainers": row["today_gainers"] if row else 0,
+        "today_losers": row["today_losers"] if row else 0,
+        "today_flat": row["today_flat"] if row else 0,
+    }
+
+
+@router.get("/groups")
+async def get_watchlist_groups(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
+    return await list_watchlist_groups(session)

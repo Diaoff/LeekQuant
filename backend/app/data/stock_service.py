@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-import json
 from typing import Any
 
 from sqlalchemy import text
@@ -24,6 +23,7 @@ LOCAL_USER_ID = 1
 @dataclass(slots=True)
 class StockFilters:
     query: str | None = None
+    market: str | list[str] | None = None
     exchange: str | None = None
     industry: str | None = None
     exclude_st: bool = False
@@ -34,17 +34,6 @@ class StockFilters:
     pb_max: Decimal | None = None
     market_cap_min: Decimal | None = None
     market_cap_max: Decimal | None = None
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, (date, Decimal)):
-        return str(value)
-    if isinstance(value, dict):
-        return {key: _jsonable(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_jsonable(item) for item in value]
-    return value
-
 
 def _range_filter(
     field: str,
@@ -71,6 +60,16 @@ def _stock_where(filters: StockFilters) -> tuple[list[str], dict[str, Any]]:
     if filters.query:
         clauses.append("(s.ts_code ILIKE :query OR s.symbol ILIKE :query OR s.name ILIKE :query)")
         params["query"] = f"%{filters.query.strip()}%"
+    if filters.market:
+        markets = filters.market if isinstance(filters.market, list) else [filters.market]
+        markets = [market.strip() for market in markets if market and market.strip()]
+        if markets:
+            names = []
+            for index, market in enumerate(markets):
+                key = f"market_{index}"
+                names.append(f":{key}")
+                params[key] = market
+            clauses.append(f"s.market IN ({', '.join(names)})")
     if filters.exchange:
         clauses.append("s.exchange = :exchange")
         params["exchange"] = filters.exchange.strip().upper()
@@ -100,6 +99,7 @@ def _filters_from_dict(filters: dict[str, Any]) -> StockFilters:
         return Decimal(str(raw)) if raw not in (None, "") else None
 
     exchange = filters.get("exchange")
+    market = filters.get("market")
     industry = filters.get("industry")
     if isinstance(exchange, list):
         exchange = exchange[0] if exchange else None
@@ -108,6 +108,7 @@ def _filters_from_dict(filters: dict[str, Any]) -> StockFilters:
 
     return StockFilters(
         query=filters.get("query"),
+        market=market,
         exchange=exchange,
         industry=industry,
         exclude_st=bool(filters.get("exclude_st", False)),
@@ -119,31 +120,6 @@ def _filters_from_dict(filters: dict[str, Any]) -> StockFilters:
         market_cap_min=dec("market_cap_min") or range_dec("market_cap", "min"),
         market_cap_max=dec("market_cap_max") or range_dec("market_cap", "max"),
     )
-
-
-async def list_stocks_for_pool(session: AsyncSession, filters: StockFilters) -> list[dict[str, Any]]:
-    """Return all stocks matching filters, no pagination limit. Used for pool rebuilds."""
-    clauses, params = _stock_where(filters)
-    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
-
-    result = await session.execute(
-        text(
-            f"""
-            SELECT s.ts_code, s.symbol, s.name, s.exchange, s.industry, s.is_st, s.is_delisted,
-                   f.pe_ttm, f.pb, f.market_cap, f.report_date
-            FROM stock_basic s
-            LEFT JOIN (
-                SELECT DISTINCT ON (ts_code) *
-                FROM stock_fundamentals
-                ORDER BY ts_code, report_date DESC
-            ) f ON f.ts_code = s.ts_code
-            {where_sql}
-            ORDER BY s.symbol
-            """
-        ),
-        params,
-    )
-    return [dict(row) for row in result.mappings().all()]
 
 
 async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 1, page_size: int = 50) -> dict[str, Any]:
@@ -247,10 +223,19 @@ async def stock_exists(session: AsyncSession, ts_code: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def list_watchlist(session: AsyncSession, user_id: int = LOCAL_USER_ID) -> list[dict[str, Any]]:
+async def list_watchlist(
+    session: AsyncSession,
+    user_id: int = LOCAL_USER_ID,
+    group_name: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["w.user_id = :user_id"]
+    params: dict[str, Any] = {"user_id": user_id}
+    if group_name:
+        clauses.append("w.group_name = :group_name")
+        params["group_name"] = group_name
     result = await session.execute(
         text(
-            """
+            f"""
             WITH latest_kline AS (
                 SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
                 FROM daily_kline
@@ -258,22 +243,38 @@ async def list_watchlist(session: AsyncSession, user_id: int = LOCAL_USER_ID) ->
             )
             SELECT
                 w.id, w.group_name, w.ts_code, w.sort_order, w.note, w.added_at,
-                s.name, s.industry, s.exchange, s.is_st, s.is_delisted,
+                s.name, s.industry, s.market, s.exchange, s.is_st, s.is_delisted,
                 k.trade_date AS latest_trade_date, k.close AS latest_close
             FROM watchlist w
             JOIN stock_basic s ON s.ts_code = w.ts_code
             LEFT JOIN latest_kline k ON k.ts_code = w.ts_code
-            WHERE w.user_id = :user_id
+            WHERE {" AND ".join(clauses)}
             ORDER BY w.group_name, w.sort_order, w.added_at DESC
             """
         ),
-        {"user_id": user_id},
+        params,
     )
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in result.mappings().all():
         item = dict(row)
         groups.setdefault(item["group_name"], []).append(item)
     return [{"group_name": name, "items": items} for name, items in groups.items()]
+
+
+async def list_watchlist_groups(session: AsyncSession, user_id: int = LOCAL_USER_ID) -> list[dict[str, Any]]:
+    result = await session.execute(
+        text(
+            """
+            SELECT group_name, COUNT(*) AS item_count
+            FROM watchlist
+            WHERE user_id = :user_id
+            GROUP BY group_name
+            ORDER BY group_name
+            """
+        ),
+        {"user_id": user_id},
+    )
+    return [dict(row) for row in result.mappings().all()]
 
 
 async def add_watchlist_item(
@@ -370,192 +371,6 @@ async def delete_watchlist_item(session: AsyncSession, item_id: int, user_id: in
     )
     await session.commit()
     return result.rowcount > 0
-
-
-async def list_pools(session: AsyncSession, user_id: int = LOCAL_USER_ID) -> list[dict[str, Any]]:
-    result = await session.execute(
-        text(
-            """
-            SELECT p.id, p.name, p.description, p.filters, p.is_dynamic,
-                   p.last_built_at, p.created_at, p.updated_at,
-                   COUNT(i.ts_code) AS item_count
-            FROM stock_pools p
-            LEFT JOIN stock_pool_items i ON i.pool_id = p.id
-            WHERE p.user_id = :user_id
-            GROUP BY p.id
-            ORDER BY p.updated_at DESC
-            """
-        ),
-        {"user_id": user_id},
-    )
-    return [dict(row) for row in result.mappings().all()]
-
-
-async def create_pool(
-    session: AsyncSession,
-    *,
-    name: str,
-    description: str | None,
-    filters: dict[str, Any],
-    is_dynamic: bool = True,
-    user_id: int = LOCAL_USER_ID,
-) -> dict[str, Any]:
-    result = await session.execute(
-        text(
-            """
-            INSERT INTO stock_pools (user_id, name, description, filters, is_dynamic)
-            VALUES (:user_id, :name, :description, CAST(:filters AS JSONB), :is_dynamic)
-            RETURNING id, name, description, filters, is_dynamic, last_built_at, created_at, updated_at
-            """
-        ),
-        {
-            "user_id": user_id,
-            "name": name,
-            "description": description,
-            "filters": json.dumps(_jsonable(filters), ensure_ascii=False, default=str),
-            "is_dynamic": is_dynamic,
-        },
-    )
-    await session.commit()
-    return dict(result.mappings().one())
-
-
-async def get_pool(session: AsyncSession, pool_id: int, user_id: int = LOCAL_USER_ID) -> dict[str, Any] | None:
-    result = await session.execute(
-        text(
-            """
-            SELECT id, name, description, filters, is_dynamic, last_built_at, created_at, updated_at
-            FROM stock_pools
-            WHERE id = :pool_id AND user_id = :user_id
-            """
-        ),
-        {"pool_id": pool_id, "user_id": user_id},
-    )
-    row = result.mappings().one_or_none()
-    return dict(row) if row else None
-
-
-async def update_pool(
-    session: AsyncSession,
-    pool_id: int,
-    *,
-    name: str | None = None,
-    description: str | None = None,
-    filters: dict[str, Any] | None = None,
-    is_dynamic: bool | None = None,
-    user_id: int = LOCAL_USER_ID,
-) -> dict[str, Any] | None:
-    current = await get_pool(session, pool_id, user_id)
-    if current is None:
-        return None
-    updates = []
-    params: dict[str, Any] = {"pool_id": pool_id, "user_id": user_id}
-    if name is not None:
-        updates.append("name = :name")
-        params["name"] = name
-    if description is not None:
-        updates.append("description = :description")
-        params["description"] = description
-    if filters is not None:
-        updates.append("filters = CAST(:filters AS JSONB)")
-        params["filters"] = json.dumps(_jsonable(filters), ensure_ascii=False, default=str)
-    if is_dynamic is not None:
-        updates.append("is_dynamic = :is_dynamic")
-        params["is_dynamic"] = is_dynamic
-    if not updates:
-        return current
-
-    result = await session.execute(
-        text(
-            f"""
-            UPDATE stock_pools
-            SET {", ".join(updates)},
-                updated_at = NOW()
-            WHERE id = :pool_id AND user_id = :user_id
-            RETURNING id, name, description, filters, is_dynamic, last_built_at, created_at, updated_at
-            """
-        ),
-        params,
-    )
-    await session.commit()
-    return dict(result.mappings().one())
-
-
-async def delete_pool(session: AsyncSession, pool_id: int, user_id: int = LOCAL_USER_ID) -> bool:
-    result = await session.execute(
-        text("DELETE FROM stock_pools WHERE id = :pool_id AND user_id = :user_id"),
-        {"pool_id": pool_id, "user_id": user_id},
-    )
-    await session.commit()
-    return result.rowcount > 0
-
-
-async def rebuild_pool(session: AsyncSession, pool_id: int, user_id: int = LOCAL_USER_ID) -> dict[str, Any] | None:
-    pool = await get_pool(session, pool_id, user_id)
-    if pool is None:
-        return None
-    filters = _filters_from_dict(pool["filters"] or {})
-    items = await list_stocks_for_pool(session, filters)
-    await session.execute(text("DELETE FROM stock_pool_items WHERE pool_id = :pool_id"), {"pool_id": pool_id})
-    if items:
-        await session.execute(
-            text(
-                """
-                INSERT INTO stock_pool_items (pool_id, ts_code, reason)
-                VALUES (:pool_id, :ts_code, CAST(:reason AS JSONB))
-                ON CONFLICT (pool_id, ts_code) DO UPDATE SET
-                    reason = EXCLUDED.reason,
-                    added_at = NOW()
-                """
-            ),
-            [
-                {
-                    "pool_id": pool_id,
-                    "ts_code": item["ts_code"],
-                    "reason": json.dumps({"filters": _jsonable(pool["filters"])}, ensure_ascii=False, default=str),
-                }
-                for item in items
-            ],
-        )
-    await session.execute(
-        text("UPDATE stock_pools SET last_built_at = NOW(), updated_at = NOW() WHERE id = :pool_id"),
-        {"pool_id": pool_id},
-    )
-    await session.commit()
-    return {"pool_id": pool_id, "item_count": len(items)}
-
-
-async def list_pool_items(session: AsyncSession, pool_id: int, user_id: int = LOCAL_USER_ID) -> list[dict[str, Any]] | None:
-    if await get_pool(session, pool_id, user_id) is None:
-        return None
-    result = await session.execute(
-        text(
-            """
-            WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) *
-                FROM stock_fundamentals
-                ORDER BY ts_code, report_date DESC
-            ),
-            latest_kline AS (
-                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
-                FROM daily_kline
-                ORDER BY ts_code, trade_date DESC
-            )
-            SELECT i.pool_id, i.ts_code, i.score, i.reason, i.added_at,
-                   s.name, s.exchange, s.industry, s.is_st, s.is_delisted,
-                   f.pe_ttm, f.pb, f.market_cap, k.trade_date AS latest_trade_date,
-                   k.close AS latest_close
-            FROM stock_pool_items i
-            JOIN stock_basic s ON s.ts_code = i.ts_code
-            LEFT JOIN latest_fundamentals f ON f.ts_code = i.ts_code
-            LEFT JOIN latest_kline k ON k.ts_code = i.ts_code
-            WHERE i.pool_id = :pool_id
-            ORDER BY s.symbol
-            """
-        ),
-        {"pool_id": pool_id},
-    )
-    return [dict(row) for row in result.mappings().all()]
 
 
 async def sync_fundamentals(

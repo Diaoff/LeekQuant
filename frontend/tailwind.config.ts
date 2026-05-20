@@ -5,12 +5,18 @@ export default {
   theme: {
     extend: {
       colors: {
-        ink: '#172033',
-        surface: '#f7f8fb',
-        line: '#d9dee8',
-        accent: '#1967d2',
-        mint: '#0f8b6f',
-        warn: '#b26a00',
+        ink: 'var(--color-ink)',
+        surface: 'var(--color-surface)',
+        panel: 'var(--color-panel)',
+        line: 'var(--color-line)',
+        accent: 'var(--color-accent)',
+        mint: 'var(--color-mint)',
+        warn: 'var(--color-warn)',
+        bg: 'var(--color-bg)',
+        muted: 'var(--color-muted)',
+        tableHead: 'var(--color-table-head)',
+        rowHover: 'var(--color-row-hover)',
+        rowAlt: 'var(--color-row-alt)',
       },
       fontFamily: {
         sans: [
@@ -27,4 +33,3 @@ export default {
   },
   plugins: [],
 } satisfies Config
-

@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.backtests import router as backtests_router
 from app.api.data import router as data_router
-from app.api.pools import router as pools_router
 from app.api.stocks import router as stocks_router
 from app.api.strategies import router as strategies_router
 from app.api.tasks import router as tasks_router
@@ -35,7 +34,6 @@ app.include_router(data_router)
 app.include_router(tasks_router)
 app.include_router(stocks_router)
 app.include_router(watchlist_router)
-app.include_router(pools_router)
 app.include_router(strategies_router)
 app.include_router(backtests_router)
 

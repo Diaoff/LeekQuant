@@ -24,11 +24,9 @@ async def list_strategies(
     result = await session.execute(
         text(
             f"""
-            SELECT s.id, s.name, s.description, s.pool_id, s.status,
-                   s.version, s.config, s.created_at, s.updated_at, s.archived_at,
-                   p.name AS pool_name
+            SELECT s.id, s.name, s.description, s.status,
+                   s.version, s.config, s.created_at, s.updated_at, s.archived_at
             FROM strategies s
-            LEFT JOIN stock_pools p ON p.id = s.pool_id
             WHERE {" AND ".join(clauses)}
             ORDER BY s.updated_at DESC
             """
@@ -47,11 +45,9 @@ async def get_strategy(
         text(
             """
             SELECT s.id, s.user_id, s.name, s.description, s.source_code,
-                   s.pool_id, s.status, s.version, s.config,
-                   s.created_at, s.updated_at, s.archived_at,
-                   p.name AS pool_name
+                   s.status, s.version, s.config,
+                   s.created_at, s.updated_at, s.archived_at
             FROM strategies s
-            LEFT JOIN stock_pools p ON p.id = s.pool_id
             WHERE s.id = :id AND s.user_id = :user_id
             """
         ),
@@ -67,7 +63,6 @@ async def create_strategy(
     name: str,
     source_code: str,
     description: str | None = None,
-    pool_id: int | None = None,
     config: dict[str, Any] | None = None,
     status: str = "draft",
     user_id: int = LOCAL_USER_ID,
@@ -75,10 +70,10 @@ async def create_strategy(
     result = await session.execute(
         text(
             """
-            INSERT INTO strategies (user_id, name, description, source_code, pool_id, config, status)
-            VALUES (:user_id, :name, :description, :source_code, :pool_id,
+            INSERT INTO strategies (user_id, name, description, source_code, config, status)
+            VALUES (:user_id, :name, :description, :source_code,
                     CAST(:config AS JSONB), :status)
-            RETURNING id, name, description, source_code, pool_id, status,
+            RETURNING id, name, description, source_code, status,
                       version, config, created_at, updated_at, archived_at
             """
         ),
@@ -87,7 +82,6 @@ async def create_strategy(
             "name": name,
             "description": description,
             "source_code": source_code,
-            "pool_id": pool_id,
             "config": json.dumps(config or {}, ensure_ascii=False, default=str),
             "status": status,
         },
@@ -103,7 +97,6 @@ async def update_strategy(
     name: str | None = None,
     description: str | None = None,
     source_code: str | None = None,
-    pool_id: int | None = None,
     config: dict[str, Any] | None = None,
     status: str | None = None,
     user_id: int = LOCAL_USER_ID,
@@ -125,9 +118,6 @@ async def update_strategy(
         updates.append("source_code = :source_code")
         updates.append("version = version + 1")
         params["source_code"] = source_code
-    if pool_id is not None:
-        updates.append("pool_id = :pool_id")
-        params["pool_id"] = pool_id
     if config is not None:
         updates.append("config = CAST(:config AS JSONB)")
         params["config"] = json.dumps(config, ensure_ascii=False, default=str)
@@ -147,7 +137,7 @@ async def update_strategy(
             SET {", ".join(updates)},
                 updated_at = NOW()
             WHERE id = :id AND user_id = :user_id
-            RETURNING id, name, description, source_code, pool_id, status,
+            RETURNING id, name, description, source_code, status,
                       version, config, created_at, updated_at, archived_at
             """
         ),
