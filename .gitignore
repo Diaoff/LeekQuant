@@ -16,3 +16,10 @@ coverage/
 .logs/
 .pids/
 backend/celerybeat-schedule*
+.trae/documents/回测引擎优化计划.md
+.trae/specs/integrate-hikyuu/checklist.md
+.trae/specs/integrate-hikyuu/spec.md
+.trae/specs/integrate-hikyuu/tasks.md
+.trae/specs/refactor-ui-m0-m3/checklist.md
+.trae/specs/refactor-ui-m0-m3/spec.md
+.trae/specs/refactor-ui-m0-m3/tasks.md

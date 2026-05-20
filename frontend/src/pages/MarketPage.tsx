@@ -1,5 +1,5 @@
 import React from 'react'
-import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown } from 'lucide-react'
+import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw } from 'lucide-react'
 import { fetchJson, formatMarketCap, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
@@ -41,6 +41,114 @@ interface StocksApiResponse {
 
 type TabKey = 'basic' | 'daily'
 
+type MarketFilterState = {
+  market: string
+  exchange: string
+  industry: string
+  excludeSt: boolean
+  excludeDelisted: boolean
+  peMin: string
+  peMax: string
+  pbMin: string
+  pbMax: string
+  marketCapMinYi: string
+  marketCapMaxYi: string
+}
+
+const DEFAULT_FILTERS: MarketFilterState = {
+  market: '',
+  exchange: '',
+  industry: '',
+  excludeSt: false,
+  excludeDelisted: true,
+  peMin: '',
+  peMax: '',
+  pbMin: '',
+  pbMax: '',
+  marketCapMinYi: '',
+  marketCapMaxYi: '',
+}
+
+const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所']
+const EXCHANGE_OPTIONS = ['SH', 'SZ', 'BJ']
+
+const numericValue = (value: string): number | null => {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
+
+const marketCapYiToYuan = (value: string): string | null => {
+  const parsed = numericValue(value)
+  if (parsed === null || Number.isNaN(parsed)) return null
+  return String(Math.round(parsed * 100000000))
+}
+
+const appendNumericParam = (search: URLSearchParams, key: string, value: string) => {
+  const parsed = numericValue(value)
+  if (parsed !== null && !Number.isNaN(parsed)) search.set(key, value.trim())
+}
+
+const buildStocksUrl = (params: {
+  page: number
+  pageSize: number
+  query: string
+  filters: MarketFilterState
+}) => {
+  const search = new URLSearchParams({
+    page: String(params.page),
+    page_size: String(params.pageSize),
+    exclude_st: String(params.filters.excludeSt),
+    exclude_delisted: String(params.filters.excludeDelisted),
+  })
+  const query = params.query.trim()
+  const industry = params.filters.industry.trim()
+  if (query) search.set('query', query)
+  if (params.filters.market) search.set('market', params.filters.market)
+  if (params.filters.exchange) search.set('exchange', params.filters.exchange)
+  if (industry) search.set('industry', industry)
+  appendNumericParam(search, 'pe_min', params.filters.peMin)
+  appendNumericParam(search, 'pe_max', params.filters.peMax)
+  appendNumericParam(search, 'pb_min', params.filters.pbMin)
+  appendNumericParam(search, 'pb_max', params.filters.pbMax)
+  const marketCapMin = marketCapYiToYuan(params.filters.marketCapMinYi)
+  const marketCapMax = marketCapYiToYuan(params.filters.marketCapMaxYi)
+  if (marketCapMin) search.set('market_cap_min', marketCapMin)
+  if (marketCapMax) search.set('market_cap_max', marketCapMax)
+  return `/api/stocks?${search.toString()}`
+}
+
+const collectFilterErrors = (filters: MarketFilterState): string[] => {
+  const errors: string[] = []
+  const validateRange = (label: string, minValue: string, maxValue: string) => {
+    const min = numericValue(minValue)
+    const max = numericValue(maxValue)
+    if (Number.isNaN(min) || Number.isNaN(max)) {
+      errors.push(`${label}请输入有效数字`)
+      return
+    }
+    if (min !== null && max !== null && min > max) errors.push(`${label}下限不能大于上限`)
+  }
+  validateRange('PE', filters.peMin, filters.peMax)
+  validateRange('PB', filters.pbMin, filters.pbMax)
+  validateRange('总市值', filters.marketCapMinYi, filters.marketCapMaxYi)
+  return errors
+}
+
+const filterSummary = (filters: MarketFilterState): string[] => {
+  const summary: string[] = []
+  if (filters.market) summary.push(filters.market)
+  if (filters.exchange) summary.push(filters.exchange)
+  if (filters.industry.trim()) summary.push(filters.industry.trim())
+  if (filters.excludeSt) summary.push('排除 ST')
+  if (!filters.excludeDelisted) summary.push('包含退市')
+  if (filters.peMin || filters.peMax) summary.push(`PE ${filters.peMin || '-'}-${filters.peMax || '-'}`)
+  if (filters.pbMin || filters.pbMax) summary.push(`PB ${filters.pbMin || '-'}-${filters.pbMax || '-'}`)
+  if (filters.marketCapMinYi || filters.marketCapMaxYi) summary.push(`市值 ${filters.marketCapMinYi || '-'}-${filters.marketCapMaxYi || '-'} 亿`)
+  return summary
+}
+
 export default function MarketPage() {
   const [tab, setTab] = React.useState<TabKey>('basic')
   const [stocks, setStocks] = React.useState<StockBasic[]>([])
@@ -57,12 +165,16 @@ export default function MarketPage() {
   const [sortKey, setSortKey] = React.useState<keyof MarketStock>('ts_code')
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
   const [dailyPage, setDailyPage] = React.useState(1)
+  const [filters, setFilters] = React.useState<MarketFilterState>(DEFAULT_FILTERS)
+
+  const activeFilterSummary = React.useMemo(() => filterSummary(filters), [filters])
+  const filterErrors = React.useMemo(() => collectFilterErrors(filters), [filters])
 
   const loadStocks = React.useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const data = await fetchJson<StocksApiResponse>('/api/stocks?page_size=200')
+      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: 1, pageSize: 200, query, filters }))
       setStocks(data.items)
       setTotalStocks(data.total)
     } catch (caught) {
@@ -70,13 +182,13 @@ export default function MarketPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [filters, query])
 
   const loadDaily = React.useCallback(async () => {
     setDailyLoading(true)
     setError(null)
     try {
-      const data = await fetchJson<StocksApiResponse>(`/api/stocks?page=${dailyPage}&page_size=50&exclude_delisted=true`)
+      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: dailyPage, pageSize: 50, query: dailyQuery, filters }))
       const rows: MarketStock[] = data.items.map((item) => ({
         ts_code: item.ts_code,
         symbol: item.symbol,
@@ -96,7 +208,7 @@ export default function MarketPage() {
     } finally {
       setDailyLoading(false)
     }
-  }, [dailyPage])
+  }, [dailyPage, dailyQuery, filters])
 
   const syncDaily = React.useCallback(async () => {
     setSyncing(true)
@@ -112,10 +224,6 @@ export default function MarketPage() {
       setSyncing(false)
     }
   }, [loadDaily])
-
-  const filteredStocks = query.length > 0
-    ? stocks.filter((s) => s.ts_code.includes(query.toUpperCase()) || s.symbol.includes(query.toUpperCase()) || (s.name ?? '').includes(query))
-    : stocks
 
   const handleDailySort = (key: keyof MarketStock) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
@@ -139,9 +247,15 @@ export default function MarketPage() {
     })
   }, [dailyRows, sortKey, sortDir])
 
-  const filteredDaily = dailyQuery.length > 0
-    ? sortedDaily.filter((r) => r.ts_code.includes(dailyQuery.toUpperCase()) || r.name.includes(dailyQuery))
-    : sortedDaily
+  const updateFilters = (patch: Partial<MarketFilterState>) => {
+    setFilters((current) => ({ ...current, ...patch }))
+    setDailyPage(1)
+  }
+
+  const resetFilters = () => {
+    setFilters(DEFAULT_FILTERS)
+    setDailyPage(1)
+  }
 
   React.useEffect(() => { void loadStocks() }, [loadStocks])
   React.useEffect(() => { void loadDaily() }, [loadDaily])
@@ -173,11 +287,27 @@ export default function MarketPage() {
               最新行情
             </button>
           </div>
+          {activeFilterSummary.length > 0 && (
+            <div className="hidden min-w-0 flex-1 items-center gap-1 md:flex">
+              {activeFilterSummary.slice(0, 4).map((item) => (
+                <span key={item} className="max-w-32 truncate rounded-md border border-line bg-surface px-2 py-1 text-xs font-medium text-muted">
+                  {item}
+                </span>
+              ))}
+              {activeFilterSummary.length > 4 && <span className="text-xs text-muted">+{activeFilterSummary.length - 4}</span>}
+            </div>
+          )}
           <input
             value={tab === 'basic' ? query : dailyQuery}
-            onChange={(e) => (tab === 'basic' ? setQuery(e.target.value) : setDailyQuery(e.target.value))}
+            onChange={(e) => {
+              if (tab === 'basic') setQuery(e.target.value)
+              else {
+                setDailyQuery(e.target.value)
+                setDailyPage(1)
+              }
+            }}
             placeholder="输入代码或名称"
-            className="ml-auto h-9 rounded-md border border-line bg-panel px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+            className="ml-auto h-9 w-40 rounded-md border border-line bg-panel px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent sm:w-56"
           />
           {tab === 'daily' && (
             <button
@@ -192,6 +322,80 @@ export default function MarketPage() {
           )}
         </div>
 
+        <div className="border-b border-line bg-surface/40 px-4 py-3">
+          <div className="grid gap-3 lg:grid-cols-12">
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">市场板块</span>
+              <select
+                value={filters.market}
+                onChange={(event) => updateFilters({ market: event.target.value })}
+                className="h-9 w-full rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">全部</option>
+                {MARKET_OPTIONS.map((market) => <option key={market} value={market}>{market}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">交易所</span>
+              <select
+                value={filters.exchange}
+                onChange={(event) => updateFilters({ exchange: event.target.value })}
+                className="h-9 w-full rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+              >
+                <option value="">全部</option>
+                {EXCHANGE_OPTIONS.map((exchange) => <option key={exchange} value={exchange}>{exchange}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">行业</span>
+              <input
+                value={filters.industry}
+                onChange={(event) => updateFilters({ industry: event.target.value })}
+                placeholder="行业名称"
+                className="h-9 w-full rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+              />
+            </label>
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">PE</span>
+              <div className="grid grid-cols-2 gap-2">
+                <input value={filters.peMin} onChange={(event) => updateFilters({ peMin: event.target.value })} inputMode="decimal" placeholder="最小" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+                <input value={filters.peMax} onChange={(event) => updateFilters({ peMax: event.target.value })} inputMode="decimal" placeholder="最大" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+              </div>
+            </label>
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">PB</span>
+              <div className="grid grid-cols-2 gap-2">
+                <input value={filters.pbMin} onChange={(event) => updateFilters({ pbMin: event.target.value })} inputMode="decimal" placeholder="最小" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+                <input value={filters.pbMax} onChange={(event) => updateFilters({ pbMax: event.target.value })} inputMode="decimal" placeholder="最大" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+              </div>
+            </label>
+            <label className="space-y-1 lg:col-span-2">
+              <span className="block text-xs font-medium text-muted">总市值（亿）</span>
+              <div className="grid grid-cols-2 gap-2">
+                <input value={filters.marketCapMinYi} onChange={(event) => updateFilters({ marketCapMinYi: event.target.value })} inputMode="decimal" placeholder="最小" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+                <input value={filters.marketCapMaxYi} onChange={(event) => updateFilters({ marketCapMaxYi: event.target.value })} inputMode="decimal" placeholder="最大" className="h-9 min-w-0 rounded-md border border-line bg-panel px-2 text-sm focus:outline-none focus:ring-2 focus:ring-accent" />
+              </div>
+            </label>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-medium text-ink">
+                <input type="checkbox" checked={filters.excludeSt} onChange={(event) => updateFilters({ excludeSt: event.target.checked })} className="h-4 w-4 accent-accent" />
+                排除 ST
+              </label>
+              <label className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-medium text-ink">
+                <input type="checkbox" checked={filters.excludeDelisted} onChange={(event) => updateFilters({ excludeDelisted: event.target.checked })} className="h-4 w-4 accent-accent" />
+                排除退市
+              </label>
+              {filterErrors.length > 0 && <span className="text-sm text-red-600">{filterErrors[0]}</span>}
+            </div>
+            <button type="button" onClick={resetFilters} className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line px-3 text-sm font-semibold text-ink hover:bg-rowHover">
+              <RotateCcw className="h-4 w-4" />
+              重置筛选
+            </button>
+          </div>
+        </div>
+
         {tab === 'basic' && (
           <>
             <div className="overflow-x-auto">
@@ -200,7 +404,7 @@ export default function MarketPage() {
                   <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th></tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {loading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : filteredStocks.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : filteredStocks.map((stock) => (
+                  {loading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
                     <tr key={stock.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
@@ -214,7 +418,7 @@ export default function MarketPage() {
               </table>
             </div>
             <div className="border-t border-line px-4 py-3 text-sm text-muted">
-              共 {formatNumber(totalStocks)} 只股票，当前展示 {formatNumber(filteredStocks.length)} 条
+              共 {formatNumber(totalStocks)} 只股票，当前展示 {formatNumber(stocks.length)} 条
             </div>
           </>
         )}
@@ -247,7 +451,7 @@ export default function MarketPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {dailyLoading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : filteredDaily.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : filteredDaily.map((row) => (
+                  {dailyLoading ? (<tr><td colSpan={6} className="px-4 py-4"><Skeleton.Table rows={5} columns={6} /></td></tr>) : sortedDaily.length === 0 ? <tr><td colSpan={6} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : sortedDaily.map((row) => (
                     <tr key={row.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{row.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{row.name}</td>
@@ -262,7 +466,7 @@ export default function MarketPage() {
             </div>
             <div className="flex items-center justify-between border-t border-line px-4 py-3">
               <span className="text-sm text-muted">
-                共 {formatNumber(dailyTotal)} 只，当前展示 {formatNumber(filteredDaily.length)} 行
+                共 {formatNumber(dailyTotal)} 只，当前展示 {formatNumber(sortedDaily.length)} 行
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -284,6 +488,7 @@ export default function MarketPage() {
           </>
         )}
       </section>
+
     </>
   )
 }

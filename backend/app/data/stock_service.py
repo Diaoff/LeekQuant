@@ -19,6 +19,39 @@ from app.data.repository import (
 
 LOCAL_USER_ID = 1
 
+PINYIN_INITIAL_RANGES = [
+    (-20319, -20284, "a"),
+    (-20283, -19776, "b"),
+    (-19775, -19219, "c"),
+    (-19218, -18711, "d"),
+    (-18710, -18527, "e"),
+    (-18526, -18240, "f"),
+    (-18239, -17923, "g"),
+    (-17922, -17418, "h"),
+    (-17417, -16475, "j"),
+    (-16474, -16213, "k"),
+    (-16212, -15641, "l"),
+    (-15640, -15166, "m"),
+    (-15165, -14923, "n"),
+    (-14922, -14915, "o"),
+    (-14914, -14631, "p"),
+    (-14630, -14150, "q"),
+    (-14149, -14091, "r"),
+    (-14090, -13319, "s"),
+    (-13318, -12839, "t"),
+    (-12838, -12557, "w"),
+    (-12556, -11848, "x"),
+    (-11847, -11056, "y"),
+    (-11055, -10247, "z"),
+]
+
+PINYIN_INITIAL_OVERRIDES = {
+    "行": "h",
+    "重": "c",
+    "长": "c",
+    "厦": "x",
+}
+
 
 @dataclass(slots=True)
 class StockFilters:
@@ -34,6 +67,44 @@ class StockFilters:
     pb_max: Decimal | None = None
     market_cap_min: Decimal | None = None
     market_cap_max: Decimal | None = None
+
+
+def _pinyin_initial(char: str) -> str:
+    if char in PINYIN_INITIAL_OVERRIDES:
+        return PINYIN_INITIAL_OVERRIDES[char]
+    if char.isascii():
+        return char.lower() if char.isalnum() else ""
+    try:
+        encoded = char.encode("gb2312")
+    except UnicodeEncodeError:
+        return ""
+    if len(encoded) < 2:
+        return ""
+    code = encoded[0] * 256 + encoded[1] - 65536
+    for start, end, initial in PINYIN_INITIAL_RANGES:
+        if start <= code <= end:
+            return initial
+    return ""
+
+
+def stock_name_initials(name: str | None) -> str:
+    return "".join(_pinyin_initial(char) for char in name or "")
+
+
+def _matches_stock_query(row: dict[str, Any], query: str) -> bool:
+    needle = query.strip().lower()
+    if not needle:
+        return True
+    code_needle = needle.upper()
+    ts_code = str(row.get("ts_code") or "")
+    symbol = str(row.get("symbol") or "")
+    name = str(row.get("name") or "")
+    return (
+        code_needle in ts_code.upper()
+        or code_needle in symbol.upper()
+        or needle in name.lower()
+        or needle in stock_name_initials(name)
+    )
 
 def _range_filter(
     field: str,
@@ -54,10 +125,10 @@ def _range_filter(
         params[f"{prefix}_max"] = max_value
 
 
-def _stock_where(filters: StockFilters) -> tuple[list[str], dict[str, Any]]:
+def _stock_where(filters: StockFilters, *, include_query: bool = True) -> tuple[list[str], dict[str, Any]]:
     clauses: list[str] = []
     params: dict[str, Any] = {}
-    if filters.query:
+    if include_query and filters.query:
         clauses.append("(s.ts_code ILIKE :query OR s.symbol ILIKE :query OR s.name ILIKE :query)")
         params["query"] = f"%{filters.query.strip()}%"
     if filters.market:
@@ -125,6 +196,9 @@ def _filters_from_dict(filters: dict[str, Any]) -> StockFilters:
 async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 1, page_size: int = 50) -> dict[str, Any]:
     page = max(page, 1)
     page_size = min(max(page_size, 1), 200)
+    if filters.query and filters.query.strip():
+        return await _list_stocks_with_fuzzy_query(session, filters, page=page, page_size=page_size)
+
     clauses, params = _stock_where(filters)
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
     params.update({"limit": page_size, "offset": (page - 1) * page_size})
@@ -181,6 +255,54 @@ async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 
         "page": page,
         "page_size": page_size,
         "total": total,
+    }
+
+
+async def _list_stocks_with_fuzzy_query(
+    session: AsyncSession,
+    filters: StockFilters,
+    page: int,
+    page_size: int,
+) -> dict[str, Any]:
+    clauses, params = _stock_where(filters, include_query=False)
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    result = await session.execute(
+        text(
+            f"""
+            WITH latest_fundamentals AS (
+                SELECT DISTINCT ON (ts_code) *
+                FROM stock_fundamentals
+                ORDER BY ts_code, report_date DESC
+            ),
+            latest_kline AS (
+                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
+                FROM daily_kline
+                ORDER BY ts_code, trade_date DESC
+            )
+            SELECT
+                s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
+                s.list_date, s.delist_date, s.is_st, s.is_delisted,
+                f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
+                f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source,
+                k.trade_date AS latest_trade_date, k.close AS latest_close
+            FROM stock_basic s
+            LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
+            LEFT JOIN latest_kline k ON k.ts_code = s.ts_code
+            {where_sql}
+            ORDER BY s.symbol
+            """
+        ),
+        params,
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    matched = [row for row in rows if _matches_stock_query(row, filters.query or "")]
+    start = (page - 1) * page_size
+    end = start + page_size
+    return {
+        "items": matched[start:end],
+        "page": page,
+        "page_size": page_size,
+        "total": len(matched),
     }
 
 
@@ -265,16 +387,156 @@ async def list_watchlist_groups(session: AsyncSession, user_id: int = LOCAL_USER
     result = await session.execute(
         text(
             """
-            SELECT group_name, COUNT(*) AS item_count
-            FROM watchlist
-            WHERE user_id = :user_id
-            GROUP BY group_name
-            ORDER BY group_name
+            SELECT g.group_name, COUNT(w.id) AS item_count
+            FROM watchlist_groups g
+            LEFT JOIN watchlist w
+              ON w.user_id = g.user_id
+             AND w.group_name = g.group_name
+            WHERE g.user_id = :user_id
+            GROUP BY g.group_name
+            ORDER BY g.group_name
             """
         ),
         {"user_id": user_id},
     )
     return [dict(row) for row in result.mappings().all()]
+
+
+async def create_watchlist_group(
+    session: AsyncSession,
+    group_name: str,
+    user_id: int = LOCAL_USER_ID,
+) -> dict[str, Any]:
+    name = group_name.strip() or "默认"
+    result = await session.execute(
+        text(
+            """
+            INSERT INTO watchlist_groups (user_id, group_name, updated_at)
+            VALUES (:user_id, :group_name, NOW())
+            ON CONFLICT (user_id, group_name) DO NOTHING
+            RETURNING id, group_name, created_at, updated_at
+            """
+        ),
+        {"user_id": user_id, "group_name": name},
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        raise ValueError(f"watchlist group already exists: {name}")
+    await session.commit()
+    return dict(row)
+
+
+async def rename_watchlist_group(
+    session: AsyncSession,
+    old_group_name: str,
+    new_group_name: str,
+    user_id: int = LOCAL_USER_ID,
+) -> dict[str, Any] | None:
+    old_name = old_group_name.strip()
+    new_name = new_group_name.strip() or "默认"
+    if not old_name:
+        return None
+    exists = await session.execute(
+        text(
+            """
+            SELECT 1
+            FROM watchlist_groups
+            WHERE user_id = :user_id AND group_name = :new_group_name
+            """
+        ),
+        {"user_id": user_id, "new_group_name": new_name},
+    )
+    if old_name != new_name and exists.scalar_one_or_none() is not None:
+        raise ValueError(f"watchlist group already exists: {new_name}")
+
+    result = await session.execute(
+        text(
+            """
+            UPDATE watchlist_groups
+            SET group_name = :new_group_name,
+                updated_at = NOW()
+            WHERE user_id = :user_id AND group_name = :old_group_name
+            RETURNING id, group_name, created_at, updated_at
+            """
+        ),
+        {"user_id": user_id, "old_group_name": old_name, "new_group_name": new_name},
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return None
+
+    await session.execute(
+        text(
+            """
+            UPDATE watchlist
+            SET group_name = :new_group_name,
+                updated_at = NOW()
+            WHERE user_id = :user_id AND group_name = :old_group_name
+            """
+        ),
+        {"user_id": user_id, "old_group_name": old_name, "new_group_name": new_name},
+    )
+    await session.commit()
+    return dict(row)
+
+
+async def delete_watchlist_group(
+    session: AsyncSession,
+    group_name: str,
+    user_id: int = LOCAL_USER_ID,
+) -> bool:
+    name = group_name.strip()
+    if not name:
+        return False
+    if name == "默认":
+        raise ValueError("default watchlist group cannot be deleted")
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO watchlist_groups (user_id, group_name, updated_at)
+            VALUES (:user_id, '默认', NOW())
+            ON CONFLICT (user_id, group_name) DO NOTHING
+            """
+        ),
+        {"user_id": user_id},
+    )
+    await session.execute(
+        text(
+            """
+            DELETE FROM watchlist source
+            USING watchlist target
+            WHERE source.user_id = :user_id
+              AND source.group_name = :group_name
+              AND target.user_id = :user_id
+              AND target.group_name = '默认'
+              AND target.ts_code = source.ts_code
+            """
+        ),
+        {"user_id": user_id, "group_name": name},
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE watchlist
+            SET group_name = '默认',
+                updated_at = NOW()
+            WHERE user_id = :user_id AND group_name = :group_name
+            """
+        ),
+        {"user_id": user_id, "group_name": name},
+    )
+    result = await session.execute(
+        text(
+            """
+            DELETE FROM watchlist_groups
+            WHERE user_id = :user_id AND group_name = :group_name
+            """
+        ),
+        {"user_id": user_id, "group_name": name},
+    )
+    await session.commit()
+    return result.rowcount > 0
 
 
 async def add_watchlist_item(
@@ -289,6 +551,16 @@ async def add_watchlist_item(
     code = normalize_ts_code(ts_code)
     if not await stock_exists(session, code):
         raise ValueError(f"unknown ts_code: {code}")
+    await session.execute(
+        text(
+            """
+            INSERT INTO watchlist_groups (user_id, group_name, updated_at)
+            VALUES (:user_id, :group_name, NOW())
+            ON CONFLICT (user_id, group_name) DO NOTHING
+            """
+        ),
+        {"user_id": user_id, "group_name": group_name or "默认"},
+    )
     result = await session.execute(
         text(
             """

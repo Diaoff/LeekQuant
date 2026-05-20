@@ -13,9 +13,13 @@ from app.data.repository import upsert_stock_fundamentals
 from app.data.stock_service import (
     StockFilters,
     add_watchlist_item,
+    create_watchlist_group,
+    delete_watchlist_group,
     delete_watchlist_item,
     list_watchlist_groups,
     list_stocks,
+    rename_watchlist_group,
+    stock_name_initials,
     sync_fundamentals,
     update_watchlist_item,
 )
@@ -181,11 +185,58 @@ async def test_list_stocks_filters_by_market_segments() -> None:
     assert session.params[0]["market_1"] == "科创板"
 
 
+def test_stock_name_initials_supports_common_a_share_names() -> None:
+    assert stock_name_initials("纳百川") == "nbc"
+    assert stock_name_initials("招商银行") == "zsyh"
+    assert stock_name_initials("中国平安") == "zgpa"
+
+
+@pytest.mark.asyncio
+async def test_list_stocks_query_matches_chinese_initials_and_code_fuzzy() -> None:
+    rows = [
+        {"ts_code": "301667.SZ", "symbol": "301667", "name": "纳百川", "market": "创业板"},
+        {"ts_code": "600036.SH", "symbol": "600036", "name": "招商银行", "market": "主板"},
+        {"ts_code": "000001.SZ", "symbol": "000001", "name": "平安银行", "market": "主板"},
+    ]
+    session = CaptureSession([FakeResult(rows)])
+
+    initials_result = await list_stocks(session, StockFilters(query="nbc"))
+
+    assert initials_result["total"] == 1
+    assert initials_result["items"][0]["ts_code"] == "301667.SZ"
+
+    code_session = CaptureSession([FakeResult(rows)])
+    code_result = await list_stocks(code_session, StockFilters(query="0036"))
+
+    assert code_result["total"] == 1
+    assert code_result["items"][0]["ts_code"] == "600036.SH"
+
+
+@pytest.mark.asyncio
+async def test_list_stocks_query_matches_chinese_name_fuzzy() -> None:
+    session = CaptureSession(
+        [
+            FakeResult(
+                [
+                    {"ts_code": "301667.SZ", "symbol": "301667", "name": "纳百川"},
+                    {"ts_code": "600036.SH", "symbol": "600036", "name": "招商银行"},
+                ]
+            )
+        ]
+    )
+
+    result = await list_stocks(session, StockFilters(query="银行"))
+
+    assert result["total"] == 1
+    assert result["items"][0]["name"] == "招商银行"
+
+
 @pytest.mark.asyncio
 async def test_watchlist_add_update_delete_flow() -> None:
     session = CaptureSession(
         [
             FakeResult(scalar=1),
+            FakeResult(),
             FakeResult([{"id": 3, "group_name": "价值", "ts_code": "000001.SZ", "note": "low pe", "sort_order": 2}]),
             FakeResult([{"id": 3, "group_name": "银行", "ts_code": "000001.SZ", "note": "low pe", "sort_order": 1}]),
             FakeResult(rowcount=1),
@@ -199,8 +250,9 @@ async def test_watchlist_add_update_delete_flow() -> None:
     assert added["id"] == 3
     assert updated["group_name"] == "银行"
     assert deleted is True
-    assert "ON CONFLICT (user_id, group_name, ts_code)" in session.statements[1]
-    assert "group_name = :group_name" in session.statements[2]
+    assert "ON CONFLICT (user_id, group_name) DO NOTHING" in session.statements[1]
+    assert "ON CONFLICT (user_id, group_name, ts_code)" in session.statements[2]
+    assert "group_name = :group_name" in session.statements[3]
 
 
 @pytest.mark.asyncio
@@ -222,6 +274,53 @@ async def test_watchlist_group_summary_lists_group_counts() -> None:
         {"group_name": "默认", "item_count": 2},
         {"group_name": "成长", "item_count": 1},
     ]
+
+
+@pytest.mark.asyncio
+async def test_watchlist_group_create_rename_delete_flow_moves_items_to_default() -> None:
+    session = CaptureSession(
+        [
+            FakeResult([{"id": 5, "group_name": "价投"}]),
+            FakeResult(scalar=None),
+            FakeResult([{"id": 5, "group_name": "观察股"}]),
+            FakeResult(),
+            FakeResult(),
+            FakeResult(),
+            FakeResult(),
+            FakeResult(rowcount=1),
+        ]
+    )
+
+    created = await create_watchlist_group(session, "价投")
+    renamed = await rename_watchlist_group(session, "价投", "观察股")
+    deleted = await delete_watchlist_group(session, "观察股")
+
+    assert created["group_name"] == "价投"
+    assert renamed is not None
+    assert renamed["group_name"] == "观察股"
+    assert deleted is True
+    sql = "\n".join(session.statements)
+    assert "CREATE TABLE" not in sql
+    assert "UPDATE watchlist_groups" in sql
+    assert "UPDATE watchlist" in sql
+    assert "target.group_name = '默认'" in sql
+    assert "SET group_name = '默认'" in sql
+
+
+@pytest.mark.asyncio
+async def test_watchlist_group_rename_rejects_existing_name() -> None:
+    session = CaptureSession([FakeResult(scalar=1)])
+
+    with pytest.raises(ValueError, match="already exists"):
+        await rename_watchlist_group(session, "价投", "观察股")
+
+
+@pytest.mark.asyncio
+async def test_watchlist_group_delete_rejects_default() -> None:
+    session = CaptureSession()
+
+    with pytest.raises(ValueError, match="default watchlist group"):
+        await delete_watchlist_group(session, "默认")
 
 
 @pytest.mark.asyncio

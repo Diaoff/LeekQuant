@@ -9,9 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.stock_service import (
     add_watchlist_item,
+    create_watchlist_group,
+    delete_watchlist_group,
     delete_watchlist_item,
     list_watchlist,
     list_watchlist_groups,
+    rename_watchlist_group,
     update_watchlist_item,
 )
 from app.db.session import get_session
@@ -30,6 +33,14 @@ class WatchlistUpdateRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=64)
     note: str | None = None
     sort_order: int | None = None
+
+
+class WatchlistGroupCreateRequest(BaseModel):
+    group_name: str = Field(min_length=1, max_length=64)
+
+
+class WatchlistGroupUpdateRequest(BaseModel):
+    group_name: str = Field(min_length=1, max_length=64)
 
 
 @router.get("")
@@ -76,6 +87,54 @@ async def patch_watchlist(
     return item
 
 
+@router.get("/groups")
+async def get_watchlist_groups(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
+    return await list_watchlist_groups(session)
+
+
+@router.post("/groups")
+async def post_watchlist_group(
+    request: WatchlistGroupCreateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        return await create_watchlist_group(session, request.group_name)
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.patch("/groups/{group_name}")
+async def patch_watchlist_group(
+    group_name: str,
+    request: WatchlistGroupUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        item = await rename_watchlist_group(session, group_name, request.group_name)
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="watchlist group not found")
+    return item
+
+
+@router.delete("/groups/{group_name}")
+async def delete_watchlist_group_endpoint(
+    group_name: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
+    try:
+        deleted = await delete_watchlist_group(session, group_name)
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="watchlist group not found")
+    return {"deleted": True}
+
+
 @router.delete("/{item_id}")
 async def delete_watchlist(item_id: int, session: AsyncSession = Depends(get_session)) -> dict[str, bool]:
     deleted = await delete_watchlist_item(session, item_id)
@@ -110,8 +169,3 @@ async def get_watchlist_summary(session: AsyncSession = Depends(get_session)) ->
         "today_losers": row["today_losers"] if row else 0,
         "today_flat": row["today_flat"] if row else 0,
     }
-
-
-@router.get("/groups")
-async def get_watchlist_groups(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    return await list_watchlist_groups(session)

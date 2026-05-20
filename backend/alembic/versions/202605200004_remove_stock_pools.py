@@ -1,7 +1,7 @@
 """Remove stock pool tables and references.
 
 Revision ID: 202605200004
-Revises: 202605200003
+Revises: 202605200002
 Create Date: 2026-05-20 00:04:00
 """
 from collections.abc import Sequence
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "202605200004"
-down_revision: str | None = "202605200003"
+down_revision: str | None = "202605200002"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
