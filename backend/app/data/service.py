@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback
+from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback, get_data_proxy_url, stock_basic_providers
 from app.data.repository import (
     backfill_stock_basic_market,
     create_alert,
@@ -99,6 +100,13 @@ async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> l
     return _balanced_sample_stock_codes(result.all(), limit)
 
 
+async def select_all_stock_codes(session: AsyncSession) -> list[str]:
+    result = await session.execute(
+        text("SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE ORDER BY symbol")
+    )
+    return [row[0] for row in result.all()]
+
+
 async def get_data_status(session: AsyncSession) -> dict[str, Any]:
     result = await session.execute(
         text(
@@ -150,8 +158,8 @@ async def sync_stock_basic(
     session: AsyncSession,
     providers: list[DataProvider] | None = None,
 ) -> dict[str, Any]:
-    provider_list = providers or default_providers()
-    source, records = fetch_with_fallback(provider_list, "fetch_stock_basic")
+    provider_list = providers or stock_basic_providers()
+    source, records = fetch_with_fallback(provider_list, "fetch_stock_basic", proxy_url=get_data_proxy_url())
     valid_records = []
     invalid_records = []
     for record in records:
@@ -203,6 +211,7 @@ async def sync_trade_calendar(
         "fetch_trade_calendar",
         start_date,
         end_date,
+        proxy_url=get_data_proxy_url(),
     )
     for record in records:
         validate_trade_calendar(record)
@@ -215,17 +224,25 @@ async def sync_trade_calendar(
 
 
 async def sync_kline(
-    session: AsyncSession,
+    session: AsyncSession | None,
     ts_codes: list[str] | None,
     start_date: date,
     end_date: date,
     providers: list[DataProvider] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    commit_each: bool = False,
 ) -> dict[str, Any]:
+    from app.db.session import async_session_factory as _per_stock_sf
+
     provider_list = providers or default_providers()
-    codes = ts_codes or await select_sample_stock_codes(session)
-    if not codes:
-        await sync_stock_basic(session, provider_list)
+    if ts_codes is None:
+        assert session is not None, "session required when ts_codes is None"
         codes = await select_sample_stock_codes(session)
+        if not codes:
+            await sync_stock_basic(session, provider_list)
+            codes = await select_sample_stock_codes(session)
+    else:
+        codes = ts_codes
     if not codes:
         raise ValueError("no stock codes available after stock basic sync; pass ts_codes explicitly")
 
@@ -233,38 +250,70 @@ async def sync_kline(
     failures: list[dict[str, str]] = []
     source_counts: dict[str, int] = {}
 
-    for ts_code in codes:
+    for i, ts_code in enumerate(codes, start=1):
         try:
+            if progress_callback:
+                progress_callback(i, len(codes), ts_code)
             source, records = fetch_with_fallback(
                 provider_list,
                 "fetch_daily_kline",
                 ts_code,
                 start_date,
                 end_date,
+                proxy_url=get_data_proxy_url(),
             )
             for record in records:
                 validate_daily_kline(record)
-            count = await upsert_daily_kline(session, records)
+
+            if commit_each:
+                async with _per_stock_sf() as wk_session:
+                    count = await upsert_daily_kline(wk_session, records)
+                    latest = max((record.trade_date for record in records), default=None)
+                    await record_update_success(wk_session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+                    await wk_session.commit()
+            else:
+                assert session is not None
+                count = await upsert_daily_kline(session, records)
+                latest = max((record.trade_date for record in records), default=None)
+                await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+
             total += count
             source_counts[source] = source_counts.get(source, 0) + count
-            latest = max((record.trade_date for record in records), default=None)
-            await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
         except Exception as exc:
             message = str(exc)
             failures.append({"ts_code": ts_code, "error": message})
-            await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
+            if commit_each:
+                async with _per_stock_sf() as wk_session:
+                    await record_update_failure(wk_session, "daily_kline", "fallback", message, ts_code=ts_code)
+                    await wk_session.commit()
+            else:
+                assert session is not None
+                await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
 
     if failures:
-        await create_alert(
-            session,
-            level="warning" if total else "error",
-            category="data_sync",
-            title="Daily kline sync completed with failures",
-            message=f"{len(failures)} symbols failed during kline sync",
-            payload={"failures": failures[:20]},
-        )
+        if session is not None:
+            await create_alert(
+                session,
+                level="warning" if total else "error",
+                category="data_sync",
+                title="Daily kline sync completed with failures",
+                message=f"{len(failures)} symbols failed during kline sync",
+                payload={"failures": failures[:20]},
+            )
+        else:
+            async with _per_stock_sf() as alert_session:
+                await create_alert(
+                    alert_session,
+                    level="warning" if total else "error",
+                    category="data_sync",
+                    title="Daily kline sync completed with failures",
+                    message=f"{len(failures)} symbols failed during kline sync",
+                    payload={"failures": failures[:20]},
+                )
 
-    await session.commit()
+    if not commit_each:
+        assert session is not None
+        await session.commit()
     if total == 0 and failures:
         raise RuntimeError(f"all kline sync attempts failed: {failures[0]['error']}")
 
@@ -273,8 +322,6 @@ async def sync_kline(
         "inserted_or_updated": total,
         "source_counts": source_counts,
         "failures": failures,
-        "start_date": start_date,
-        "end_date": end_date,
     }
 
 

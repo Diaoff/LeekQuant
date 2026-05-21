@@ -636,7 +636,7 @@ export function createSignatureHelpProvider(
       position: monaco.Position,
       _token: monaco.CancellationToken,
       _context: monaco.languages.SignatureHelpContext
-    ): monaco.languages.ProviderResult<monaco.languages.SignatureHelp> {
+    ): monaco.languages.ProviderResult<monaco.languages.SignatureHelpResult> {
       const textUntilPosition = model.getValueInRange({
         startLineNumber: position.lineNumber,
         startColumn: 1,

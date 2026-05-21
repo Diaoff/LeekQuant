@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback
+from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback, get_data_proxy_url
 from app.data.normalizers import normalize_ts_code
 from app.data.repository import (
     create_alert,
@@ -150,7 +150,7 @@ def _stock_where(filters: StockFilters, *, include_query: bool = True) -> tuple[
     if filters.exclude_st:
         clauses.append("s.is_st = FALSE")
     if filters.exclude_delisted:
-        clauses.append("s.is_delisted = FALSE")
+        clauses.append("(s.is_delisted = FALSE AND s.delist_date IS NULL)")
     _range_filter("f.pe_ttm", filters.pe_min, filters.pe_max, clauses, params, "pe")
     _range_filter("f.pb", filters.pb_min, filters.pb_max, clauses, params, "pb")
     _range_filter("f.market_cap", filters.market_cap_min, filters.market_cap_max, clauses, params, "market_cap")
@@ -233,16 +233,23 @@ async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 
                 SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
                 FROM daily_kline
                 ORDER BY ts_code, trade_date DESC
+            ),
+            kline_counts AS (
+                SELECT ts_code, COUNT(*) AS count
+                FROM daily_kline
+                GROUP BY ts_code
             )
             SELECT
                 s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
                 s.list_date, s.delist_date, s.is_st, s.is_delisted,
                 f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
                 f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source,
-                k.trade_date AS latest_trade_date, k.close AS latest_close
+                k.trade_date AS latest_trade_date, k.close AS latest_close,
+                COALESCE(kc.count, 0) AS daily_kline_count
             FROM stock_basic s
             LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
             LEFT JOIN latest_kline k ON k.ts_code = s.ts_code
+            LEFT JOIN kline_counts kc ON kc.ts_code = s.ts_code
             {where_sql}
             ORDER BY s.symbol
             LIMIT :limit OFFSET :offset
@@ -278,16 +285,23 @@ async def _list_stocks_with_fuzzy_query(
                 SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
                 FROM daily_kline
                 ORDER BY ts_code, trade_date DESC
+            ),
+            kline_counts AS (
+                SELECT ts_code, COUNT(*) AS count
+                FROM daily_kline
+                GROUP BY ts_code
             )
             SELECT
                 s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
                 s.list_date, s.delist_date, s.is_st, s.is_delisted,
                 f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
                 f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source,
-                k.trade_date AS latest_trade_date, k.close AS latest_close
+                k.trade_date AS latest_trade_date, k.close AS latest_close,
+                COALESCE(kc.count, 0) AS daily_kline_count
             FROM stock_basic s
             LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
             LEFT JOIN latest_kline k ON k.ts_code = s.ts_code
+            LEFT JOIN kline_counts kc ON kc.ts_code = s.ts_code
             {where_sql}
             ORDER BY s.symbol
             """
@@ -359,14 +373,15 @@ async def list_watchlist(
         text(
             f"""
             WITH latest_kline AS (
-                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
+                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close, pre_close
                 FROM daily_kline
                 ORDER BY ts_code, trade_date DESC
             )
             SELECT
                 w.id, w.group_name, w.ts_code, w.sort_order, w.note, w.added_at,
                 s.name, s.industry, s.market, s.exchange, s.is_st, s.is_delisted,
-                k.trade_date AS latest_trade_date, k.close AS latest_close
+                k.trade_date AS latest_trade_date, k.close AS latest_close,
+                k.pre_close AS pre_close
             FROM watchlist w
             JOIN stock_basic s ON s.ts_code = w.ts_code
             LEFT JOIN latest_kline k ON k.ts_code = w.ts_code
@@ -663,7 +678,7 @@ async def sync_fundamentals(
 
     for code in codes:
         try:
-            source, records = fetch_with_fallback(provider_list, "fetch_stock_fundamentals", [code], start_date, end_date)
+            source, records = fetch_with_fallback(provider_list, "fetch_stock_fundamentals", [code], start_date, end_date, proxy_url=get_data_proxy_url())
             count = await upsert_stock_fundamentals(session, records)
             total += count
             source_counts[source] = source_counts.get(source, 0) + count

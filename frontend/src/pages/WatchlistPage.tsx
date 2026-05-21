@@ -2,6 +2,7 @@ import React from 'react'
 import { AlertTriangle, Search, Loader2, Plus, X, Menu, Pencil, Trash2, Settings2, Check } from 'lucide-react'
 import { fetchJson, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
+import WatchlistSparkline from '../components/WatchlistSparkline'
 
 interface WatchlistItem {
   id: number
@@ -11,6 +12,7 @@ interface WatchlistItem {
   added_at: string
   note: string | null
   latest_close: string | null
+  pre_close: string | null
   latest_trade_date: string | null
 }
 
@@ -272,7 +274,7 @@ export default function WatchlistPage() {
         </div>
 
         {loading ? (
-          <div className="px-4 py-4"><Skeleton.Table rows={8} columns={6} /></div>
+          <div className="px-4 py-4"><Skeleton.Table rows={8} columns={7} /></div>
         ) : activeItems.length === 0 ? (
           <div className="px-4 py-16 text-center text-sm text-muted">
             当前分组暂无自选股
@@ -283,6 +285,7 @@ export default function WatchlistPage() {
               <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
                 <tr>
                   <th className="px-4 py-3">名称</th>
+                  <th className="px-4 py-3">K线</th>
                   <th className="px-4 py-3">价格</th>
                   <th className="px-4 py-3">加入时间</th>
                   <th className="px-4 py-3">备注</th>
@@ -295,6 +298,13 @@ export default function WatchlistPage() {
                     <td className="whitespace-nowrap px-4 py-3">
                       <div className="font-semibold text-ink">{stock.name}</div>
                       <div className="font-mono text-xs text-muted">{stock.ts_code}</div>
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3">
+                      <WatchlistSparkline
+                        latestClose={stock.latest_close ? Number(stock.latest_close) : null}
+                        preClose={stock.pre_close ? Number(stock.pre_close) : null}
+                        tsCode={stock.ts_code}
+                      />
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-base tabular-nums">{stock.latest_close ?? '—'}</td>
                     <td className="whitespace-nowrap px-4 py-3 text-muted">{new Date(stock.added_at).toLocaleDateString('zh-CN')}</td>

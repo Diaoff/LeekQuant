@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.service import default_kline_window, get_data_status, sync_kline, sync_stock_basic, sync_trade_calendar
+from app.data.service import default_kline_window, get_data_status, select_all_stock_codes, sync_kline, sync_stock_basic, sync_trade_calendar
 from app.db.session import get_session
 
 router = APIRouter(prefix="/api/data", tags=["data"])
@@ -61,7 +61,10 @@ async def sync_kline_endpoint(
     start = request.start_date or default_start
     end = request.end_date or default_end
     try:
-        return await sync_kline(session, request.ts_codes, start, end)
+        codes = request.ts_codes
+        if codes is None:
+            codes = await select_all_stock_codes(session)
+        return await sync_kline(session, codes, start, end)
     except ValueError as exc:
         await session.rollback()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

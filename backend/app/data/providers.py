@@ -182,8 +182,24 @@ class AkShareProvider:
         except ImportError as exc:
             raise DataProviderError("akshare is not installed") from exc
 
+        result: list[StockBasic] = []
         frame = ak.stock_info_a_code_name()
-        return [normalize_stock_basic(row, self.name) for row in dataframe_records(frame)]
+        result.extend(normalize_stock_basic(row, self.name) for row in dataframe_records(frame))
+
+        try:
+            for func_name in ("stock_info_sh_delist", "stock_info_sz_delist"):
+                try:
+                    delist_frame = getattr(ak, func_name)()
+                except Exception:
+                    continue
+                for row in dataframe_records(delist_frame):
+                    basic = normalize_stock_basic(row, self.name)
+                    if basic.is_delisted or basic.delist_date is not None:
+                        result.append(basic)
+        except Exception:
+            pass
+
+        return result
 
     def fetch_trade_calendar(self, start_date: date, end_date: date) -> list[TradeCalendarDay]:
         try:

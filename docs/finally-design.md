@@ -1688,7 +1688,7 @@ beat_schedule = {
 | --- | --- | --- | --- |
 | M0 基础环境 | Docker Compose、PostgreSQL、Redis、FastAPI、React 空壳 | 可一键启动，健康检查通过 | `docker compose up`，API `/health` |
 | M1 数据基座 | 股票列表、交易日历、日线 K 线全量和增量 | `stock_basic`、`daily_kline`、`trade_calendar` 有数据 | 随机股票 K 线与源数据比对 |
-| M2 股票池与自选股 | 动态筛选、自选分组、基础前端页面 | 股票池 API、自选股 API、市场页 | 筛选 ST / 退市 / 行业条件 |
+| M2 股票池与自选股 | 动态筛选、自选分组、基础前端页面 | 市场筛选、自选分组、自选股 API、市场页 | 筛选 ST / 退市 / 行业条件 |
 | M3 策略与回测 | Monaco 编辑、MyTT 提示、Hikyuu 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
 | M4 信号与模拟交易 | 五档信号、模拟交易 6 表、T+1 / 涨跌停 / 费用 | 信号中心、模拟账户闭环 | 资金守恒和 T+1 单测 |
 | M5 多因子 | 因子定义、计算、IC/IR、排行榜 | 因子页、排行榜、股票池导入 | IC 计算样例验证 |

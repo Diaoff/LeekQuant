@@ -1,9 +1,15 @@
 import React from 'react'
-import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshCw, Server, Table2, CalendarDays } from 'lucide-react'
+import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshCw, Server, Table2, CalendarDays, Layers } from 'lucide-react'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 
 type HealthState = 'checking' | 'ok' | 'error'
-type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'fundamentals'
+type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'all-kline' | 'fundamentals'
+
+interface ProgressMeta {
+  current: number
+  total: number
+  current_code: string
+}
 
 interface EndpointHealth {
   state: HealthState
@@ -130,6 +136,9 @@ export default function StatusPage() {
   const [activeAction, setActiveAction] = React.useState<ActionKey | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const [progressTaskId, setProgressTaskId] = React.useState<string | null>(null)
+  const [progressMeta, setProgressMeta] = React.useState<ProgressMeta | null>(null)
+  const [progressDone, setProgressDone] = React.useState(false)
 
   const refreshStatus = React.useCallback(async () => {
     setIsRefreshing(true)
@@ -168,6 +177,17 @@ export default function StatusPage() {
         const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sample-kline', { method: 'POST', body: JSON.stringify({}) })
         setNotice(`小样本 K 线任务已提交：${result.task_id}`)
       }
+      if (action === 'all-kline') {
+        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sync-all-kline', { method: 'POST', body: JSON.stringify({}) })
+        setNotice(`全量 K 线同步任务已提交：${result.task_id}`)
+        setProgressTaskId(result.task_id)
+        setProgressMeta(null)
+        setProgressDone(false)
+        return
+      }
+      setProgressTaskId(null)
+      setProgressMeta(null)
+      setProgressDone(false)
       if (action === 'fundamentals') {
         const result = await fetchJson<{ task_id: string }>('/api/tasks/data/fundamentals', { method: 'POST', body: JSON.stringify({}) })
         setNotice(`基本面同步任务已提交：${result.task_id}`)
@@ -183,6 +203,28 @@ export default function StatusPage() {
   React.useEffect(() => {
     void refreshStatus()
   }, [refreshStatus])
+
+  React.useEffect(() => {
+    if (!progressTaskId) return
+    const interval = setInterval(async () => {
+      try {
+        const result = await fetchJson<{ meta?: ProgressMeta; ready: boolean }>(`/api/tasks/${progressTaskId}`)
+        if (result.meta) {
+          setProgressMeta(result.meta)
+        }
+        if (result.ready) {
+          setProgressDone(true)
+          setNotice('全量 K 线同步完成')
+          clearInterval(interval)
+          void refreshStatus()
+        }
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught))
+        clearInterval(interval)
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [progressTaskId, refreshStatus])
 
   const metrics = dataStatus ?? {
     stock_basic_count: 0,
@@ -205,10 +247,44 @@ export default function StatusPage() {
         </section>
       )}
 
+      {progressTaskId && !progressDone && progressMeta && (
+        <section className="rounded-lg border border-blue-200 bg-blue-50 p-4">
+          <div className="mb-2 flex items-center gap-2">
+            <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
+            <span className="text-sm font-medium text-blue-900">全量 K 线同步进行中</span>
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-blue-200">
+            <div
+              className="h-full rounded-full bg-blue-600 transition-all duration-500"
+              style={{ width: `${Math.round((progressMeta.current / progressMeta.total) * 100)}%` }}
+            />
+          </div>
+          <p className="mt-1 text-xs text-blue-700">
+            {progressMeta.current} / {progressMeta.total} 只 · 当前: {progressMeta.current_code}
+          </p>
+        </section>
+      )}
+      {progressDone && (
+        <section className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+            <span className="font-medium">全量 K 线同步完成</span>
+            <button
+              type="button"
+              onClick={() => { setProgressTaskId(null); setProgressDone(false); setProgressMeta(null) }}
+              className="ml-auto text-xs text-emerald-700 underline"
+            >
+              关闭
+            </button>
+          </div>
+        </section>
+      )}
+
       <div className="flex flex-wrap gap-3">
         <ActionButton action="stock-basic" activeAction={activeAction} icon={<Database className="h-4 w-4" aria-hidden="true" />} label="同步股票" onClick={() => void runAction('stock-basic')} />
         <ActionButton action="trade-calendar" activeAction={activeAction} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
         <ActionButton action="sample-kline" activeAction={activeAction} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
+        <ActionButton action="all-kline" activeAction={activeAction} icon={<Layers className="h-4 w-4" aria-hidden="true" />} label="全量 K 线" onClick={() => void runAction('all-kline')} />
         <ActionButton action="fundamentals" activeAction={activeAction} icon={<Table2 className="h-4 w-4" aria-hidden="true" />} label="同步基本面" onClick={() => void runAction('fundamentals')} />
         <button
           type="button"

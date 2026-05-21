@@ -1,5 +1,5 @@
 import React from 'react'
-import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw, Star } from 'lucide-react'
+import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw, Star, Loader2, X } from 'lucide-react'
 import { fetchJson, formatMarketCap, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
@@ -17,6 +17,7 @@ interface StockBasic {
   pe_ttm: string | null
   pb: string | null
   market_cap: string | null
+  daily_kline_count: number
 }
 
 interface MarketStock {
@@ -37,6 +38,11 @@ interface StocksApiResponse {
   page: number
   page_size: number
   total: number
+}
+
+interface WatchlistGroupOption {
+  group_name: string
+  item_count: number
 }
 
 type TabKey = 'basic' | 'daily'
@@ -76,6 +82,15 @@ const DEFAULT_FILTERS: MarketFilterState = {
 
 const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所']
 const EXCHANGE_OPTIONS = ['SH', 'SZ', 'BJ']
+const DEFAULT_GROUP_NAME = '默认'
+
+const defaultWatchlistGroups = (): WatchlistGroupOption[] => [{ group_name: DEFAULT_GROUP_NAME, item_count: 0 }]
+
+const normalizeWatchlistGroups = (groups: WatchlistGroupOption[]): WatchlistGroupOption[] => {
+  const nextGroups = groups.length > 0 ? groups : defaultWatchlistGroups()
+  if (nextGroups.some((group) => group.group_name === DEFAULT_GROUP_NAME)) return nextGroups
+  return [...defaultWatchlistGroups(), ...nextGroups]
+}
 
 const numericValue = (value: string): number | null => {
   const trimmed = value.trim()
@@ -165,6 +180,9 @@ export default function MarketPage() {
   const [syncing, setSyncing] = React.useState(false)
   const [addingWatchlistCode, setAddingWatchlistCode] = React.useState<string | null>(null)
   const [syncingKlineCode, setSyncingKlineCode] = React.useState<string | null>(null)
+  const [watchlistGroups, setWatchlistGroups] = React.useState<WatchlistGroupOption[]>(defaultWatchlistGroups)
+  const [watchlistModalStock, setWatchlistModalStock] = React.useState<RowActionStock | null>(null)
+  const [selectedWatchlistGroups, setSelectedWatchlistGroups] = React.useState<string[]>([DEFAULT_GROUP_NAME])
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [query, setQuery] = React.useState('')
@@ -176,6 +194,15 @@ export default function MarketPage() {
 
   const activeFilterSummary = React.useMemo(() => filterSummary(filters), [filters])
   const filterErrors = React.useMemo(() => collectFilterErrors(filters), [filters])
+
+  const loadWatchlistGroups = React.useCallback(async () => {
+    try {
+      const data = await fetchJson<WatchlistGroupOption[]>('/api/watchlist/groups')
+      setWatchlistGroups(normalizeWatchlistGroups(data))
+    } catch {
+      setWatchlistGroups(defaultWatchlistGroups())
+    }
+  }, [])
 
   const loadStocks = React.useCallback(async () => {
     setLoading(true)
@@ -237,22 +264,50 @@ export default function MarketPage() {
     else await loadDaily()
   }, [loadDaily, loadStocks, tab])
 
-  const addToWatchlist = React.useCallback(async (stock: RowActionStock) => {
-    setAddingWatchlistCode(stock.ts_code)
+  const openWatchlistModal = React.useCallback((stock: RowActionStock) => {
+    setWatchlistModalStock(stock)
+    setSelectedWatchlistGroups([DEFAULT_GROUP_NAME])
+    setNotice(null)
+    setError(null)
+    void loadWatchlistGroups()
+  }, [loadWatchlistGroups])
+
+  const closeWatchlistModal = React.useCallback(() => {
+    if (addingWatchlistCode) return
+    setWatchlistModalStock(null)
+  }, [addingWatchlistCode])
+
+  const toggleWatchlistGroup = React.useCallback((groupName: string) => {
+    setSelectedWatchlistGroups((current) => (
+      current.includes(groupName)
+        ? current.filter((name) => name !== groupName)
+        : [...current, groupName]
+    ))
+  }, [])
+
+  const addToWatchlist = React.useCallback(async () => {
+    if (!watchlistModalStock || selectedWatchlistGroups.length === 0) return
+    setAddingWatchlistCode(watchlistModalStock.ts_code)
     setNotice(null)
     setError(null)
     try {
-      await fetchJson('/api/watchlist', {
-        method: 'POST',
-        body: JSON.stringify({ ts_code: stock.ts_code, group_name: '默认' }),
-      })
-      setNotice(`已添加 ${stock.ts_code} 到默认自选`)
+      await Promise.all(selectedWatchlistGroups.map((groupName) => (
+        fetchJson('/api/watchlist', {
+          method: 'POST',
+          body: JSON.stringify({ ts_code: watchlistModalStock.ts_code, group_name: groupName }),
+        })
+      )))
+      const targetText = selectedWatchlistGroups.length === 1
+        ? `${selectedWatchlistGroups[0]}自选`
+        : `${selectedWatchlistGroups.length} 个自选分类`
+      setNotice(`已添加 ${watchlistModalStock.ts_code} 到 ${targetText}`)
+      setWatchlistModalStock(null)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setAddingWatchlistCode(null)
     }
-  }, [])
+  }, [selectedWatchlistGroups, watchlistModalStock])
 
   const syncRowKline = React.useCallback(async (stock: RowActionStock) => {
     setSyncingKlineCode(stock.ts_code)
@@ -311,10 +366,10 @@ export default function MarketPage() {
       <div className="flex justify-end gap-2">
         <button
           type="button"
-          onClick={() => void addToWatchlist(stock)}
+          onClick={() => openWatchlistModal(stock)}
           disabled={adding}
           className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-line px-2.5 text-xs font-semibold text-ink transition hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-60"
-          title={`添加 ${stock.ts_code} 到默认自选`}
+          title={`选择 ${stock.ts_code} 的自选分类`}
         >
           <Star className="h-3.5 w-3.5" />
           {adding ? '添加中' : '加自选'}
@@ -335,6 +390,16 @@ export default function MarketPage() {
 
   React.useEffect(() => { void loadStocks() }, [loadStocks])
   React.useEffect(() => { void loadDaily() }, [loadDaily])
+  React.useEffect(() => { void loadWatchlistGroups() }, [loadWatchlistGroups])
+
+  React.useEffect(() => {
+    if (!watchlistModalStock) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeWatchlistModal()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [closeWatchlistModal, watchlistModalStock])
 
   return (
     <>
@@ -477,10 +542,10 @@ export default function MarketPage() {
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-line text-left text-sm">
                 <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th><th className="px-4 py-3 text-right">操作</th></tr>
+                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th><th className="px-4 py-3">K线</th><th className="px-4 py-3 text-right">操作</th></tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {loading ? (<tr><td colSpan={7} className="px-4 py-4"><Skeleton.Table rows={5} columns={7} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
+                  {loading ? (<tr><td colSpan={8} className="px-4 py-4"><Skeleton.Table rows={5} columns={8} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={8} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
                     <tr key={stock.ts_code} className="hover:bg-rowHover">
                       <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
                       <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
@@ -488,6 +553,7 @@ export default function MarketPage() {
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.list_date ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.exchange ?? '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{stock.latest_close ?? '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{stock.daily_kline_count ?? 0}</td>
                       <td className="whitespace-nowrap px-4 py-3">{renderRowActions(stock)}</td>
                     </tr>
                   ))}
@@ -567,6 +633,74 @@ export default function MarketPage() {
           </>
         )}
       </section>
+
+      {watchlistModalStock && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 py-6" role="dialog" aria-modal="true" aria-labelledby="market-watchlist-title" onMouseDown={closeWatchlistModal}>
+          <div className="w-full max-w-md rounded-lg border border-line bg-panel shadow-2xl" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4 border-b border-line px-6 py-5">
+              <div className="min-w-0">
+                <h2 id="market-watchlist-title" className="text-lg font-bold text-ink">选择自选分类</h2>
+                <p className="mt-1 truncate text-sm text-muted">
+                  {watchlistModalStock.name} · <span className="font-mono">{watchlistModalStock.ts_code}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeWatchlistModal}
+                disabled={addingWatchlistCode === watchlistModalStock.ts_code}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted hover:bg-rowHover hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                aria-label="关闭"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto px-6 py-4">
+              <div className="divide-y divide-line rounded-md border border-line">
+                {watchlistGroups.map((group) => {
+                  const checked = selectedWatchlistGroups.includes(group.group_name)
+                  return (
+                    <label key={group.group_name} className="flex min-h-12 cursor-pointer items-center gap-3 px-4 py-3 hover:bg-rowHover">
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleWatchlistGroup(group.group_name)}
+                        disabled={addingWatchlistCode === watchlistModalStock.ts_code}
+                        className="h-4 w-4 accent-accent"
+                      />
+                      <span className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">{group.group_name}</span>
+                      <span className="text-xs text-muted">{formatNumber(group.item_count)} 只</span>
+                    </label>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 border-t border-line px-6 py-4">
+              <span className="text-sm text-muted">已选择 {formatNumber(selectedWatchlistGroups.length)} 个分类</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={closeWatchlistModal}
+                  disabled={addingWatchlistCode === watchlistModalStock.ts_code}
+                  className="h-9 rounded-md border border-line px-3 text-sm font-semibold text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void addToWatchlist()}
+                  disabled={addingWatchlistCode === watchlistModalStock.ts_code || selectedWatchlistGroups.length === 0}
+                  className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {addingWatchlistCode === watchlistModalStock.ts_code && <Loader2 className="h-4 w-4 animate-spin" />}
+                  确认加入
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
     </>
   )

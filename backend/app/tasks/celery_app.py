@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 from celery import Celery
+from celery.schedules import crontab
 
 from app.core.config import get_settings
 
@@ -19,13 +18,21 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="Asia/Shanghai",
     beat_schedule={
-        "daily-incremental-kline": {
-            "task": "app.tasks.data_tasks.incremental_kline_update",
-            "schedule": 60 * 60 * 24,
+        "update-stock-basic-weekly": {
+            "task": "app.tasks.data_tasks.update_stock_basic",
+            "schedule": crontab(day_of_week="saturday", hour=3, minute=0),
         },
-        "daily-fundamentals": {
+        "update-trade-calendar-weekly": {
+            "task": "app.tasks.data_tasks.update_trade_calendar",
+            "schedule": crontab(day_of_week="sunday", hour=2, minute=0),
+        },
+        "incremental-kline-daily": {
+            "task": "app.tasks.data_tasks.incremental_kline_update",
+            "schedule": crontab(hour=18, minute=0),
+        },
+        "update-fundamentals-daily": {
             "task": "app.tasks.data_tasks.sync_fundamentals",
-            "schedule": 60 * 60 * 24,
-        }
+            "schedule": crontab(hour=19, minute=30),
+        },
     },
 )

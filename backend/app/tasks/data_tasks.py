@@ -12,6 +12,7 @@ from sqlalchemy import text
 from app.data.service import (
     default_kline_window,
     infer_incremental_kline_window,
+    select_all_stock_codes,
     sync_kline,
     sync_stock_basic,
     sync_trade_calendar,
@@ -204,13 +205,52 @@ def incremental_kline_update(self) -> dict[str, Any]:
         start, end = await infer_incremental_kline_window(session)
         if start is None or end is None:
             return {"skipped": True, "reason": "no new open trade dates"}
-        return await sync_kline(session, None, start, end)
+        all_codes = await select_all_stock_codes(session)
+        return await sync_kline(session, all_codes, start, end)
 
     return asyncio.run(
         _run_tracked(
             "incremental_kline_update",
             self.request.id,
             {},
+            run,
+        )
+    )
+
+
+@celery_app.task(name="app.tasks.data_tasks.sync_all_kline", bind=True)
+def sync_all_kline(
+    self,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    default_start, default_end = default_kline_window()
+    start = date.fromisoformat(start_date) if start_date else default_start
+    end = date.fromisoformat(end_date) if end_date else default_end
+
+    async def run(session) -> dict[str, Any]:
+        all_codes = await select_all_stock_codes(session)
+        await session.close()
+        total = len(all_codes)
+
+        def progress(i: int, _total: int, code: str) -> None:
+            if i != 1 and i != total and i % 10 != 0:
+                return
+            try:
+                self.update_state(
+                    state="PROGRESS",
+                    meta={"current": i, "total": total, "current_code": code},
+                )
+            except Exception:
+                pass
+
+        return await sync_kline(None, all_codes, start, end, progress_callback=progress, commit_each=True)
+
+    return asyncio.run(
+        _run_tracked(
+            "sync_all_kline",
+            self.request.id,
+            {"start_date": start, "end_date": end},
             run,
         )
     )

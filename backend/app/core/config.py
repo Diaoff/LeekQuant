@@ -19,6 +19,7 @@ class Settings(BaseSettings):
         default="http://localhost:5173,http://127.0.0.1:5173",
         alias="BACKEND_CORS_ORIGINS",
     )
+    data_proxy_url: str | None = Field(default=None, alias="DATA_PROXY_URL")
 
     @field_validator("database_url")
     @classmethod

@@ -98,7 +98,7 @@ def normalize_ts_code(value: Any) -> str:
 
 
 def normalize_stock_basic(row: Mapping[str, Any], source: str) -> StockBasic:
-    ts_code = normalize_ts_code(first_value(row, "ts_code", "code", "stock_code", "证券代码", "代码"))
+    ts_code = normalize_ts_code(first_value(row, "ts_code", "code", "stock_code", "证券代码", "代码", "公司代码"))
     symbol = ts_code.split(".", 1)[0]
     name = str(
         first_value(
@@ -111,14 +111,17 @@ def normalize_stock_basic(row: Mapping[str, Any], source: str) -> StockBasic:
             "证券名称",
             "股票简称",
             "名称",
+            "公司简称",
         )
         or ""
     ).strip()
     list_date = parse_date(first_value(row, "list_date", "上市日期", "ipo_date"))
-    delist_date = parse_date(first_value(row, "delist_date", "退市日期"))
+    delist_date = parse_date(first_value(row, "delist_date", "退市日期", "outDate", "终止上市日期", "暂停上市日期"))
+    raw_status = first_value(row, "status")
+    baostock_delisted = raw_status is not None and str(raw_status).strip() == "0"
     market = first_value(row, "market", "type", "板块") or infer_market(ts_code)
     exchange = first_value(row, "exchange", "交易所") or infer_exchange(ts_code)
-    is_delisted = delist_date is not None or truthy(first_value(row, "is_delisted", "退市", "delisted"))
+    is_delisted = delist_date is not None or baostock_delisted or truthy(first_value(row, "is_delisted", "退市", "delisted"))
 
     return StockBasic(
         ts_code=ts_code,
