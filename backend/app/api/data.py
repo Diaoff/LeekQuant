@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from uuid import uuid4
 
+from celery.result import AsyncResult
 from fastapi import APIRouter, Body, Depends, HTTPException, status
+from kombu.exceptions import OperationalError
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.service import default_kline_window, get_data_status, select_all_stock_codes, sync_kline, sync_stock_basic, sync_trade_calendar
-from app.db.session import get_session
+from app.data.service import get_data_status, sync_stock_basic, sync_trade_calendar
+from app.data.repository import create_pending_task_run, mark_task_run_queue_failed
+from app.db.session import async_session_factory, get_session
+from app.tasks.celery_app import celery_app
+from app.tasks.data_tasks import sync_sample_kline
 
 router = APIRouter(prefix="/api/data", tags=["data"])
 
@@ -55,19 +61,43 @@ async def sync_trade_calendar_endpoint(
 @router.post("/sync/kline")
 async def sync_kline_endpoint(
     request: KlineSyncRequest = Body(default_factory=KlineSyncRequest),
-    session: AsyncSession = Depends(get_session),
 ) -> dict:
-    default_start, default_end = default_kline_window()
-    start = request.start_date or default_start
-    end = request.end_date or default_end
+    task_id = uuid4().hex
+    payload: dict = {
+        "ts_codes": request.ts_codes,
+        "start_date": request.start_date.isoformat() if request.start_date else None,
+        "end_date": request.end_date.isoformat() if request.end_date else None,
+    }
+    async with async_session_factory() as session:
+        await create_pending_task_run(
+            session,
+            task_name="sync_sample_kline",
+            task_id=task_id,
+            payload=payload,
+        )
     try:
-        codes = request.ts_codes
-        if codes is None:
-            codes = await select_all_stock_codes(session)
-        return await sync_kline(session, codes, start, end)
-    except ValueError as exc:
-        await session.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-    except Exception as exc:
-        await session.rollback()
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        sync_sample_kline.apply_async(kwargs=payload, task_id=task_id)
+    except OperationalError as exc:
+        async with async_session_factory() as session:
+            await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.get("/sync/kline/result/{task_id}")
+async def sync_kline_result(task_id: str) -> dict:
+    async_result = AsyncResult(task_id, app=celery_app)
+    result: dict = {
+        "task_id": task_id,
+        "status": async_result.status.lower(),
+        "ready": async_result.ready(),
+    }
+    if async_result.ready():
+        if async_result.failed():
+            result["error"] = str(async_result.result)
+        else:
+            result["result"] = async_result.result
+    return result

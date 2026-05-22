@@ -7,6 +7,9 @@ import {
   Star,
   Code,
   BarChart3,
+  RadioTower,
+  WalletCards,
+  Settings,
   ChevronLeft,
   ChevronRight,
   Sun,
@@ -14,7 +17,7 @@ import {
 } from 'lucide-react'
 import { useTheme } from '../lib/theme'
 
-type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest'
+type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest' | 'signals' | 'simulation' | 'sources'
 
 const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: string }> = [
   { key: 'dashboard', label: '仪表盘', icon: <LayoutDashboard className="h-5 w-5" />, to: '/' },
@@ -23,6 +26,9 @@ const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: 
   { key: 'watchlist', label: '自选股', icon: <Star className="h-5 w-5" />, to: '/watchlist' },
   { key: 'strategy', label: '策略中心', icon: <Code className="h-5 w-5" />, to: '/strategy' },
   { key: 'backtest', label: '回测', icon: <BarChart3 className="h-5 w-5" />, to: '/backtests' },
+  { key: 'signals', label: '信号中心', icon: <RadioTower className="h-5 w-5" />, to: '/signals' },
+  { key: 'simulation', label: '模拟交易', icon: <WalletCards className="h-5 w-5" />, to: '/simulation' },
+  { key: 'sources', label: '数据源', icon: <Settings className="h-5 w-5" />, to: '/sources' },
 ]
 
 const SIDEBAR_EXPANDED_WIDTH = 240
@@ -61,6 +67,9 @@ export default function Layout({ children }: LayoutProps) {
     if (path === '/watchlist') return 'watchlist'
     if (path === '/strategy') return 'strategy'
     if (path.startsWith('/backtests')) return 'backtest'
+    if (path === '/signals') return 'signals'
+    if (path === '/simulation') return 'simulation'
+    if (path === '/sources') return 'sources'
     return 'dashboard'
   }, [location.pathname])
 

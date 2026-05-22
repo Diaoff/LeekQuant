@@ -1,0 +1,299 @@
+import React from 'react'
+import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal } from 'lucide-react'
+import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
+import Skeleton from '../components/Skeleton'
+
+interface SignalLog {
+  id: number
+  strategy_name: string | null
+  account_name: string | null
+  ts_code: string
+  stock_name: string | null
+  trade_date: string
+  signal_type: string
+  target_position: string
+  current_position: string
+  action: string | null
+  confidence: string | null
+  reason: string | null
+  snapshot: Record<string, unknown> | null
+  created_at: string
+}
+
+interface SignalResponse {
+  items: SignalLog[]
+  page: number
+  page_size: number
+  total: number
+  summary: SignalSummary
+}
+
+interface SignalSummary {
+  buy_count: number
+  add_count: number
+  reduce_count: number
+  sell_count: number
+  hold_count: number
+  blocked_count: number
+}
+
+const signalTypes = ['', '买入', '增持', '减仓', '卖出', '观望']
+
+function signalTone(type: string) {
+  if (type === '买入' || type === '增持') return 'bg-red-50 text-red-700 border-red-200'
+  if (type === '减仓' || type === '卖出') return 'bg-emerald-50 text-emerald-700 border-emerald-200'
+  return 'bg-slate-100 text-slate-700 border-slate-200'
+}
+
+function actionTone(action: string | null) {
+  if (action === 'BLOCKED') return 'text-warn'
+  if (action?.startsWith('SELL')) return 'text-emerald-600'
+  if (action === 'BUY') return 'text-red-600'
+  return 'text-muted'
+}
+
+export default function SignalsPage() {
+  const [signals, setSignals] = React.useState<SignalLog[]>([])
+  const [total, setTotal] = React.useState(0)
+  const [summary, setSummary] = React.useState<SignalSummary>({
+    buy_count: 0,
+    add_count: 0,
+    reduce_count: 0,
+    sell_count: 0,
+    hold_count: 0,
+    blocked_count: 0,
+  })
+  const [loading, setLoading] = React.useState(true)
+  const [error, setError] = React.useState<string | null>(null)
+  const [selected, setSelected] = React.useState<SignalLog | null>(null)
+  const [filters, setFilters] = React.useState({
+    ts_code: '',
+    signal_type: '',
+    start_date: '',
+    end_date: '',
+    strategy_id: '',
+    account_id: '',
+  })
+
+  const loadSignals = React.useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    const params = new URLSearchParams({ page_size: '80' })
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value.trim()) params.set(key, value.trim())
+    })
+    try {
+      const data = await fetchJson<SignalResponse>(`/api/signals?${params.toString()}`)
+      setSignals(data.items)
+      setTotal(data.total)
+      setSummary(data.summary)
+      setSelected((current) => current ?? data.items[0] ?? null)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setLoading(false)
+    }
+  }, [filters])
+
+  React.useEffect(() => {
+    void loadSignals()
+  }, [loadSignals])
+
+  return (
+    <div className="space-y-5">
+      <section className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold text-ink">信号中心</h1>
+          <p className="mt-1 text-sm text-muted">五档信号、动作结果、阻塞原因和策略快照。</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void loadSignals()}
+          className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm text-ink hover:bg-rowHover"
+        >
+          <RefreshCw className="h-4 w-4" />
+          刷新
+        </button>
+      </section>
+
+      <section className="rounded-lg border border-line bg-panel p-4">
+        <div className="mb-3 flex items-center gap-2 text-sm font-medium text-ink">
+          <SlidersHorizontal className="h-4 w-4 text-muted" />
+          筛选
+        </div>
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+          <label className="space-y-1 text-xs text-muted">
+            股票
+            <div className="flex h-9 items-center gap-2 rounded-md border border-line bg-surface px-2">
+              <Search className="h-4 w-4" />
+              <input
+                value={filters.ts_code}
+                onChange={(event) => setFilters((prev) => ({ ...prev, ts_code: event.target.value.toUpperCase() }))}
+                placeholder="000001.SZ"
+                className="min-w-0 flex-1 bg-transparent text-sm text-ink outline-none"
+              />
+            </div>
+          </label>
+          <label className="space-y-1 text-xs text-muted">
+            信号
+            <select
+              value={filters.signal_type}
+              onChange={(event) => setFilters((prev) => ({ ...prev, signal_type: event.target.value }))}
+              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+            >
+              {signalTypes.map((type) => (
+                <option key={type || 'all'} value={type}>{type || '全部'}</option>
+              ))}
+            </select>
+          </label>
+          <label className="space-y-1 text-xs text-muted">
+            开始日期
+            <input
+              type="date"
+              value={filters.start_date}
+              onChange={(event) => setFilters((prev) => ({ ...prev, start_date: event.target.value }))}
+              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+            />
+          </label>
+          <label className="space-y-1 text-xs text-muted">
+            结束日期
+            <input
+              type="date"
+              value={filters.end_date}
+              onChange={(event) => setFilters((prev) => ({ ...prev, end_date: event.target.value }))}
+              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+            />
+          </label>
+          <label className="space-y-1 text-xs text-muted">
+            策略 ID
+            <input
+              value={filters.strategy_id}
+              onChange={(event) => setFilters((prev) => ({ ...prev, strategy_id: event.target.value }))}
+              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+            />
+          </label>
+          <label className="space-y-1 text-xs text-muted">
+            账户 ID
+            <input
+              value={filters.account_id}
+              onChange={(event) => setFilters((prev) => ({ ...prev, account_id: event.target.value }))}
+              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+            />
+          </label>
+        </div>
+      </section>
+
+      {error && (
+        <section className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-900">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4" />
+            <span>{error}</span>
+          </div>
+        </section>
+      )}
+
+      <section className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {[
+          { label: '买入', value: summary.buy_count, tone: 'text-red-600' },
+          { label: '增持', value: summary.add_count, tone: 'text-red-600' },
+          { label: '减仓', value: summary.reduce_count, tone: 'text-emerald-600' },
+          { label: '卖出', value: summary.sell_count, tone: 'text-emerald-600' },
+          { label: '观望', value: summary.hold_count, tone: 'text-muted' },
+          { label: 'BLOCKED', value: summary.blocked_count, tone: 'text-warn' },
+        ].map((item) => (
+          <div key={item.label} className="rounded-lg border border-line bg-panel p-4">
+            <div className="text-xs text-muted">{item.label}</div>
+            <div className={`mt-2 text-xl font-semibold ${item.tone}`}>{formatNumber(item.value)}</div>
+          </div>
+        ))}
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="overflow-hidden rounded-lg border border-line bg-panel">
+          <div className="flex items-center justify-between border-b border-line px-4 py-3">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <Filter className="h-4 w-4 text-muted" />
+              信号列表
+            </div>
+            <span className="text-xs text-muted">{formatNumber(total)} 条</span>
+          </div>
+          {loading ? (
+            <div className="p-4"><Skeleton.Table rows={8} columns={7} /></div>
+          ) : signals.length === 0 ? (
+            <div className="p-8 text-center text-sm text-muted">暂无信号</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-[920px] w-full text-left text-sm">
+                <thead className="bg-tableHead text-xs text-muted">
+                  <tr>
+                    <th className="px-4 py-3 font-medium">日期</th>
+                    <th className="px-4 py-3 font-medium">股票</th>
+                    <th className="px-4 py-3 font-medium">信号</th>
+                    <th className="px-4 py-3 font-medium">动作</th>
+                    <th className="px-4 py-3 font-medium">目标仓位</th>
+                    <th className="px-4 py-3 font-medium">策略/账户</th>
+                    <th className="px-4 py-3 font-medium">原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {signals.map((signal) => (
+                    <tr
+                      key={signal.id}
+                      onClick={() => setSelected(signal)}
+                      className={`cursor-pointer border-t border-line hover:bg-rowHover ${selected?.id === signal.id ? 'bg-rowAlt' : ''}`}
+                    >
+                      <td className="px-4 py-3 text-muted">{formatDate(signal.trade_date)}</td>
+                      <td className="px-4 py-3">
+                        <div className="font-medium text-ink">{signal.ts_code}</div>
+                        <div className="text-xs text-muted">{signal.stock_name ?? '暂无名称'}</div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex rounded-md border px-2 py-1 text-xs ${signalTone(signal.signal_type)}`}>
+                          {signal.signal_type}
+                        </span>
+                      </td>
+                      <td className={`px-4 py-3 font-medium ${actionTone(signal.action)}`}>{signal.action ?? '暂无'}</td>
+                      <td className="px-4 py-3 text-muted">{formatNumber(Number(signal.target_position) * 100, 2)}%</td>
+                      <td className="px-4 py-3 text-muted">
+                        <div>{signal.strategy_name ?? '未绑定策略'}</div>
+                        <div className="text-xs">{signal.account_name ?? '未绑定账户'}</div>
+                      </td>
+                      <td className="max-w-[260px] truncate px-4 py-3 text-muted">{signal.reason ?? String(signal.snapshot?.blocked_reason ?? '')}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <aside className="rounded-lg border border-line bg-panel p-4">
+          <h2 className="text-sm font-semibold text-ink">快照详情</h2>
+          {selected ? (
+            <div className="mt-4 space-y-4 text-sm">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <div className="text-xs text-muted">创建时间</div>
+                  <div className="mt-1 text-ink">{formatDateTime(selected.created_at)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted">置信度</div>
+                  <div className="mt-1 text-ink">{selected.confidence ? `${formatNumber(Number(selected.confidence) * 100, 2)}%` : '暂无'}</div>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted">说明</div>
+                <div className="mt-1 rounded-md bg-surface p-3 text-ink">{selected.reason || '暂无'}</div>
+              </div>
+              <pre className="max-h-[420px] overflow-auto rounded-md bg-surface p-3 text-xs leading-5 text-ink">
+                {JSON.stringify(selected.snapshot ?? {}, null, 2)}
+              </pre>
+            </div>
+          ) : (
+            <div className="mt-8 text-center text-sm text-muted">选择一条信号查看快照</div>
+          )}
+        </aside>
+      </section>
+    </div>
+  )
+}

@@ -286,6 +286,18 @@ class TestApplyCnRulesLimitUp:
         action, reason = apply_cn_rules("BUY", is_suspended=False, is_limit_up=False, is_limit_down=False)
         assert action == "BUY"
 
+    def test_limit_up_buy_can_defer_to_match_stage(self):
+        """委托生成阶段可跳过涨停过滤，留给撮合阶段处理"""
+        action, reason = apply_cn_rules(
+            "BUY",
+            is_suspended=False,
+            is_limit_up=True,
+            is_limit_down=False,
+            enforce_price_limits=False,
+        )
+        assert action == "BUY"
+        assert reason == ""
+
 
 @pytest.mark.signals
 class TestApplyCnRulesLimitDown:
@@ -307,6 +319,18 @@ class TestApplyCnRulesLimitDown:
         """跌停不影响买入操作"""
         action, reason = apply_cn_rules("BUY", is_suspended=False, is_limit_up=False, is_limit_down=True)
         assert action == "BUY"
+        assert reason == ""
+
+    def test_limit_down_sell_can_defer_to_match_stage(self):
+        """委托生成阶段可跳过跌停过滤，留给撮合阶段处理"""
+        action, reason = apply_cn_rules(
+            "SELL_ALL",
+            is_suspended=False,
+            is_limit_up=False,
+            is_limit_down=True,
+            enforce_price_limits=False,
+        )
+        assert action == "SELL_ALL"
         assert reason == ""
 
 

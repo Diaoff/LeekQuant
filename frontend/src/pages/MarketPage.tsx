@@ -244,12 +244,26 @@ export default function MarketPage() {
     }
   }, [dailyPage, dailyQuery, filters])
 
+  const pollTask = React.useCallback(async (taskId: string, signal: AbortSignal): Promise<void> => {
+    for (let i = 0; i < 600; i++) {
+      if (signal.aborted) return
+      await new Promise((r) => setTimeout(r, 1000))
+      const result = await fetchJson<{ ready: boolean; error?: string }>(`/api/data/sync/kline/result/${taskId}`)
+      if (result.error) throw new Error(result.error)
+      if (result.ready) return
+    }
+    throw new Error('同步超时')
+  }, [])
+
   const syncDaily = React.useCallback(async () => {
     setSyncing(true)
     setNotice(null)
     setError(null)
     try {
-      await fetchJson('/api/data/sync/kline', { method: 'POST', body: JSON.stringify({}) })
+      const { task_id } = await fetchJson<{ task_id: string }>('/api/data/sync/kline', { method: 'POST', body: JSON.stringify({}) })
+      setNotice('K 线同步中...')
+      const abort = new AbortController()
+      await pollTask(task_id, abort.signal)
       setNotice('K 线同步完成')
       await loadDaily()
     } catch (caught) {
@@ -257,7 +271,7 @@ export default function MarketPage() {
     } finally {
       setSyncing(false)
     }
-  }, [loadDaily])
+  }, [loadDaily, pollTask])
 
   const refreshActiveTab = React.useCallback(async () => {
     if (tab === 'basic') await loadStocks()
@@ -314,10 +328,13 @@ export default function MarketPage() {
     setNotice(null)
     setError(null)
     try {
-      await fetchJson('/api/data/sync/kline', {
+      const { task_id } = await fetchJson<{ task_id: string }>('/api/data/sync/kline', {
         method: 'POST',
         body: JSON.stringify({ ts_codes: [stock.ts_code] }),
       })
+      setNotice(`${stock.ts_code} K线同步中...`)
+      const abort = new AbortController()
+      await pollTask(task_id, abort.signal)
       setNotice(`${stock.ts_code} K线同步完成`)
       await refreshActiveTab()
     } catch (caught) {
@@ -325,7 +342,7 @@ export default function MarketPage() {
     } finally {
       setSyncingKlineCode(null)
     }
-  }, [refreshActiveTab])
+  }, [refreshActiveTab, pollTask])
 
   const handleDailySort = (key: keyof MarketStock) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))

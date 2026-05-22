@@ -80,6 +80,7 @@ def apply_cn_rules(
     is_limit_up: bool,
     is_limit_down: bool,
     is_t1_blocked: bool = False,
+    enforce_price_limits: bool = True,
 ) -> tuple[ActionType, str]:
     """Apply A-share trading rules to filter actions.
 
@@ -88,10 +89,10 @@ def apply_cn_rules(
     if is_suspended:
         return "BLOCKED", "停牌"
 
-    if action == "BUY" and is_limit_up:
+    if enforce_price_limits and action == "BUY" and is_limit_up:
         return "BLOCKED", "涨停不可买入"
 
-    if action in ("SELL_ALL", "SELL_PARTIAL") and is_limit_down:
+    if enforce_price_limits and action in ("SELL_ALL", "SELL_PARTIAL") and is_limit_down:
         return "BLOCKED", "跌停不可卖出"
 
     if action.startswith("SELL") and is_t1_blocked:

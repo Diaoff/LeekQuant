@@ -1,0 +1,105 @@
+"""Celery tasks for simulation trading maintenance."""
+from __future__ import annotations
+
+import asyncio
+from datetime import date
+from typing import Any
+
+from sqlalchemy import text
+
+from app.sim.service import match_order, snapshot_daily_nav, unlock_t1_positions
+from app.tasks.celery_app import celery_app
+from app.tasks.tracking import _run_tracked
+
+
+@celery_app.task(name="app.tasks.trading_tasks.unlock_t1_daily", bind=True)
+def unlock_t1_daily(self, trade_date: str | None = None) -> dict[str, Any]:
+    run_date = date.fromisoformat(trade_date) if trade_date else date.today()
+    return asyncio.run(
+        _run_tracked(
+            "unlock_t1_daily",
+            self.request.id,
+            {"trade_date": run_date},
+            lambda session: _unlock_t1_daily(session, run_date),
+        )
+    )
+
+
+async def _unlock_t1_daily(session, run_date: date) -> dict[str, Any]:
+    updated = await unlock_t1_positions(session, trade_date=run_date)
+    return {"trade_date": run_date.isoformat(), "positions_updated": updated}
+
+
+@celery_app.task(name="app.tasks.trading_tasks.snapshot_nav_daily", bind=True)
+def snapshot_nav_daily(self, nav_date: str | None = None) -> dict[str, Any]:
+    run_date = date.fromisoformat(nav_date) if nav_date else date.today()
+    return asyncio.run(
+        _run_tracked(
+            "snapshot_nav_daily",
+            self.request.id,
+            {"nav_date": run_date},
+            lambda session: _snapshot_nav_daily(session, run_date),
+        )
+    )
+
+
+async def _snapshot_nav_daily(session, run_date: date) -> dict[str, Any]:
+    calendar_result = await session.execute(
+        text("SELECT is_open FROM trade_calendar WHERE cal_date = :run_date"),
+        {"run_date": run_date},
+    )
+    calendar = calendar_result.mappings().one_or_none()
+    if not calendar or not calendar["is_open"]:
+        return {"nav_date": run_date.isoformat(), "skipped": True, "reason": "non-trading day"}
+
+    result = await session.execute(
+        text("SELECT id FROM sim_accounts WHERE status = 'active' ORDER BY id")
+    )
+    account_ids = [int(row["id"]) for row in result.mappings().all()]
+    snapshots = []
+    for account_id in account_ids:
+        snapshots.append(await snapshot_daily_nav(session, account_id=account_id, nav_date=run_date))
+    return {"nav_date": run_date.isoformat(), "snapshot_count": len(snapshots)}
+
+
+@celery_app.task(name="app.tasks.trading_tasks.match_pending_orders", bind=True)
+def match_pending_orders(self, trade_date: str | None = None, match_mode: str = "close") -> dict[str, Any]:
+    run_date = date.fromisoformat(trade_date) if trade_date else date.today()
+    return asyncio.run(
+        _run_tracked(
+            "match_pending_orders",
+            self.request.id,
+            {"trade_date": run_date, "match_mode": match_mode},
+            lambda session: _match_pending_orders(session, run_date, match_mode),
+        )
+    )
+
+
+async def _match_pending_orders(session, run_date: date, match_mode: str = "close") -> dict[str, Any]:
+    result = await session.execute(
+        text(
+            """
+            SELECT o.id, a.user_id
+            FROM sim_orders o
+            JOIN sim_accounts a ON a.id = o.account_id
+            WHERE o.status = '待成交'
+            ORDER BY o.submit_time, o.id
+            """
+        )
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    matched = 0
+    failed: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            await match_order(
+                session,
+                user_id=int(row["user_id"]),
+                order_id=int(row["id"]),
+                trade_date=run_date,
+                match_mode=match_mode,
+            )
+            matched += 1
+        except Exception as exc:
+            failed.append({"order_id": row["id"], "error": str(exc)})
+    return {"trade_date": run_date.isoformat(), "match_mode": match_mode, "matched": matched, "failed": failed}

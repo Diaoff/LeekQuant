@@ -1,3 +1,6 @@
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
@@ -5,14 +8,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.backtests import router as backtests_router
 from app.api.data import router as data_router
+from app.api.signals import router as signals_router
+from app.api.sim import router as sim_router
+from app.api.sources import router as sources_router
 from app.api.stocks import router as stocks_router
 from app.api.strategies import router as strategies_router
 from app.api.tasks import router as tasks_router
 from app.api.watchlist import router as watchlist_router
 from app.core.config import get_settings
-from app.db.session import get_session
+from app.db.session import async_session_factory, get_session
 
 settings = get_settings()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    from app.data.source_service import apply_config_from_db
+    try:
+        async with async_session_factory() as session:
+            await apply_config_from_db(session)
+    except Exception:
+        pass
+    yield
+
 
 app = FastAPI(
     title=settings.app_name,
@@ -20,6 +37,7 @@ app = FastAPI(
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -31,11 +49,14 @@ app.add_middleware(
 )
 
 app.include_router(data_router)
+app.include_router(sources_router)
 app.include_router(tasks_router)
 app.include_router(stocks_router)
 app.include_router(watchlist_router)
 app.include_router(strategies_router)
 app.include_router(backtests_router)
+app.include_router(signals_router)
+app.include_router(sim_router)
 
 
 @app.get("/health", tags=["health"])

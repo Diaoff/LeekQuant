@@ -31,6 +31,9 @@ class DataProvider(Protocol):
     ) -> list[StockFundamental]: ...
 
 
+PROVIDER_REGISTRY: dict[str, type[DataProvider]] = {}
+
+
 def _date_arg(value: date) -> str:
     return value.strftime("%Y%m%d")
 
@@ -254,3 +257,10 @@ class AkShareProvider:
             data["report_date"] = latest_report_date
             records.append(normalize_stock_fundamental(data, self.name, ts_code=ts_code, report_date=latest_report_date))
         return records
+
+
+PROVIDER_REGISTRY.update({
+    "adata": ADataProvider,
+    "baostock": BaostockProvider,
+    "akshare": AkShareProvider,
+})

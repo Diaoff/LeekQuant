@@ -1,7 +1,9 @@
 import asyncio
+from datetime import date
 
 from app.tasks.celery_app import celery_app
-from app.tasks.data_tasks import _run_tracked
+from app.tasks.tracking import _run_tracked
+from app.tasks.trading_tasks import _snapshot_nav_daily
 
 
 def test_celery_app_registers_data_tasks() -> None:
@@ -13,10 +15,15 @@ def test_celery_app_registers_data_tasks() -> None:
     assert "app.tasks.data_tasks.update_trade_calendar" in registered
     assert "app.tasks.data_tasks.sync_sample_kline" in registered
     assert "app.tasks.data_tasks.incremental_kline_update" in registered
+    assert "app.tasks.trading_tasks.unlock_t1_daily" in registered
+    assert "app.tasks.trading_tasks.match_pending_orders" in registered
+    assert "app.tasks.trading_tasks.snapshot_nav_daily" in registered
+    assert "app.tasks.signal_tasks.generate_all_signals" in registered
+    assert celery_app.conf.beat_schedule["generate-signals-daily"]["task"] == "app.tasks.signal_tasks.generate_all_signals"
 
 
 def test_run_tracked_claims_pending_task_run(monkeypatch) -> None:
-    from app.tasks import data_tasks
+    from app.tasks import tracking
 
     class FakeScalarResult:
         def __init__(self, value):
@@ -52,7 +59,7 @@ def test_run_tracked_claims_pending_task_run(monkeypatch) -> None:
             return None
 
     factory = FakeFactory()
-    monkeypatch.setattr(data_tasks, "async_session_factory", lambda: factory)
+    monkeypatch.setattr(tracking, "async_session_factory", lambda: factory)
 
     async def run():
         return await _run_tracked("sync_sample_kline", "task-123", {}, lambda _session: _success())
@@ -66,3 +73,58 @@ def test_run_tracked_claims_pending_task_run(monkeypatch) -> None:
     assert "UPDATE task_runs" in factory.session.statements[0]
     assert factory.session.params[0]["task_id"] == "task-123"
     assert factory.session.params[-1]["status"] == "success"
+
+
+def test_snapshot_nav_daily_skips_non_trading_day() -> None:
+    class FakeResult:
+        def __init__(self, rows=None):
+            self._rows = rows or []
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def one_or_none(self):
+            return self._rows[0] if self._rows else None
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+            self.params = []
+
+        async def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            self.params.append(params or {})
+            return FakeResult([{"is_open": False}])
+
+    session = FakeSession()
+    result = asyncio.run(_snapshot_nav_daily(session, date(2026, 5, 23)))
+
+    assert result == {"nav_date": "2026-05-23", "skipped": True, "reason": "non-trading day"}
+    assert "FROM trade_calendar" in session.statements[0]
+    assert len(session.statements) == 1
+
+
+def test_snapshot_nav_daily_treats_missing_calendar_as_non_trading_day() -> None:
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return None
+
+    class FakeSession:
+        def __init__(self):
+            self.statements = []
+
+        async def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            return FakeResult()
+
+    session = FakeSession()
+    result = asyncio.run(_snapshot_nav_daily(session, date(2026, 5, 23)))
+
+    assert result["skipped"] is True
+    assert result["reason"] == "non-trading day"
