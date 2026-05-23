@@ -122,7 +122,14 @@ async def _run_tracked(
             result = await fn(session)
         except Exception as exc:
             duration_ms = int((perf_counter() - started) * 1000)
-            await _finish_task_run(session, run_id, "failed", duration_ms, error_message=str(exc))
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:  # pragma: no cover - original failure is more actionable.
+                exc.add_note(f"Failed to rollback task session: {rollback_exc}")
+            try:
+                await _finish_task_run(session, run_id, "failed", duration_ms, error_message=str(exc))
+            except Exception as finish_exc:
+                exc.add_note(f"Failed to record task failure: {finish_exc}")
             raise
         duration_ms = int((perf_counter() - started) * 1000)
         await _finish_task_run(session, run_id, "success", duration_ms, result=result)

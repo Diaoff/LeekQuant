@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.backtests import router as backtests_router
 from app.api.data import router as data_router
+from app.api.factors import router as factors_router
 from app.api.signals import router as signals_router
 from app.api.sim import router as sim_router
 from app.api.sources import router as sources_router
@@ -57,6 +58,7 @@ app.include_router(strategies_router)
 app.include_router(backtests_router)
 app.include_router(signals_router)
 app.include_router(sim_router)
+app.include_router(factors_router)
 
 
 @app.get("/health", tags=["health"])

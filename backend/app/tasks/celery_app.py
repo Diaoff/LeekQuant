@@ -9,7 +9,13 @@ celery_app = Celery(
     "leek_quant",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.data_tasks", "app.backtest.tasks", "app.tasks.trading_tasks", "app.tasks.signal_tasks"],
+    include=[
+        "app.tasks.data_tasks",
+        "app.backtest.tasks",
+        "app.tasks.trading_tasks",
+        "app.tasks.signal_tasks",
+        "app.tasks.factor_tasks",
+    ],
 )
 celery_app.conf.update(
     task_track_started=True,
@@ -33,6 +39,10 @@ celery_app.conf.update(
         "generate-signals-daily": {
             "task": "app.tasks.signal_tasks.generate_all_signals",
             "schedule": crontab(hour=17, minute=0),
+        },
+        "compute-factors-daily": {
+            "task": "app.tasks.factor_tasks.compute_daily_factors",
+            "schedule": crontab(hour=17, minute=30),
         },
         "update-fundamentals-daily": {
             "task": "app.tasks.data_tasks.sync_fundamentals",

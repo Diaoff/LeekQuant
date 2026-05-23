@@ -57,6 +57,7 @@
 - 因子分类：估值、成长、质量、动量、波动、技术
 - IC / IR 分析评估因子有效性
 - 横截面打分排名 + 权重可配置
+- M5 已完成：内置 8 个因子、`factor_definitions.enabled/default_weight` 配置、Top N 排行榜、IC/IR 写入、Celery/API 任务入口与前端 `/factor` 页面 MVP
 
 ### 🔴 实时行情推送
 - 东方财富 WebSocket 自建解析器
@@ -125,21 +126,22 @@ cd leek-quant
 ```bash
 cp .env.example .env
 # 编辑 .env 设置以下关键配置：
-# - DB_PASSWORD: PostgreSQL 密码
-# - REDIS_PASSWORD: Redis 密码
-# - SECRET_KEY: JWT签名密钥
+# - POSTGRES_PASSWORD: PostgreSQL 密码
+# - DATABASE_URL: 本机后端/测试连接 PostgreSQL
+# - CONTAINER_DATABASE_URL: Compose 内 backend/celery 连接 PostgreSQL
+# - REDIS_URL: Celery/缓存连接 Redis
 ```
 
 ### 3️⃣ 启动服务
 ```bash
 docker compose up -d
 ```
-这将启动 7 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`realtime_ws`、`frontend`
+这将启动 6 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`frontend`
 
 ### 4️⃣ 访问应用
 | 服务 | 地址 |
 |------|------|
-| 🖥️ 前端界面 | http://localhost |
+| 🖥️ 前端界面 | http://localhost:8080 |
 | 📚 API文档(Swagger) | http://localhost:8000/api/docs |
 | 📖 API文档(ReDoc) | http://localhost:8000/api/redoc |
 | 🐘 PostgreSQL | localhost:5432 |
@@ -154,10 +156,11 @@ leek-quant/
 ├── backend/                      # FastAPI 后端
 │   ├── app/
 │   │   ├── api/                 # REST API 路由
-│   │   │   ├── data.py          # 行情/股票池 API
+│   │   │   ├── data.py          # 行情 API
 │   │   │   ├── strategies.py    # 策略 CRUD
 │   │   │   ├── backtests.py     # 回测任务
-│   │   │   └── watchlist.py     # 自选股管理
+│   │   │   ├── watchlist.py     # 自选股管理
+│   │   │   └── factors.py       # M5: 因子定义/值/排行榜/ICIR查询
 │   │   ├── backtest/            # M3: 回测引擎
 │   │   │   ├── adapter.py       # Hikyuu 适配层
 │   │   │   ├── cost.py          # A股费用计算
@@ -166,14 +169,16 @@ leek-quant/
 │   │   │   ├── providers.py     # 三层数据源
 │   │   │   ├── normalizers.py   # 数据标准化
 │   │   │   └── validators.py    # 数据校验
+│   │   ├── factor/              # M5: 多因子计算、标准化、ICIR分析
 │   │   ├── core/                # 配置与工具
 │   │   ├── libs/                # 第三方库
 │   │   │   └── MyTT.py          # 指标库(28函数)
 │   │   └── tasks/               # Celery 异步任务
 │   │       ├── celery_app.py    # Celery 应用配置
-│   │       └── data_tasks.py    # 数据拉取任务
+│   │       ├── data_tasks.py    # 数据拉取任务
+│   │       └── factor_tasks.py  # M5: 因子计算/分析任务
 │   ├── alembic/                 # 数据库迁移
-│   │   └── versions/            # 迁移版本(M0-M3)
+│   │   └── versions/            # 迁移版本(M0-M5)
 │   ├── tests/                   # 测试套件
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -203,7 +208,7 @@ leek-quant/
 | **M2 股票池与自选股** | ✅ 完成 | 动态筛选(ST/退市/行业) + 分组管理 + 基础前端 |
 | **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Hikyuu异步回测 |
 | **M4 信号与模拟交易** | 🚧 开发中 | 五档信号状态机 + 6表闭环 + T+1解锁 |
-| **M5 多因子选股** | 📋 规划中 | IC/IR分析 + 排行榜 + 股票池导入 |
+| **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR/API/任务 + 前端因子页 MVP |
 | **M6 实时行情** | 📋 规划中 | 东方财富WebSocket + Redis广播 |
 | **M7 优化完善** | 📋 规划中 | 监控告警 + 参数敏感性 + 文档完善 |
 
@@ -285,7 +290,6 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 |------|------|------|------|
 | 行情 | GET | `/api/stocks` | 全市场股票列表（支持筛选） |
 | 行情 | GET | `/api/stocks/{ts_code}/klines` | K线查询（日/周/月） |
-| 股票池 | POST | `/api/pools` | 创建动态股票池 |
 | 自选股 | GET/POST | `/api/watchlist` | 自选股CRUD |
 | 策略 | GET/POST | `/api/strategies` | 策略管理 |
 | 回测 | POST | `/api/backtests` | 提交异步回测任务 |
@@ -294,7 +298,12 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 | 模拟交易 | GET/POST | `/api/sim/accounts` | 模拟账户管理 |
 | 模拟交易 | GET | `/api/sim/accounts/{id}/positions` | 持仓查询 |
 | 模拟交易 | GET | `/api/sim/accounts/{id}/nav` | 净值曲线 |
-| 因子 | GET | `/api/factors/rank` | 多因子排行榜 |
+| 因子 | GET | `/api/factors` | 因子定义与默认权重 |
+| 因子 | GET | `/api/factors/rank?page_size=N` | 多因子 Top N 排行榜 |
+| 因子 | GET | `/api/factors/values` | 单因子横截面值 |
+| 因子 | GET | `/api/factors/analysis` | 因子 IC/IR 分析结果 |
+| 任务 | POST | `/api/tasks/factors/compute` | 触发单日因子计算 |
+| 任务 | POST | `/api/tasks/factors/analyze` | 触发因子 IC/IR 分析 |
 | 系统 | GET | `/api/system/tasks` | 任务运行状态 |
 | WebSocket | WS | `/ws/realtime` | 实时行情订阅 |
 | WebSocket | WS | `/ws/tasks` | 任务状态推送 |
@@ -302,6 +311,12 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 ---
 
 ## 🧪 测试
+
+默认集成测试会真实连接 PostgreSQL 与 Redis，不做 skip。运行前确保 `.env` 中的 `DATABASE_URL` / `REDIS_URL` 可达，或先启动依赖：
+
+```bash
+docker compose up -d postgres redis
+```
 
 ```bash
 # 运行全部测试
@@ -312,9 +327,19 @@ pytest backend/tests/test_data_normalizers.py -v   # 数据标准化
 pytest backend/tests/test_m2_stock_management.py -v # 股票池管理
 pytest backend/tests/test_repository.py -v          # 数据仓库
 pytest backend/tests/test_tasks.py -v               # Celery任务
+pytest backend/tests/test_m5_factors.py backend/tests/test_factor_api.py backend/tests/test_factor_tasks.py backend/tests/test_m5_factor_migration.py -v  # M5因子专项
+pytest backend/tests/test_m5_integration.py -v      # M5真实PostgreSQL/Alembic/任务闭环集成
 
 # 运行覆盖率报告
 pytest backend/tests/ --cov=app --cov-report=html
+```
+
+M5 风险消除验证组合：
+
+```bash
+./.venv/bin/python -m pytest backend/tests/test_m5_factors.py backend/tests/test_factor_api.py backend/tests/test_factor_tasks.py backend/tests/test_m5_factor_migration.py
+./.venv/bin/python -m pytest backend/tests/test_m5_integration.py
+cd frontend && npm run typecheck && npm run build && npm run test:smoke
 ```
 
 ### 关键测试覆盖
@@ -325,6 +350,7 @@ pytest backend/tests/ --cov=app --cov-report=html
 - ✅ 涨跌停校验逻辑
 - ✅ 模拟交易资金守恒
 - ✅ Hikyuu回测适配层
+- ✅ M5 因子四表迁移、幂等 seed、单日计算、DB 权重排名、Top N API、IC/IR upsert、Celery任务入口、前端因子页 MVP
 
 ---
 

@@ -7,6 +7,7 @@ import { ThemeProvider } from './lib/theme'
 import BacktestPage from './pages/BacktestPage'
 import DashboardPage from './pages/DashboardPage'
 import DataSourcePage from './pages/DataSourcePage'
+import FactorPage from './pages/FactorPage'
 import MarketPage from './pages/MarketPage'
 import SignalsPage from './pages/SignalsPage'
 import SimulationPage from './pages/SimulationPage'
@@ -34,6 +35,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <Route path="/backtests/compare" element={<BacktestPage />} />
               <Route path="/signals" element={<SignalsPage />} />
               <Route path="/simulation" element={<SimulationPage />} />
+              <Route path="/factor" element={<FactorPage />} />
             </Routes>
           </App>
         </Layout>

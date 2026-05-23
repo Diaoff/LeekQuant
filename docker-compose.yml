@@ -1,4 +1,25 @@
 services:
+  postgres:
+    image: ${IMAGE_PREFIX:-}postgres:15-alpine
+    container_name: leek-quant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-leek_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-leek_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - leek-quant-network
+
   redis:
     image: ${IMAGE_PREFIX:-}redis:7-alpine
     container_name: leek-quant-redis
@@ -24,18 +45,18 @@ services:
     container_name: leek-quant-backend
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@host.docker.internal:5432/leek-quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${BACKEND_PORT:-127.0.0.1:8000}:8000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -54,17 +75,17 @@ services:
     container_name: leek-quant-celery-worker
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@host.docker.internal:5432/leek-quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "--loglevel=INFO"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - leek-quant-network
 
@@ -78,17 +99,17 @@ services:
     container_name: leek-quant-celery-beat
     restart: unless-stopped
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@host.docker.internal:5432/leek-quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["celery", "-A", "app.tasks.celery_app:celery_app", "beat", "--loglevel=INFO"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - leek-quant-network
 
@@ -113,3 +134,6 @@ services:
 networks:
   leek-quant-network:
     driver: bridge
+
+volumes:
+  postgres-data:

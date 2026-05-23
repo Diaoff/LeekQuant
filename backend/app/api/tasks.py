@@ -6,7 +6,7 @@ from uuid import uuid4
 from celery.result import AsyncResult
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 from kombu.exceptions import OperationalError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +14,7 @@ from app.data.repository import create_pending_task_run, mark_task_run_queue_fai
 from app.db.session import get_session
 from app.tasks.celery_app import celery_app
 from app.tasks.data_tasks import sync_all_kline, sync_fundamentals_task, sync_sample_kline
+from app.tasks.factor_tasks import analyze_factor_icir_task, compute_daily_factors
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -28,6 +29,29 @@ class FundamentalsTaskRequest(BaseModel):
     ts_codes: list[str] | None = Field(default=None, max_length=100)
     start_date: date | None = None
     end_date: date | None = None
+
+
+class FactorComputeTaskRequest(BaseModel):
+    trade_date: date | None = None
+    scope_type: str = Field(default="all", pattern="^(all|watchlist_group)$")
+    scope_value: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "FactorComputeTaskRequest":
+        if self.scope_type == "all":
+            self.scope_value = None
+            return self
+        if not self.scope_value or not self.scope_value.strip():
+            raise ValueError("scope_value is required for watchlist_group scope")
+        self.scope_value = self.scope_value.strip()
+        return self
+
+
+class FactorAnalyzeTaskRequest(BaseModel):
+    factor_name: str = Field(min_length=1, max_length=64)
+    period_start: date
+    period_end: date
+    forward_days: int = Field(default=5, ge=1, le=60)
 
 
 @router.post("/data/sample-kline")
@@ -113,6 +137,63 @@ async def start_fundamentals_task(
             kwargs=payload,
             task_id=task_id,
         )
+    except OperationalError as exc:
+        await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.post("/factors/compute")
+async def start_factor_compute_task(
+    request: FactorComputeTaskRequest = Body(default_factory=FactorComputeTaskRequest),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    task_id = uuid4().hex
+    payload = {
+        "trade_date": request.trade_date.isoformat() if request.trade_date else None,
+        "scope_type": request.scope_type,
+        "scope_value": request.scope_value,
+    }
+    await create_pending_task_run(
+        session,
+        task_name="compute_daily_factors",
+        task_id=task_id,
+        payload=payload,
+    )
+    try:
+        compute_daily_factors.apply_async(kwargs=payload, task_id=task_id)
+    except OperationalError as exc:
+        await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.post("/factors/analyze")
+async def start_factor_analyze_task(
+    request: FactorAnalyzeTaskRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    task_id = uuid4().hex
+    payload = {
+        "factor_name": request.factor_name,
+        "period_start": request.period_start.isoformat(),
+        "period_end": request.period_end.isoformat(),
+        "forward_days": request.forward_days,
+    }
+    await create_pending_task_run(
+        session,
+        task_name="analyze_factor_icir",
+        task_id=task_id,
+        payload=payload,
+    )
+    try:
+        analyze_factor_icir_task.apply_async(kwargs=payload, task_id=task_id)
     except OperationalError as exc:
         await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
         raise HTTPException(
