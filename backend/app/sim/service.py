@@ -11,7 +11,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.backtest.cost import AShareCostCalculator, FeeConfig
+from app.backtest.cost import AShareCostCalculator, FeeConfig, build_fee_config
 from app.backtest.signals import SignalInput, apply_cn_rules, map_signal_to_action
 
 LOT_SIZE = 100
@@ -45,16 +45,36 @@ def _json(value: dict[str, Any] | None) -> str:
     return json.dumps(value or {}, ensure_ascii=False, default=str)
 
 
-def _fee_config(config: dict[str, Any] | None) -> FeeConfig:
+def _dict_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _fee_config(config: dict[str, Any] | None, global_config: FeeConfig | None = None) -> FeeConfig:
     fee_cfg = (config or {}).get("fee_config") if isinstance(config, dict) else None
-    if not isinstance(fee_cfg, dict):
-        return FeeConfig()
-    return FeeConfig(
-        commission_rate=_dec(fee_cfg.get("commission_rate"), "0.00025"),
-        min_commission=_dec(fee_cfg.get("min_commission"), "5.0"),
-        stamp_tax_rate=_dec(fee_cfg.get("stamp_tax_rate"), "0.0005"),
-        transfer_fee_rate=_dec(fee_cfg.get("transfer_fee_rate"), "0.00001"),
+    global_cfg = (
+        {
+            "commission_rate": global_config.commission_rate,
+            "min_commission": global_config.min_commission,
+            "stamp_tax_rate": global_config.stamp_tax_rate,
+            "transfer_fee_rate": global_config.transfer_fee_rate,
+            "waive_min_commission": global_config.waive_min_commission,
+        }
+        if global_config
+        else None
     )
+    return build_fee_config(global_cfg, fee_cfg if isinstance(fee_cfg, dict) else None)
+
+
+def _global_fee_config(row: dict[str, Any]) -> FeeConfig:
+    return build_fee_config(_dict_value(row.get("user_trading_fee_config")))
 
 
 def _serialize_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -77,10 +97,13 @@ async def get_account_or_404(session: AsyncSession, account_id: int, user_id: in
     result = await session.execute(
         text(
             """
-            SELECT id, user_id, strategy_id, name, initial_cash, available_cash,
-                   frozen_cash, total_asset, status, config, created_at, updated_at
-            FROM sim_accounts
-            WHERE id = :id AND user_id = :user_id
+            SELECT a.id, a.user_id, a.strategy_id, a.name, a.initial_cash, a.available_cash,
+                   a.frozen_cash, a.total_asset, a.status, a.config, a.created_at, a.updated_at,
+                   p.value AS user_trading_fee_config
+            FROM sim_accounts a
+            LEFT JOIN user_preferences p
+              ON p.user_id = a.user_id AND p.key = 'trading_fee'
+            WHERE a.id = :id AND a.user_id = :user_id
             """
         ),
         {"id": account_id, "user_id": user_id},
@@ -400,7 +423,7 @@ async def generate_order_from_signal(
         delta_value = max(target_value - market_value, Decimal("0"))
         raw_shares = int((delta_value / price).to_integral_value(rounding=ROUND_FLOOR))
         volume = raw_shares // LOT_SIZE * LOT_SIZE
-        calculator = AShareCostCalculator(_fee_config(account.get("config")))
+        calculator = AShareCostCalculator(_fee_config(account.get("config"), _global_fee_config(account)))
         available_cash = _dec(account["available_cash"])
         while volume >= LOT_SIZE:
             gross_amount = _money(price * Decimal(volume))
@@ -527,9 +550,11 @@ async def match_order(
     result = await session.execute(
         text(
             """
-            SELECT o.*, a.user_id, a.config
+            SELECT o.*, a.user_id, a.config, p.value AS user_trading_fee_config
             FROM sim_orders o
             JOIN sim_accounts a ON a.id = o.account_id
+            LEFT JOIN user_preferences p
+              ON p.user_id = a.user_id AND p.key = 'trading_fee'
             WHERE o.id = :order_id AND a.user_id = :user_id
             FOR UPDATE
             """
@@ -566,7 +591,7 @@ async def match_order(
     volume = int(order["volume"]) - int(order["filled_volume"])
     price = _resolve_match_price(order, kline, match_mode)
     amount = _money(price * Decimal(volume))
-    fees = AShareCostCalculator(_fee_config(order.get("config"))).calculate(direction, amount)
+    fees = AShareCostCalculator(_fee_config(order.get("config"), _global_fee_config(order))).calculate(direction, amount)
 
     trade_result = await session.execute(
         text(

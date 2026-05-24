@@ -12,17 +12,17 @@ from requests.exceptions import ConnectionError as ReqConnectionError
 
 from app.core.config import get_settings
 from app.data.providers import (
-    ADataProvider,
-    AkShareProvider,
-    BaostockProvider,
     DataProvider,
     DataProviderError,
+    METHOD_CAPABILITIES,
+    PROVIDER_REGISTRY,
+    provider_supports,
 )
 
 __all__ = [
     "DataProvider", "DataProviderError",
     "configure_providers",
-    "default_providers", "stock_basic_providers",
+    "default_providers", "providers_for_capability", "providers_for_method", "stock_basic_providers",
     "fetch_with_fallback", "get_data_proxy_url",
 ]
 
@@ -31,7 +31,9 @@ ProviderList: TypeAlias = Iterable[DataProvider]
 _RETRYABLE = (ReqConnectionError, TimeoutError, OSError)
 _PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 _REDIS_CONFIG_KEY = "leek:provider_order"
-_PROVIDER_ORDER: list[str] = ["adata", "baostock", "akshare"]
+_PROVIDER_ORDER: list[str] = [
+    cls.name for cls in sorted(PROVIDER_REGISTRY.values(), key=lambda provider_cls: provider_cls.priority_default)
+]
 _REDIS_CLIENT: redis_mod.Redis | None = None
 
 
@@ -71,17 +73,22 @@ def configure_providers(ordered_names: list[str]) -> None:
 
 def default_providers() -> list[DataProvider]:
     order = _load_order_from_redis() or _PROVIDER_ORDER
-    return [_PROVIDER_MAP[n]() for n in order if n in _PROVIDER_MAP]
+    return [PROVIDER_REGISTRY[n]() for n in order if n in PROVIDER_REGISTRY]
+
+
+def providers_for_capability(capability: str) -> list[DataProvider]:
+    return [provider for provider in default_providers() if provider_supports(provider, capability)]
+
+
+def providers_for_method(method_name: str) -> list[DataProvider]:
+    capability = METHOD_CAPABILITIES.get(method_name)
+    if capability is None:
+        return default_providers()
+    return providers_for_capability(capability)
+
 
 def stock_basic_providers() -> list[DataProvider]:
-    return default_providers()
-
-
-_PROVIDER_MAP: dict[str, type[DataProvider]] = {
-    "adata": ADataProvider,
-    "baostock": BaostockProvider,
-    "akshare": AkShareProvider,
-}
+    return providers_for_method("fetch_stock_basic")
 
 
 @contextmanager
@@ -120,8 +127,14 @@ def fetch_with_fallback(
     proxy_url: str | None = None,
 ) -> tuple[str, list]:
     errors: list[str] = []
+    capability = METHOD_CAPABILITIES.get(method_name)
+    provider_list = [
+        provider for provider in providers if capability is None or provider_supports(provider, capability)
+    ]
+    if not provider_list:
+        raise DataProviderError(f"no enabled providers support {capability or method_name}")
     with _data_proxy_ctx(proxy_url):
-        for provider in providers:
+        for provider in provider_list:
             for attempt in range(2):
                 try:
                     records = _try_once(provider, method_name, args)

@@ -164,6 +164,7 @@ class TestCustomFeeConfig:
         assert config.min_commission == Decimal("5.0")
         assert config.stamp_tax_rate == Decimal("0.0005")
         assert config.transfer_fee_rate == Decimal("0.00001")
+        assert config.waive_min_commission is False
 
     def test_calculator_uses_provided_config(self):
         """计算器使用传入的配置，而非默认配置"""
@@ -177,6 +178,21 @@ class TestCustomFeeConfig:
         result = calc.calculate("买入", Decimal("1000"))
         assert result.commission == Decimal("1.0000")
         assert result.total_fee == Decimal("1.0000")
+
+    def test_waive_min_commission_uses_proportional_commission(self):
+        """免5时小额交易不触发最低佣金"""
+        config = FeeConfig(waive_min_commission=True)
+        calc = AShareCostCalculator(config)
+        result = calc.calculate("买入", Decimal("10000"))
+        assert result.commission == Decimal("2.5000")
+
+    def test_string_false_does_not_enable_waive_min_commission(self):
+        from app.backtest.cost import build_fee_config
+
+        config = build_fee_config({"waive_min_commission": "false"})
+        calc = AShareCostCalculator(config)
+        result = calc.calculate("买入", Decimal("10000"))
+        assert result.commission == Decimal("5.0000")
 
 
 @pytest.mark.cost

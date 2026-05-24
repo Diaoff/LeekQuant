@@ -10,8 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.adapter import BacktestConfig, BacktestRunner, KBar
-from app.backtest.cost import FeeConfig
+from app.backtest.cost import FeeConfig, build_fee_config
 from app.db.session import async_session_factory
+from app.preferences.service import get_trading_fee_config
 from app.tasks.celery_app import celery_app
 
 RISK_CONFIG_FIELDS = (
@@ -23,6 +24,7 @@ RISK_CONFIG_FIELDS = (
 )
 
 MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
+MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
 
 
 def _decode_json_dict(value: Any) -> dict[str, Any]:
@@ -51,8 +53,13 @@ def _merge_backtest_config(strategy_config_value: Any, params_snapshot_value: An
 
     merged = dict(strategy_config)
     for key, value in runtime_config.items():
-        if key not in RISK_CONFIG_FIELDS and key != "risk_config":
+        if key not in RISK_CONFIG_FIELDS and key not in {"risk_config", "fee_config"}:
             merged[key] = value
+
+    fee_config = _decode_json_dict(strategy_config.get("fee_config"))
+    fee_config.update(_decode_json_dict(runtime_config.get("fee_config")))
+    if fee_config:
+        merged["fee_config"] = fee_config
 
     risk_config = _decode_json_dict(strategy_config.get("risk_config"))
     risk_config.update(_decode_json_dict(runtime_config.get("risk_config")))
@@ -64,6 +71,24 @@ def _merge_backtest_config(strategy_config_value: Any, params_snapshot_value: An
         merged["risk_config"] = risk_config
 
     return merged
+
+
+def _fee_config_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, FeeConfig):
+        return {
+            "commission_rate": value.commission_rate,
+            "min_commission": value.min_commission,
+            "stamp_tax_rate": value.stamp_tax_rate,
+            "transfer_fee_rate": value.transfer_fee_rate,
+            "waive_min_commission": value.waive_min_commission,
+        }
+    return _decode_json_dict(value)
+
+
+def _merge_fee_config(global_config: FeeConfig | None, local_config: Any) -> FeeConfig:
+    global_dict = _fee_config_dict(global_config)
+    local_dict = _fee_config_dict(local_config)
+    return build_fee_config(global_dict, local_dict)
 
 
 def _has_risk_controls(risk_config: dict[str, Any]) -> bool:
@@ -85,63 +110,126 @@ def _stock_scope_diagnostics(stock_codes: list[str]) -> dict[str, Any]:
     }
 
 
+def _normalize_market_targets(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else [value]
+    selected = {
+        str(item).strip()
+        for item in raw_values
+        if item is not None and str(item).strip()
+    }
+    return [market for market in MARKET_TARGET_ORDER if market in selected]
+
+
 def _target_from_snapshot(params_snapshot_value: Any) -> dict[str, Any]:
     params_snapshot = _decode_json_dict(params_snapshot_value)
     target = _decode_json_dict(params_snapshot.get("target"))
     target_type = target.get("type") or params_snapshot.get("target_type") or "all"
     target_value = target.get("value") or params_snapshot.get("target_value")
-    if target_type == "market" and target_value not in MARKET_TARGETS:
-        target_type = "all"
-        target_value = None
+    if target_type == "market":
+        target_value = _normalize_market_targets(target_value)
+        if not target_value:
+            target_type = "all"
+            target_value = None
     if target_type == "watchlist_group" and not target_value:
         target_type = "all"
     return {"type": target_type, "value": target_value}
 
 
-async def _resolve_stock_codes(session: AsyncSession, user_id: int, target: dict[str, Any]) -> list[str]:
+def _filters_from_snapshot(params_snapshot_value: Any, target: dict[str, Any] | None = None) -> dict[str, bool]:
+    params_snapshot = _decode_json_dict(params_snapshot_value)
+    filters = _decode_json_dict(params_snapshot.get("filters"))
+    target_type = (target or _target_from_snapshot(params_snapshot)).get("type", "all")
+    default_filter = target_type in {"all", "market"}
+    return {
+        "exclude_st": bool(filters.get("exclude_st", default_filter)),
+        "exclude_loss_pe": bool(filters.get("exclude_loss_pe", default_filter)),
+    }
+
+
+def _stock_filter_clauses(filters: dict[str, bool]) -> tuple[list[str], str]:
+    clauses = ["s.is_delisted = FALSE"]
+    fundamentals_join = ""
+    if filters.get("exclude_st"):
+        clauses.append("s.is_st = FALSE")
+    if filters.get("exclude_loss_pe"):
+        fundamentals_join = """
+            LEFT JOIN LATERAL (
+                SELECT pe_ttm
+                FROM stock_fundamentals sf
+                WHERE sf.ts_code = s.ts_code
+                  AND sf.report_date <= :start_date
+                ORDER BY sf.report_date DESC
+                LIMIT 1
+            ) f ON TRUE
+        """
+        clauses.append("(f.pe_ttm IS NULL OR f.pe_ttm > 0)")
+    return clauses, fundamentals_join
+
+
+async def _resolve_stock_codes(
+    session: AsyncSession,
+    user_id: int,
+    target: dict[str, Any],
+    start_date: date,
+    filters: dict[str, bool],
+) -> list[str]:
     target_type = target["type"]
     target_value = target["value"]
+    filter_clauses, fundamentals_join = _stock_filter_clauses(filters)
+    where_sql = " AND ".join(filter_clauses)
 
     if target_type == "market":
+        markets = _normalize_market_targets(target_value)
+        market_placeholders = []
+        params: dict[str, Any] = {"start_date": start_date}
+        for index, market in enumerate(markets):
+            key = f"market_{index}"
+            market_placeholders.append(f":{key}")
+            params[key] = market
         result = await session.execute(
             text(
-                """
-                SELECT ts_code
-                FROM stock_basic
-                WHERE market = :market AND is_delisted = FALSE
+                f"""
+                SELECT s.ts_code
+                FROM stock_basic s
+                {fundamentals_join}
+                WHERE s.market IN ({', '.join(market_placeholders)})
+                  AND {where_sql}
                 ORDER BY symbol
                 """
             ),
-            {"market": target_value},
+            params,
         )
         return [r["ts_code"] for r in result.mappings().all()]
 
     if target_type == "watchlist_group":
         result = await session.execute(
             text(
-                """
+                f"""
                 SELECT w.ts_code
                 FROM watchlist w
                 JOIN stock_basic s ON s.ts_code = w.ts_code
+                {fundamentals_join}
                 WHERE w.user_id = :user_id
                   AND w.group_name = :group_name
-                  AND s.is_delisted = FALSE
+                  AND {where_sql}
                 ORDER BY w.sort_order, w.added_at
                 """
             ),
-            {"user_id": user_id, "group_name": target_value},
+            {"user_id": user_id, "group_name": target_value, "start_date": start_date},
         )
         return [r["ts_code"] for r in result.mappings().all()]
 
     result = await session.execute(
         text(
-            """
-            SELECT ts_code
-            FROM stock_basic
-            WHERE is_delisted = FALSE
+            f"""
+            SELECT s.ts_code
+            FROM stock_basic s
+            {fundamentals_join}
+            WHERE {where_sql}
             ORDER BY symbol
             """
-        )
+        ),
+        {"start_date": start_date},
     )
     return [r["ts_code"] for r in result.mappings().all()]
 
@@ -199,7 +287,8 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             await session.commit()
 
             target = _target_from_snapshot(bt_row.get("params_snapshot"))
-            stock_codes = await _resolve_stock_codes(session, bt_row["user_id"], target)
+            filters = _filters_from_snapshot(bt_row.get("params_snapshot"), target)
+            stock_codes = await _resolve_stock_codes(session, bt_row["user_id"], target, bt_row["start_date"], filters)
 
             if not stock_codes:
                 await session.execute(
@@ -250,16 +339,8 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 bt_row.get("params_snapshot"),
             )
 
-            fee_cfg_dict = strategy_config.get("fee_config", {})
-            if fee_cfg_dict:
-                fee_cfg = FeeConfig(
-                    commission_rate=Decimal(str(fee_cfg_dict.get("commission_rate", FeeConfig.commission_rate))),
-                    min_commission=Decimal(str(fee_cfg_dict.get("min_commission", FeeConfig.min_commission))),
-                    stamp_tax_rate=Decimal(str(fee_cfg_dict.get("stamp_tax_rate", FeeConfig.stamp_tax_rate))),
-                    transfer_fee_rate=Decimal(str(fee_cfg_dict.get("transfer_fee_rate", FeeConfig.transfer_fee_rate))),
-                )
-            else:
-                fee_cfg = FeeConfig()
+            global_fee_cfg = await get_trading_fee_config(session, bt_row["user_id"])
+            fee_cfg = _merge_fee_config(global_fee_cfg, strategy_config.get("fee_config"))
 
             risk_cfg = strategy_config.get("risk_config", {})
             risk_controls_enabled = _has_risk_controls(risk_cfg)
@@ -316,6 +397,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 results["engine"] = engine
                 if "performance" in results and isinstance(results["performance"], dict):
                     results["performance"]["engine"] = engine
+                    results["performance"]["filters"] = filters
                     results["performance"].update(_stock_scope_diagnostics(list(all_klines.keys())))
             except Exception as exc:
                 import traceback

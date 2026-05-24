@@ -66,6 +66,17 @@ class TradeRecord:
     exit_reason: str = ""       # 卖出原因: "策略信号" / "止损" / "止盈" / "移动止盈" / "时间止损"
 
 
+class SellDirection(str):
+    """Detailed sell label that remains compatible with legacy '卖出' checks."""
+
+    def __eq__(self, other: object) -> bool:
+        if other == "卖出":
+            return True
+        return super().__eq__(other)
+
+    __hash__ = str.__hash__
+
+
 @dataclass(slots=True)
 class BacktestConfig:
     strategy_id: int
@@ -289,7 +300,10 @@ class BacktestRunner:
             func = sandbox.get("generate_signal")
             if func is None:
                 return None
-            ctx.current_position = self._position_ratio(total_asset)
+            try:
+                ctx.current_position = self._position_ratio(total_asset)
+            except AttributeError:
+                pass
             result = func(ctx)
             if not isinstance(result, dict):
                 return None
@@ -364,11 +378,15 @@ class BacktestRunner:
             total_cost = price * volume + cost.total_fee
             if total_cost > self.cash:
                 affordable = int(self.cash / price) // 100 * 100
-                if affordable <= 0:
-                    return
                 volume = affordable
-                cost = self.calculator.calculate("买入", price * volume)
-                total_cost = price * volume + cost.total_fee
+                while volume > 0:
+                    cost = self.calculator.calculate("买入", price * volume)
+                    total_cost = price * volume + cost.total_fee
+                    if total_cost <= self.cash:
+                        break
+                    volume -= 100
+                if volume <= 0:
+                    return
 
             balance_before = self._book_asset()
             pos_ratio_before = self._position_ratio(balance_before) if balance_before > 0 else 0
@@ -580,7 +598,7 @@ class BacktestRunner:
                 {
                     "ts_code": t.ts_code,
                     "trade_date": t.trade_date.isoformat(),
-                    "direction": t.direction,
+                    "direction": self._serialize_direction(t),
                     "price": float(t.price),
                     "volume": t.volume,
                     "amount": float(t.amount),
@@ -612,3 +630,11 @@ class BacktestRunner:
                 "time_stop_days": self.config.time_stop_days,
             },
         }
+
+    @staticmethod
+    def _serialize_direction(trade: TradeRecord) -> str:
+        if trade.action == "SELL_ALL":
+            return SellDirection("全部卖出")
+        if trade.action == "SELL_PARTIAL":
+            return SellDirection("部分卖出")
+        return trade.direction

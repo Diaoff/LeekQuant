@@ -27,12 +27,15 @@ UPGRADE_STATEMENTS = [
     """,
     """
     INSERT INTO data_source_config (name, display_name, priority, enabled) VALUES
-        ('adata', 'AData', 1, TRUE),
-        ('baostock', 'Baostock', 2, TRUE),
-        ('akshare', 'AkShare', 3, TRUE)
+        ('eastmoney_http', 'EastMoney HTTP', 1, TRUE),
+        ('tencent_http', 'Tencent Finance HTTP', 2, TRUE),
+        ('mootdx', 'Mootdx', 5, FALSE),
+        ('adata', 'AData', 10, TRUE),
+        ('baostock', 'Baostock', 20, TRUE),
+        ('akshare', 'AkShare', 30, TRUE)
     """,
     "COMMENT ON TABLE data_source_config IS '数据源配置，支持调整优先级和启用/禁用'",
-    "COMMENT ON COLUMN data_source_config.name IS '数据源标识（adata/baostock/akshare）'",
+    "COMMENT ON COLUMN data_source_config.name IS '数据源插件标识，如 eastmoney_http / tencent_http / adata / baostock / akshare'",
     "COMMENT ON COLUMN data_source_config.display_name IS '显示名称'",
     "COMMENT ON COLUMN data_source_config.priority IS '优先级（小→大）'",
     "COMMENT ON COLUMN data_source_config.enabled IS '是否启用'",

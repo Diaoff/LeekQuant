@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 import json
 from typing import Any
 
@@ -307,6 +307,61 @@ async def create_pending_task_run(
     )
     await session.commit()
     return int(result.scalar_one())
+
+
+async def get_active_task_run(session: AsyncSession, *, task_name: str) -> dict[str, Any] | None:
+    result = await session.execute(
+        text(
+            """
+            SELECT id, task_name, task_id, status, started_at, payload
+            FROM task_runs
+            WHERE task_name = :task_name
+              AND status IN ('pending', 'running')
+            ORDER BY started_at DESC NULLS LAST, id DESC
+            LIMIT 1
+            """
+        ),
+        {"task_name": task_name},
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
+
+
+async def mark_stale_running_task_runs(
+    session: AsyncSession,
+    *,
+    older_than: timedelta = timedelta(hours=24),
+    task_names: list[str] | None = None,
+    error_message: str = "stale running task after celery worker cleanup",
+) -> int:
+    task_name_filter = ""
+    cutoff_at = datetime.now(tz=UTC) - older_than
+    params: dict[str, Any] = {
+        "cutoff_at": cutoff_at,
+        "error_message": error_message[:4000],
+    }
+    if task_names:
+        task_name_filter = "AND task_name = ANY(CAST(:task_names AS TEXT[]))"
+        params["task_names"] = task_names
+
+    result = await session.execute(
+        text(
+            f"""
+            UPDATE task_runs
+            SET status = 'failed',
+                finished_at = NOW(),
+                error_message = COALESCE(error_message, :error_message)
+            WHERE status = 'running'
+              AND started_at < :cutoff_at
+              {task_name_filter}
+            RETURNING id
+            """
+        ),
+        params,
+    )
+    rows = result.fetchall()
+    await session.commit()
+    return len(rows)
 
 
 async def mark_task_run_queue_failed(

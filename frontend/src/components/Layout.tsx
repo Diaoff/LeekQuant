@@ -18,7 +18,7 @@ import {
 } from 'lucide-react'
 import { useTheme } from '../lib/theme'
 
-type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest' | 'signals' | 'simulation' | 'factor' | 'sources'
+type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest' | 'signals' | 'simulation' | 'factor' | 'preferences'
 
 const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: string }> = [
   { key: 'dashboard', label: '仪表盘', icon: <LayoutDashboard className="h-5 w-5" />, to: '/' },
@@ -30,7 +30,7 @@ const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: 
   { key: 'signals', label: '信号中心', icon: <RadioTower className="h-5 w-5" />, to: '/signals' },
   { key: 'simulation', label: '模拟交易', icon: <WalletCards className="h-5 w-5" />, to: '/simulation' },
   { key: 'factor', label: '因子选股', icon: <Sigma className="h-5 w-5" />, to: '/factor' },
-  { key: 'sources', label: '数据源', icon: <Settings className="h-5 w-5" />, to: '/sources' },
+  { key: 'preferences', label: '偏好设置', icon: <Settings className="h-5 w-5" />, to: '/preferences' },
 ]
 
 const SIDEBAR_EXPANDED_WIDTH = 240
@@ -72,7 +72,7 @@ export default function Layout({ children }: LayoutProps) {
     if (path === '/signals') return 'signals'
     if (path === '/simulation') return 'simulation'
     if (path === '/factor') return 'factor'
-    if (path === '/sources') return 'sources'
+    if (path === '/preferences' || path === '/sources') return 'preferences'
     return 'dashboard'
   }, [location.pathname])
 

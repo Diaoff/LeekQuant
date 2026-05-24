@@ -118,8 +118,6 @@ def sync_all_kline(
         total = len(all_codes)
 
         def progress(i: int, _total: int, code: str) -> None:
-            if i != 1 and i != total and i % 10 != 0:
-                return
             try:
                 self.update_state(
                     state="PROGRESS",

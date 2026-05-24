@@ -21,6 +21,7 @@ from app.tasks.celery_app import celery_app
 router = APIRouter(prefix="/api/backtests", tags=["backtests"])
 
 MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
+MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
 
 
 def _extract_user_id(request: Request) -> int:
@@ -66,20 +67,29 @@ class BacktestCreateRequest(BaseModel):
     benchmark_code: str | None = None
     config: dict[str, Any] = Field(default_factory=dict)
     target_type: Literal["all", "market", "watchlist_group"] = "all"
-    target_value: str | None = None
+    target_value: str | list[str] | None = None
+    exclude_st: bool | None = None
+    exclude_loss_pe: bool | None = None
 
     @model_validator(mode="after")
     def validate_target(self) -> "BacktestCreateRequest":
         if self.target_type == "all":
             self.target_value = None
-            return self
-        if self.target_type == "market":
-            if self.target_value not in MARKET_TARGETS:
+        elif self.target_type == "market":
+            markets = _normalize_market_targets(self.target_value)
+            if not markets:
                 raise ValueError("target_value must be one of 主板 / 创业板 / 科创板 / 北交所")
-            return self
-        if not self.target_value or not self.target_value.strip():
-            raise ValueError("target_value is required for watchlist_group")
-        self.target_value = self.target_value.strip()
+            self.target_value = markets
+        else:
+            if not isinstance(self.target_value, str) or not self.target_value.strip():
+                raise ValueError("target_value is required for watchlist_group")
+            self.target_value = self.target_value.strip()
+
+        default_filter = self.target_type in {"all", "market"}
+        if self.exclude_st is None:
+            self.exclude_st = default_filter
+        if self.exclude_loss_pe is None:
+            self.exclude_loss_pe = default_filter
         return self
 
 
@@ -95,11 +105,21 @@ def _decode_json_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _target_label(target_type: str | None, target_value: str | None) -> str:
+def _normalize_market_targets(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else [value]
+    selected = [str(item).strip() for item in raw_values if item is not None and str(item).strip()]
+    if not selected or any(market not in MARKET_TARGETS for market in selected):
+        return []
+    selected_set = set(selected)
+    return [market for market in MARKET_TARGET_ORDER if market in selected_set]
+
+
+def _target_label(target_type: str | None, target_value: Any) -> str:
     if target_type == "market" and target_value:
-        return target_value
+        markets = _normalize_market_targets(target_value)
+        return "、".join(markets) if markets else "全市场"
     if target_type == "watchlist_group" and target_value:
-        return f"自选股/{target_value}"
+        return f"自选股/{str(target_value)}"
     return "全市场"
 
 
@@ -170,6 +190,10 @@ async def submit_backtest(
         "initial_cash": request.initial_cash,
         "benchmark_code": request.benchmark_code,
         "config": request.config,
+        "filters": {
+            "exclude_st": bool(request.exclude_st),
+            "exclude_loss_pe": bool(request.exclude_loss_pe),
+        },
         "target": {
             "type": request.target_type,
             "value": request.target_value,

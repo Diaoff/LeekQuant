@@ -17,7 +17,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.backtest.cost import FeeConfig
+from app.backtest.cost import FeeConfig, build_fee_config
 
 logger = logging.getLogger(__name__)
 
@@ -227,21 +227,12 @@ class HikyuuBacktestAdapter:
 
         # Configure A-share fees
         fee_cfg = config.get("fee_config", {})
-        if isinstance(fee_cfg, FeeConfig):
-            commission_rate = float(fee_cfg.commission_rate)
-            min_commission = float(fee_cfg.min_commission)
-            stamp_tax_rate = float(fee_cfg.stamp_tax_rate)
-            transfer_fee_rate = float(fee_cfg.transfer_fee_rate)
-        elif isinstance(fee_cfg, dict):
-            commission_rate = float(fee_cfg.get("commission_rate", 0.00025))
-            min_commission = float(fee_cfg.get("min_commission", 5.0))
-            stamp_tax_rate = float(fee_cfg.get("stamp_tax_rate", 0.0005))
-            transfer_fee_rate = float(fee_cfg.get("transfer_fee_rate", 0.00001))
-        else:
-            commission_rate = 0.00025
-            min_commission = 5.0
-            stamp_tax_rate = 0.0005
-            transfer_fee_rate = 0.00001
+        if not isinstance(fee_cfg, FeeConfig):
+            fee_cfg = build_fee_config(fee_cfg if isinstance(fee_cfg, dict) else None)
+        commission_rate = float(fee_cfg.commission_rate)
+        min_commission = 0.0 if fee_cfg.waive_min_commission else float(fee_cfg.min_commission)
+        stamp_tax_rate = float(fee_cfg.stamp_tax_rate)
+        transfer_fee_rate = float(fee_cfg.transfer_fee_rate)
 
         # Set fees on TradeManager
         tm.commission = commission_rate

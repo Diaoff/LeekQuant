@@ -63,7 +63,7 @@ interface BacktestListResult {
   strategy_id: number
   strategy_name: string | null
   target_type?: 'all' | 'market' | 'watchlist_group'
-  target_value?: string | null
+  target_value?: string | string[] | null
   target_label?: string | null
   start_date: string
   end_date: string
@@ -88,7 +88,9 @@ interface BacktestParams {
   end_date: string
   initial_cash: number
   target_type: 'all' | 'market' | 'watchlist_group'
-  target_value: string
+  target_value: string | string[]
+  exclude_st: boolean
+  exclude_loss_pe: boolean
   stop_loss_pct: string
   take_profit_pct: string
   trailing_stop_pct: string
@@ -103,6 +105,18 @@ interface WatchlistGroupOption {
 const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所'] as const
 
 type ViewKey = 'list' | 'edit'
+type BacktestTargetType = BacktestParams['target_type']
+type MarketOption = typeof MARKET_OPTIONS[number]
+
+function defaultFiltersForTarget(targetType: BacktestTargetType) {
+  const enabled = targetType === 'all' || targetType === 'market'
+  return { exclude_st: enabled, exclude_loss_pe: enabled }
+}
+
+function selectedMarkets(value: BacktestParams['target_value']): MarketOption[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((market): market is MarketOption => MARKET_OPTIONS.includes(market as MarketOption))
+}
 
 const DEFAULT_CODE = `# 双均线策略示例
 # 可用指标: MA, EMA, RSI, MACD, BOLL, KDJ, ATR 等 (MyTT)
@@ -151,6 +165,7 @@ export default function StrategyPage() {
     initial_cash: 100000,
     target_type: 'all',
     target_value: '',
+    ...defaultFiltersForTarget('all'),
     stop_loss_pct: '',
     take_profit_pct: '',
     trailing_stop_pct: '',
@@ -234,6 +249,23 @@ export default function StrategyPage() {
     }
   }
 
+  const selectTargetType = (targetType: BacktestTargetType) => {
+    setBacktestParams({
+      ...backtestParams,
+      target_type: targetType,
+      target_value: targetType === 'market' ? [] : '',
+      ...defaultFiltersForTarget(targetType),
+    })
+  }
+
+  const toggleMarketTarget = (market: MarketOption) => {
+    const current = selectedMarkets(backtestParams.target_value)
+    const next = current.includes(market)
+      ? current.filter((item) => item !== market)
+      : MARKET_OPTIONS.filter((item) => item === market || current.includes(item))
+    setBacktestParams({ ...backtestParams, target_value: next })
+  }
+
   const runBacktest = async (strategy: Strategy) => {
     setTargetStrategy(strategy)
     setBacktestParams({
@@ -242,6 +274,7 @@ export default function StrategyPage() {
       initial_cash: 100000,
       target_type: 'all',
       target_value: '',
+      ...defaultFiltersForTarget('all'),
       stop_loss_pct: '',
       take_profit_pct: '',
       trailing_stop_pct: '',
@@ -268,6 +301,8 @@ export default function StrategyPage() {
         config: Object.keys(config).length > 0 ? config : undefined,
         target_type: backtestParams.target_type,
         target_value: backtestParams.target_type === 'all' ? null : backtestParams.target_value,
+        exclude_st: backtestParams.exclude_st,
+        exclude_loss_pe: backtestParams.exclude_loss_pe,
       }
       await fetchJson('/api/backtests', { method: 'POST', body: JSON.stringify(body) })
       setNotice('回测任务已提交')
@@ -281,8 +316,8 @@ export default function StrategyPage() {
 
   const isBacktestTargetValid =
     backtestParams.target_type === 'all' ||
-    (backtestParams.target_type === 'market' && backtestParams.target_value.trim().length > 0) ||
-    (backtestParams.target_type === 'watchlist_group' && backtestParams.target_value.trim().length > 0)
+    (backtestParams.target_type === 'market' && selectedMarkets(backtestParams.target_value).length > 0) ||
+    (backtestParams.target_type === 'watchlist_group' && typeof backtestParams.target_value === 'string' && backtestParams.target_value.trim().length > 0)
 
   const loadRunHistory = async () => {
     setLoadingRuns(true)
@@ -455,32 +490,37 @@ export default function StrategyPage() {
 
       {showBacktestModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowBacktestModal(false)}>
-          <div className={`w-full max-w-md rounded-lg p-6 ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'bg-slate-800 text-slate-100' : 'bg-white text-ink'}`} onClick={(e) => e.stopPropagation()}>
+          <div className={`w-full max-w-lg rounded-lg p-6 ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'bg-slate-800 text-slate-100' : 'bg-white text-ink'}`} onClick={(e) => e.stopPropagation()}>
             <h3 className="mb-4 text-lg font-semibold">回测参数设置</h3>
             <div className="space-y-4">
               <div>
                 <label className="mb-1 block text-sm font-medium text-slate-600">标的范围</label>
                 <div className="grid grid-cols-3 gap-2">
-                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'all', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'all' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>全市场</button>
-                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'market', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'market' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>市场板块</button>
-                  <button type="button" onClick={() => setBacktestParams({ ...backtestParams, target_type: 'watchlist_group', target_value: '' })} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'watchlist_group' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>自选分组</button>
+                  <button type="button" onClick={() => selectTargetType('all')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'all' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>全市场</button>
+                  <button type="button" onClick={() => selectTargetType('market')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'market' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>市场板块</button>
+                  <button type="button" onClick={() => selectTargetType('watchlist_group')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'watchlist_group' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>自选分组</button>
                 </div>
               </div>
               {backtestParams.target_type === 'market' && (
                 <div>
                   <label className="mb-1 block text-sm font-medium text-slate-600">市场板块</label>
-                  <select value={backtestParams.target_value} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`}>
-                    <option value="">请选择</option>
-                    {MARKET_OPTIONS.map((market) => (
-                      <option key={market} value={market}>{market}</option>
-                    ))}
-                  </select>
+                  <div className="grid grid-cols-2 gap-2">
+                    {MARKET_OPTIONS.map((market) => {
+                      const checked = selectedMarkets(backtestParams.target_value).includes(market)
+                      return (
+                        <label key={market} className={`flex min-h-10 items-center gap-2 rounded-md border px-3 text-sm font-medium ${checked ? 'border-accent bg-blue-50 text-accent' : document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
+                          <input type="checkbox" checked={checked} onChange={() => toggleMarketTarget(market)} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+                          <span>{market}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
                 </div>
               )}
               {backtestParams.target_type === 'watchlist_group' && (
                 <div>
                   <label className="mb-1 block text-sm font-medium text-slate-600">自选股分组</label>
-                  <select value={backtestParams.target_value} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} disabled={watchlistGroups.length === 0}>
+                  <select value={typeof backtestParams.target_value === 'string' ? backtestParams.target_value : ''} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} disabled={watchlistGroups.length === 0}>
                     <option value="">{watchlistGroups.length === 0 ? '暂无分组' : '请选择'}</option>
                     {watchlistGroups.map((group) => (
                       <option key={group.group_name} value={group.group_name}>{group.group_name} ({group.item_count} 只)</option>
@@ -488,6 +528,16 @@ export default function StrategyPage() {
                   </select>
                 </div>
               )}
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <label className={`flex min-h-11 items-center gap-2 rounded-md border px-3 text-sm font-medium ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
+                  <input type="checkbox" checked={backtestParams.exclude_st} onChange={(e) => setBacktestParams({ ...backtestParams, exclude_st: e.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+                  <span>排除 ST</span>
+                </label>
+                <label className={`flex min-h-11 items-center gap-2 rounded-md border px-3 text-sm font-medium ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
+                  <input type="checkbox" checked={backtestParams.exclude_loss_pe} onChange={(e) => setBacktestParams({ ...backtestParams, exclude_loss_pe: e.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+                  <span>排除亏损市盈率 PE&lt;=0</span>
+                </label>
+              </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="mb-1 block text-sm font-medium text-slate-600">开始日期</label>

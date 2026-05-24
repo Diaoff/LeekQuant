@@ -96,8 +96,9 @@ async def sync_kline_result(task_id: str) -> dict:
         "ready": async_result.ready(),
     }
     if async_result.ready():
-        if async_result.failed():
+        if async_result.failed() or async_result.status.lower() == "revoked":
             result["error"] = str(async_result.result)
         else:
-            result["result"] = async_result.result
+            task_result = async_result.result
+            result["result"] = task_result if isinstance(task_result, dict) else str(task_result)
     return result

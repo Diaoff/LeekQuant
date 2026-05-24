@@ -1,9 +1,17 @@
+import asyncio
+import logging
+from datetime import timedelta
+
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import worker_ready
 
 from app.core.config import get_settings
+from app.data.repository import mark_stale_running_task_runs
+from app.db.session import async_session_factory
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "leek_quant",
@@ -22,6 +30,7 @@ celery_app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
+    worker_prefetch_multiplier=1,
     timezone="Asia/Shanghai",
     beat_schedule={
         "update-stock-basic-weekly": {
@@ -62,3 +71,22 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_ready.connect
+def cleanup_stale_running_tasks_on_worker_ready(**_kwargs) -> None:
+    async def cleanup() -> int:
+        async with async_session_factory() as session:
+            return await mark_stale_running_task_runs(
+                session,
+                older_than=timedelta(hours=24),
+                error_message="stale running task after celery worker startup",
+            )
+
+    try:
+        cleaned = asyncio.run(cleanup())
+    except Exception:
+        logger.exception("Failed to clean stale running task records on worker startup")
+        return
+    if cleaned:
+        logger.warning("Marked %s stale running task record(s) as failed", cleaned)

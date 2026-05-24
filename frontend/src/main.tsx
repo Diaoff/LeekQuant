@@ -6,7 +6,7 @@ import Layout from './components/Layout'
 import { ThemeProvider } from './lib/theme'
 import BacktestPage from './pages/BacktestPage'
 import DashboardPage from './pages/DashboardPage'
-import DataSourcePage from './pages/DataSourcePage'
+import PreferencesPage from './pages/PreferencesPage'
 import FactorPage from './pages/FactorPage'
 import MarketPage from './pages/MarketPage'
 import SignalsPage from './pages/SignalsPage'
@@ -26,7 +26,8 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/" element={<DashboardPage />} />
               <Route path="/status" element={<StatusPage />} />
-              <Route path="/sources" element={<DataSourcePage />} />
+              <Route path="/preferences" element={<PreferencesPage />} />
+              <Route path="/sources" element={<PreferencesPage />} />
               <Route path="/market" element={<MarketPage />} />
               <Route path="/watchlist" element={<WatchlistPage />} />
               <Route path="/strategy" element={<StrategyPage />} />

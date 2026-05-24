@@ -9,6 +9,7 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-1}"
 
 WITH_CELERY=0
 SKIP_BACKEND=0
@@ -29,6 +30,7 @@ Environment:
   BACKEND_PORT       Backend port, default 8000.
   FRONTEND_HOST      Frontend bind host, default 127.0.0.1.
   FRONTEND_PORT      Frontend port, default 5173.
+  CELERY_CONCURRENCY Celery worker concurrency, default 1.
 EOF
 }
 
@@ -70,6 +72,7 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-1}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
 
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
@@ -113,6 +116,29 @@ wait_http() {
   exit 1
 }
 
+start_detached() {
+  local log_file="$1"
+  shift
+
+  "$PYTHON_BIN" -c '
+import subprocess
+import sys
+
+log_path = sys.argv[1]
+cmd = sys.argv[2:]
+log = open(log_path, "ab", buffering=0)
+process = subprocess.Popen(
+    cmd,
+    stdin=subprocess.DEVNULL,
+    stdout=log,
+    stderr=subprocess.STDOUT,
+    close_fds=True,
+    start_new_session=True,
+)
+print(process.pid)
+' "$log_file" "$@"
+}
+
 kill_pid_file() {
   local name="$1"
   local file="$PID_DIR/$name.pid"
@@ -125,6 +151,36 @@ kill_pid_file() {
       kill "$pid" >/dev/null 2>&1 || true
     fi
     rm -f "$file"
+  fi
+}
+
+kill_celery_processes() {
+  local name="$1"
+  local role="$2"
+
+  if ! command -v ps >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local app_path="app.tasks.celery_app:celery_app"
+  local pids
+  pids="$(ps -eo pid=,command= | awk -v app="$app_path" -v role="$role" 'index($0, app) && index($0, role) {print $1}' || true)"
+  if [[ -z "$pids" ]]; then
+    return 0
+  fi
+
+  echo "Stopping existing celery $name process(es): $pids"
+  for pid in $pids; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+
+  sleep 1
+  pids="$(ps -eo pid=,command= | awk -v app="$app_path" -v role="$role" 'index($0, app) && index($0, role) {print $1}' || true)"
+  if [[ -n "$pids" ]]; then
+    echo "Force stopping existing celery $name process(es): $pids"
+    for pid in $pids; do
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    done
   fi
 }
 
@@ -157,6 +213,7 @@ kill_port() {
 }
 
 start_backend() {
+  require_file "$PYTHON_BIN"
   require_file "$ALEMBIC_BIN"
   require_file "$UVICORN_BIN"
 
@@ -169,42 +226,40 @@ start_backend() {
   echo "Starting backend on http://$BACKEND_HOST:$BACKEND_PORT"
   (
     cd "$ROOT_DIR/backend"
-    nohup "$UVICORN_BIN" app.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" \
-      >"$LOG_DIR/backend.log" 2>&1 &
-    echo "$!" > "$PID_DIR/backend.pid"
+    start_detached "$LOG_DIR/backend.log" "$UVICORN_BIN" app.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" \
+      > "$PID_DIR/backend.pid"
   )
 }
 
 start_frontend() {
+  require_file "$PYTHON_BIN"
   require_cmd npm
 
   echo "Starting frontend on http://$FRONTEND_HOST:$FRONTEND_PORT"
   (
     cd "$ROOT_DIR/frontend"
     export VITE_API_BASE_URL
-    nohup npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" \
-      >"$LOG_DIR/frontend.log" 2>&1 &
-    echo "$!" > "$PID_DIR/frontend.pid"
+    start_detached "$LOG_DIR/frontend.log" npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT" \
+      > "$PID_DIR/frontend.pid"
   )
 }
 
 start_celery() {
+  require_file "$PYTHON_BIN"
   require_file "$CELERY_BIN"
 
-  echo "Starting celery worker"
+  echo "Starting celery worker with concurrency=$CELERY_CONCURRENCY"
   (
     cd "$ROOT_DIR/backend"
-    nohup "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO \
-      >"$LOG_DIR/celery-worker.log" 2>&1 &
-    echo "$!" > "$PID_DIR/celery-worker.pid"
+    start_detached "$LOG_DIR/celery-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$CELERY_CONCURRENCY" \
+      > "$PID_DIR/celery-worker.pid"
   )
 
   echo "Starting celery beat"
   (
     cd "$ROOT_DIR/backend"
-    nohup "$CELERY_BIN" -A app.tasks.celery_app:celery_app beat --loglevel=INFO \
-      >"$LOG_DIR/celery-beat.log" 2>&1 &
-    echo "$!" > "$PID_DIR/celery-beat.pid"
+    start_detached "$LOG_DIR/celery-beat.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app beat --loglevel=INFO \
+      > "$PID_DIR/celery-beat.pid"
   )
 }
 
@@ -221,6 +276,8 @@ fi
 if [[ "$WITH_CELERY" -eq 1 ]]; then
   kill_pid_file celery-worker
   kill_pid_file celery-beat
+  kill_celery_processes worker " worker"
+  kill_celery_processes beat " beat"
 fi
 
 if [[ "$SKIP_BACKEND" -eq 0 ]]; then

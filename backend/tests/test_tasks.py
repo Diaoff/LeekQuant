@@ -23,6 +23,7 @@ def test_celery_app_registers_data_tasks() -> None:
     assert "app.tasks.trading_tasks.snapshot_nav_daily" in registered
     assert "app.tasks.signal_tasks.generate_all_signals" in registered
     assert celery_app.conf.beat_schedule["generate-signals-daily"]["task"] == "app.tasks.signal_tasks.generate_all_signals"
+    assert celery_app.conf.worker_prefetch_multiplier == 1
 
 
 def test_run_tracked_claims_pending_task_run(monkeypatch) -> None:

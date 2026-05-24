@@ -101,27 +101,24 @@ function HealthPill({ icon, label, health }: { icon: React.ReactNode; label: str
 }
 
 function ActionButton({
-  action,
-  activeAction,
+  running,
   icon,
   label,
   onClick,
 }: {
-  action: ActionKey
-  activeAction: ActionKey | null
+  running: boolean
   icon: React.ReactNode
   label: string
   onClick: () => void
 }) {
-  const isActive = activeAction === action
   return (
     <button
       type="button"
       onClick={onClick}
-      disabled={activeAction !== null}
+      disabled={running}
       className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
     >
-      {isActive ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : icon}
+      {running ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : icon}
       {label}
     </button>
   )
@@ -133,7 +130,7 @@ export default function StatusPage() {
   const [dataStatus, setDataStatus] = React.useState<DataStatus | null>(null)
   const [lastCheckedAt, setLastCheckedAt] = React.useState<string>('尚未完成')
   const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const [activeAction, setActiveAction] = React.useState<ActionKey | null>(null)
+  const [runningActions, setRunningActions] = React.useState<Partial<Record<ActionKey, boolean>>>({})
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [progressTaskId, setProgressTaskId] = React.useState<string | null>(null)
@@ -161,7 +158,8 @@ export default function StatusPage() {
   }, [])
 
   const runAction = React.useCallback(async (action: ActionKey) => {
-    setActiveAction(action)
+    if (runningActions[action]) return
+    setRunningActions((prev) => ({ ...prev, [action]: true }))
     setNotice(null)
     setError(null)
     try {
@@ -196,9 +194,9 @@ export default function StatusPage() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
-      setActiveAction(null)
+      setRunningActions((prev) => ({ ...prev, [action]: false }))
     }
-  }, [refreshStatus])
+  }, [refreshStatus, runningActions])
 
   React.useEffect(() => {
     void refreshStatus()
@@ -208,11 +206,20 @@ export default function StatusPage() {
     if (!progressTaskId) return
     const interval = setInterval(async () => {
       try {
-        const result = await fetchJson<{ meta?: ProgressMeta; ready: boolean }>(`/api/tasks/${progressTaskId}`)
+        const result = await fetchJson<{ meta?: ProgressMeta; ready: boolean; error?: string }>(`/api/tasks/${progressTaskId}`)
         if (result.meta) {
           setProgressMeta(result.meta)
         }
         if (result.ready) {
+          if (result.error) {
+            setError(`全量 K 线同步失败：${result.error}`)
+            setProgressTaskId(null)
+            setProgressMeta(null)
+            setProgressDone(false)
+            clearInterval(interval)
+            void refreshStatus()
+            return
+          }
           setProgressDone(true)
           setNotice('全量 K 线同步完成')
           clearInterval(interval)
@@ -281,15 +288,15 @@ export default function StatusPage() {
       )}
 
       <div className="flex flex-wrap gap-3">
-        <ActionButton action="stock-basic" activeAction={activeAction} icon={<Database className="h-4 w-4" aria-hidden="true" />} label="同步股票" onClick={() => void runAction('stock-basic')} />
-        <ActionButton action="trade-calendar" activeAction={activeAction} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
-        <ActionButton action="sample-kline" activeAction={activeAction} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
-        <ActionButton action="all-kline" activeAction={activeAction} icon={<Layers className="h-4 w-4" aria-hidden="true" />} label="全量 K 线" onClick={() => void runAction('all-kline')} />
-        <ActionButton action="fundamentals" activeAction={activeAction} icon={<Table2 className="h-4 w-4" aria-hidden="true" />} label="同步基本面" onClick={() => void runAction('fundamentals')} />
+        <ActionButton running={runningActions['stock-basic'] === true} icon={<Database className="h-4 w-4" aria-hidden="true" />} label="同步股票" onClick={() => void runAction('stock-basic')} />
+        <ActionButton running={runningActions['trade-calendar'] === true} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
+        <ActionButton running={runningActions['sample-kline'] === true} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
+        <ActionButton running={runningActions['all-kline'] === true} icon={<Layers className="h-4 w-4" aria-hidden="true" />} label="全量 K 线" onClick={() => void runAction('all-kline')} />
+        <ActionButton running={runningActions.fundamentals === true} icon={<Table2 className="h-4 w-4" aria-hidden="true" />} label="同步基本面" onClick={() => void runAction('fundamentals')} />
         <button
           type="button"
           onClick={() => void refreshStatus()}
-          disabled={isRefreshing || activeAction !== null}
+          disabled={isRefreshing}
           className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-semibold text-ink transition hover:bg-surface focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
         >
           <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} aria-hidden="true" />

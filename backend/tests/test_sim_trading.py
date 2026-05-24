@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from fastapi import HTTPException
 
-from app.sim.service import SignalOrderRequest, generate_order_from_signal, match_order, snapshot_daily_nav, unlock_t1_positions
+from app.sim.service import SignalOrderRequest, _fee_config, _global_fee_config, generate_order_from_signal, match_order, snapshot_daily_nav, unlock_t1_positions
 
 
 class FakeResult:
@@ -153,6 +153,27 @@ def order_row(**overrides):
     }
     row.update(overrides)
     return row
+
+
+def test_sim_fee_config_merges_account_over_global_over_defaults():
+    global_config = _global_fee_config(
+        {
+            "user_trading_fee_config": {
+                "commission_rate": "0.0003",
+                "min_commission": "4.0",
+                "waive_min_commission": True,
+            }
+        }
+    )
+    account_config = {"fee_config": {"commission_rate": "0.0002"}}
+
+    result = _fee_config(account_config, global_config)
+
+    assert result.commission_rate == Decimal("0.0002")
+    assert result.min_commission == Decimal("4.0")
+    assert result.stamp_tax_rate == Decimal("0.0005")
+    assert result.transfer_fee_rate == Decimal("0.00001")
+    assert result.waive_min_commission is True
 
 
 @pytest.mark.asyncio
