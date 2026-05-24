@@ -1,7 +1,8 @@
 import React from 'react'
-import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw, Star, Loader2, X } from 'lucide-react'
+import { RefreshCw, AlertTriangle, ChevronUp, ChevronDown, RotateCcw, Star, Loader2, X, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from 'lucide-react'
 import { fetchJson, formatMarketCap, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
+import { type RealtimeTick, useRealtimeTicks } from '../hooks/useRealtimeTicks'
 
 interface StockBasic {
   ts_code: string
@@ -83,6 +84,7 @@ const DEFAULT_FILTERS: MarketFilterState = {
 const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所']
 const EXCHANGE_OPTIONS = ['SH', 'SZ', 'BJ']
 const DEFAULT_GROUP_NAME = '默认'
+const MARKET_PAGE_SIZE = 20
 
 const defaultWatchlistGroups = (): WatchlistGroupOption[] => [{ group_name: DEFAULT_GROUP_NAME, item_count: 0 }]
 
@@ -169,6 +171,115 @@ const filterSummary = (filters: MarketFilterState): string[] => {
   return summary
 }
 
+const signedTone = (value: string | null | undefined) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 'text-ink'
+  if (numeric > 0) return 'text-red-600'
+  if (numeric < 0) return 'text-emerald-600'
+  return 'text-muted'
+}
+
+const priceValue = (value: string | null | undefined) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '暂无'
+  return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(numeric)
+}
+
+const signedValue = (value: string | null | undefined, digits = 2) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${numeric > 0 ? '+' : ''}${formatNumber(numeric, digits)}`
+}
+
+const percentValue = (value: string | null | undefined) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${numeric > 0 ? '+' : ''}${formatNumber(numeric, 2)}%`
+}
+
+const realtimePrice = (tick: RealtimeTick | undefined) => tick?.price ?? null
+
+interface AdvancedPaginationProps {
+  page: number
+  pageSize: number
+  total: number
+  disabled?: boolean
+  onPageChange: (page: number) => void
+}
+
+function AdvancedPagination({ page, pageSize, total, disabled = false, onPageChange }: AdvancedPaginationProps) {
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const currentPage = Math.min(Math.max(1, page), totalPages)
+  const [jumpValue, setJumpValue] = React.useState(String(currentPage))
+
+  React.useEffect(() => {
+    setJumpValue(String(currentPage))
+  }, [currentPage])
+
+  const goToPage = (nextPage: number) => {
+    const clamped = Math.min(Math.max(1, nextPage), totalPages)
+    if (clamped !== currentPage) onPageChange(clamped)
+  }
+
+  const submitJump = () => {
+    const nextPage = Number(jumpValue)
+    if (Number.isFinite(nextPage)) goToPage(Math.trunc(nextPage))
+  }
+
+  const startPage = Math.max(1, Math.min(currentPage - 2, totalPages - 4))
+  const pageNumbers = Array.from({ length: Math.min(5, totalPages) }, (_, index) => startPage + index)
+  const startRow = total === 0 ? 0 : (currentPage - 1) * pageSize + 1
+  const endRow = Math.min(total, currentPage * pageSize)
+
+  return (
+    <div className="flex flex-col gap-3 border-t border-line px-4 py-3 text-sm text-muted lg:flex-row lg:items-center lg:justify-between">
+      <span>
+        共 {formatNumber(total)} 只，{formatNumber(pageSize)} 条/页，当前 {formatNumber(startRow)}-{formatNumber(endRow)}
+      </span>
+      <div className="flex flex-wrap items-center gap-2">
+        <button type="button" onClick={() => goToPage(1)} disabled={disabled || currentPage <= 1} className="flex h-8 w-8 items-center justify-center rounded-md border border-line text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-40" aria-label="第一页">
+          <ChevronsLeft className="h-4 w-4" />
+        </button>
+        <button type="button" onClick={() => goToPage(currentPage - 1)} disabled={disabled || currentPage <= 1} className="flex h-8 w-8 items-center justify-center rounded-md border border-line text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-40" aria-label="上一页">
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+        {startPage > 1 && <span className="px-1 tabular-nums">...</span>}
+        {pageNumbers.map((pageNumber) => (
+          <button
+            key={pageNumber}
+            type="button"
+            onClick={() => goToPage(pageNumber)}
+            disabled={disabled}
+            className={`h-8 min-w-8 rounded-md border px-2 tabular-nums disabled:cursor-not-allowed disabled:opacity-40 ${pageNumber === currentPage ? 'border-accent bg-accent text-white' : 'border-line text-ink hover:bg-rowHover'}`}
+          >
+            {pageNumber}
+          </button>
+        ))}
+        {startPage + pageNumbers.length - 1 < totalPages && <span className="px-1 tabular-nums">...</span>}
+        <button type="button" onClick={() => goToPage(currentPage + 1)} disabled={disabled || currentPage >= totalPages} className="flex h-8 w-8 items-center justify-center rounded-md border border-line text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-40" aria-label="下一页">
+          <ChevronRight className="h-4 w-4" />
+        </button>
+        <button type="button" onClick={() => goToPage(totalPages)} disabled={disabled || currentPage >= totalPages} className="flex h-8 w-8 items-center justify-center rounded-md border border-line text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-40" aria-label="最后一页">
+          <ChevronsRight className="h-4 w-4" />
+        </button>
+        <span className="ml-1 whitespace-nowrap tabular-nums">第 {currentPage}/{totalPages} 页</span>
+        <input
+          value={jumpValue}
+          onChange={(event) => setJumpValue(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Enter') submitJump() }}
+          disabled={disabled}
+          inputMode="numeric"
+          className="h-8 w-16 rounded-md border border-line bg-panel px-2 text-center tabular-nums text-ink focus:outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="跳转页码"
+        />
+        <button type="button" onClick={submitJump} disabled={disabled} className="h-8 rounded-md border border-line px-3 font-semibold text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-40">
+          跳转
+        </button>
+      </div>
+    </div>
+  )
+}
+
 export default function MarketPage() {
   const [tab, setTab] = React.useState<TabKey>('basic')
   const [stocks, setStocks] = React.useState<StockBasic[]>([])
@@ -189,11 +300,18 @@ export default function MarketPage() {
   const [dailyQuery, setDailyQuery] = React.useState('')
   const [sortKey, setSortKey] = React.useState<keyof MarketStock>('ts_code')
   const [sortDir, setSortDir] = React.useState<'asc' | 'desc'>('asc')
+  const [stockPage, setStockPage] = React.useState(1)
   const [dailyPage, setDailyPage] = React.useState(1)
   const [filters, setFilters] = React.useState<MarketFilterState>(DEFAULT_FILTERS)
 
   const activeFilterSummary = React.useMemo(() => filterSummary(filters), [filters])
   const filterErrors = React.useMemo(() => collectFilterErrors(filters), [filters])
+  const realtimeCodes = React.useMemo(() => (
+    tab === 'basic'
+      ? stocks.map((stock) => stock.ts_code)
+      : dailyRows.map((stock) => stock.ts_code)
+  ), [dailyRows, stocks, tab])
+  const realtime = useRealtimeTicks(realtimeCodes)
 
   const loadWatchlistGroups = React.useCallback(async () => {
     try {
@@ -208,7 +326,7 @@ export default function MarketPage() {
     setLoading(true)
     setError(null)
     try {
-      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: 1, pageSize: 200, query, filters }))
+      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: stockPage, pageSize: MARKET_PAGE_SIZE, query, filters }))
       setStocks(data.items)
       setTotalStocks(data.total)
     } catch (caught) {
@@ -216,18 +334,18 @@ export default function MarketPage() {
     } finally {
       setLoading(false)
     }
-  }, [filters, query])
+  }, [filters, query, stockPage])
 
   const loadDaily = React.useCallback(async () => {
     setDailyLoading(true)
     setError(null)
     try {
-      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: dailyPage, pageSize: 50, query: dailyQuery, filters }))
+      const data = await fetchJson<StocksApiResponse>(buildStocksUrl({ page: dailyPage, pageSize: MARKET_PAGE_SIZE, query: dailyQuery, filters }))
       const rows: MarketStock[] = data.items.map((item) => ({
         ts_code: item.ts_code,
         symbol: item.symbol,
         name: item.name,
-        latest_close: item.latest_close,
+        latest_close: null,
         change_pct: null,
         volume: null,
         amount: null,
@@ -353,9 +471,12 @@ export default function MarketPage() {
   }
 
   const sortedDaily = React.useMemo(() => {
-    const closeVal = (r: MarketStock) => Number(r.latest_close) || 0
+    const closeVal = (r: MarketStock) => Number(realtime.ticks[r.ts_code]?.price ?? r.latest_close) || 0
     const keyVal = (r: MarketStock, k: keyof MarketStock) => {
       if (k === 'latest_close') return closeVal(r)
+      if (k === 'change_pct') return Number(realtime.ticks[r.ts_code]?.change_pct ?? r.change_pct) || 0
+      if (k === 'volume') return Number(realtime.ticks[r.ts_code]?.volume ?? r.volume) || 0
+      if (k === 'amount') return Number(realtime.ticks[r.ts_code]?.amount ?? r.amount) || 0
       return r[k]
     }
     return [...dailyRows].sort((a, b) => {
@@ -364,15 +485,17 @@ export default function MarketPage() {
       if (typeof va === 'number' && typeof vb === 'number') return sortDir === 'asc' ? va - vb : vb - va
       return sortDir === 'asc' ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va))
     })
-  }, [dailyRows, sortKey, sortDir])
+  }, [dailyRows, realtime.ticks, sortKey, sortDir])
 
   const updateFilters = (patch: Partial<MarketFilterState>) => {
     setFilters((current) => ({ ...current, ...patch }))
+    setStockPage(1)
     setDailyPage(1)
   }
 
   const resetFilters = () => {
     setFilters(DEFAULT_FILTERS)
+    setStockPage(1)
     setDailyPage(1)
   }
 
@@ -458,8 +581,10 @@ export default function MarketPage() {
           <input
             value={tab === 'basic' ? query : dailyQuery}
             onChange={(e) => {
-              if (tab === 'basic') setQuery(e.target.value)
-              else {
+              if (tab === 'basic') {
+                setQuery(e.target.value)
+                setStockPage(1)
+              } else {
                 setDailyQuery(e.target.value)
                 setDailyPage(1)
               }
@@ -559,27 +684,40 @@ export default function MarketPage() {
             <div className="overflow-x-auto">
               <table className="min-w-full divide-y divide-line text-left text-sm">
                 <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">最新价</th><th className="px-4 py-3">K线</th><th className="px-4 py-3 text-right">操作</th></tr>
+                  <tr><th className="px-4 py-3">代码</th><th className="px-4 py-3">名称</th><th className="px-4 py-3">行业</th><th className="px-4 py-3">上市日期</th><th className="px-4 py-3">交易所</th><th className="px-4 py-3">实时价</th><th className="px-4 py-3">涨跌</th><th className="px-4 py-3">成交</th><th className="px-4 py-3">K线</th><th className="px-4 py-3 text-right">操作</th></tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {loading ? (<tr><td colSpan={8} className="px-4 py-4"><Skeleton.Table rows={5} columns={8} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={8} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => (
-                    <tr key={stock.ts_code} className="hover:bg-rowHover">
-                      <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
-                      <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.industry ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.list_date ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.exchange ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{stock.latest_close ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{stock.daily_kline_count ?? 0}</td>
-                      <td className="whitespace-nowrap px-4 py-3">{renderRowActions(stock)}</td>
-                    </tr>
-                  ))}
+                  {loading ? (<tr><td colSpan={10} className="px-4 py-4"><Skeleton.Table rows={5} columns={10} /></td></tr>) : stocks.length === 0 ? <tr><td colSpan={10} className="px-4 py-8 text-center text-muted">暂无数据</td></tr> : stocks.map((stock) => {
+                    const tick = realtime.ticks[stock.ts_code]
+                    const tone = signedTone(tick?.change)
+                    return (
+                      <tr key={stock.ts_code} className="hover:bg-rowHover">
+                        <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{stock.ts_code}</td>
+                        <td className="whitespace-nowrap px-4 py-3 font-medium">{stock.name}</td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.industry ?? '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.list_date ?? '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.exchange ?? '—'}</td>
+                        <td className={`whitespace-nowrap px-4 py-3 font-semibold tabular-nums ${tone}`}>
+                          {tick ? priceValue(realtimePrice(tick)) : '暂无'}
+                          <div className="mt-0.5 text-[11px] font-normal text-muted">{tick ? '实时' : '实时不可用'}</div>
+                        </td>
+                        <td className={`whitespace-nowrap px-4 py-3 tabular-nums ${tone}`}>
+                          <div>{signedValue(tick?.change)}</div>
+                          <div className="text-xs">{percentValue(tick?.change_pct)}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted tabular-nums">
+                          <div>{tick ? formatNumber(tick.volume) : '—'}</div>
+                          <div className="text-xs">{tick ? formatNumber(tick.amount, 2) : '—'}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{stock.daily_kline_count ?? 0}</td>
+                        <td className="whitespace-nowrap px-4 py-3">{renderRowActions(stock)}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
-            <div className="border-t border-line px-4 py-3 text-sm text-muted">
-              共 {formatNumber(totalStocks)} 只股票，当前展示 {formatNumber(stocks.length)} 条
-            </div>
+            <AdvancedPagination page={stockPage} pageSize={MARKET_PAGE_SIZE} total={totalStocks} disabled={loading} onPageChange={setStockPage} />
           </>
         )}
 
@@ -592,7 +730,10 @@ export default function MarketPage() {
                     {[
                       ['ts_code', '代码'],
                       ['name', '名称'],
-                      ['latest_close', '最新价'],
+                      ['latest_close', '实时价'],
+                      ['change_pct', '涨跌幅'],
+                      ['volume', '成交量'],
+                      ['amount', '成交额'],
                       ['pe_ttm', '市盈率'],
                       ['pb', '市净率'],
                       ['market_cap', '总市值'],
@@ -612,41 +753,34 @@ export default function MarketPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-line">
-                  {dailyLoading ? (<tr><td colSpan={7} className="px-4 py-4"><Skeleton.Table rows={5} columns={7} /></td></tr>) : sortedDaily.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : sortedDaily.map((row) => (
-                    <tr key={row.ts_code} className="hover:bg-rowHover">
-                      <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{row.ts_code}</td>
-                      <td className="whitespace-nowrap px-4 py-3 font-medium">{row.name}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.latest_close ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pe_ttm ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pb ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.market_cap ? formatMarketCap(row.market_cap) : '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3">{renderRowActions(row)}</td>
-                    </tr>
-                  ))}
+                  {dailyLoading ? (<tr><td colSpan={10} className="px-4 py-4"><Skeleton.Table rows={5} columns={10} /></td></tr>) : sortedDaily.length === 0 ? <tr><td colSpan={10} className="px-4 py-8 text-center text-muted">暂无数据，请先同步 K 线</td></tr> : sortedDaily.map((row) => {
+                    const tick = realtime.ticks[row.ts_code]
+                    const tone = signedTone(tick?.change)
+                    return (
+                      <tr key={row.ts_code} className="hover:bg-rowHover">
+                        <td className="whitespace-nowrap px-4 py-3 font-mono font-medium">{row.ts_code}</td>
+                        <td className="whitespace-nowrap px-4 py-3 font-medium">{row.name}</td>
+                        <td className={`whitespace-nowrap px-4 py-3 font-semibold tabular-nums ${tone}`}>
+                          {tick ? priceValue(realtimePrice(tick)) : '暂无'}
+                          <div className="mt-0.5 text-[11px] font-normal text-muted">{tick ? '实时' : '实时不可用'}</div>
+                        </td>
+                        <td className={`whitespace-nowrap px-4 py-3 tabular-nums ${tone}`}>
+                          <div>{percentValue(tick?.change_pct)}</div>
+                          <div className="text-xs">{signedValue(tick?.change)}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted tabular-nums">{tick ? formatNumber(tick.volume) : '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 text-muted tabular-nums">{tick ? formatNumber(tick.amount, 2) : '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pe_ttm ?? '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.pb ?? '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3 tabular-nums">{row.market_cap ? formatMarketCap(row.market_cap) : '—'}</td>
+                        <td className="whitespace-nowrap px-4 py-3">{renderRowActions(row)}</td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
-            <div className="flex items-center justify-between border-t border-line px-4 py-3">
-              <span className="text-sm text-muted">
-                共 {formatNumber(dailyTotal)} 只，当前展示 {formatNumber(sortedDaily.length)} 行
-              </span>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setDailyPage((p) => Math.max(1, p - 1))}
-                  disabled={dailyPage <= 1}
-                  className="h-8 rounded-md border border-line px-3 text-sm disabled:opacity-40"
-                >
-                  上一页
-                </button>
-                <span className="text-sm tabular-nums">第 {dailyPage} 页</span>
-                <button
-                  onClick={() => setDailyPage((p) => p + 1)}
-                  className="h-8 rounded-md border border-line px-3 text-sm"
-                >
-                  下一页
-                </button>
-              </div>
-            </div>
+            <AdvancedPagination page={dailyPage} pageSize={MARKET_PAGE_SIZE} total={dailyTotal} disabled={dailyLoading} onPageChange={setDailyPage} />
           </>
         )}
       </section>

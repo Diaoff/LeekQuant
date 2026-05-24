@@ -45,7 +45,7 @@ export default function WatchlistSparkline({ latestClose, preClose, tsCode }: Sp
   }, [latestClose, preClose, tsCode])
 
   const isUp = latestClose != null && preClose != null && latestClose >= preClose
-  const strokeColor = isUp ? '#10b981' : '#ef4444'
+  const strokeColor = isUp ? '#ef4444' : '#10b981'
 
   return (
     <svg

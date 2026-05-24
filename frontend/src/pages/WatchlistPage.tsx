@@ -3,6 +3,7 @@ import { AlertTriangle, Search, Loader2, Plus, X, Menu, Pencil, Trash2, Settings
 import { fetchJson, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 import WatchlistSparkline from '../components/WatchlistSparkline'
+import { useRealtimeTicks } from '../hooks/useRealtimeTicks'
 
 interface WatchlistItem {
   id: number
@@ -54,6 +55,47 @@ function marketBadge(stock: StockBasic) {
   return stock.market ?? 'A股'
 }
 
+function signedTone(value: string | null | undefined) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 'text-ink'
+  if (numeric > 0) return 'text-red-600'
+  if (numeric < 0) return 'text-emerald-600'
+  return 'text-muted'
+}
+
+function signedValue(value: string | null | undefined, digits = 2) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${numeric > 0 ? '+' : ''}${formatNumber(numeric, digits)}`
+}
+
+function priceValue(value: string | null | undefined) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '暂无'
+  return new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(numeric)
+}
+
+function percentValue(value: string | null | undefined) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${numeric > 0 ? '+' : ''}${formatNumber(numeric, 2)}%`
+}
+
+function volumeValue(value: number | null | undefined) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  return `${formatNumber(numeric / 10000, 2)}万手`
+}
+
+function amountValue(value: string | null | undefined) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '—'
+  if (Math.abs(numeric) >= 100000000) {
+    return `${formatNumber(numeric / 100000000, 2)}亿元`
+  }
+  return `${formatNumber(numeric / 10000, 2)}万元`
+}
+
 export default function WatchlistPage() {
   const [groups, setGroups] = React.useState<WatchlistGroup[]>([])
   const [groupOptions, setGroupOptions] = React.useState<WatchlistGroupOption[]>([])
@@ -76,6 +118,8 @@ export default function WatchlistPage() {
   const flatItems = React.useMemo(() => groups.flatMap((g) => g.items), [groups])
   const activeGroup = React.useMemo(() => groups.find((group) => group.group_name === activeGroupName), [activeGroupName, groups])
   const activeItems = activeGroup?.items ?? []
+  const activeTsCodes = React.useMemo(() => activeItems.map((item) => item.ts_code), [activeItems])
+  const realtime = useRealtimeTicks(activeTsCodes)
 
   const loadWatchlist = React.useCallback(async () => {
     setLoading(true)
@@ -274,7 +318,7 @@ export default function WatchlistPage() {
         </div>
 
         {loading ? (
-          <div className="px-4 py-4"><Skeleton.Table rows={8} columns={7} /></div>
+          <div className="px-4 py-4"><Skeleton.Table rows={8} columns={8} /></div>
         ) : activeItems.length === 0 ? (
           <div className="px-4 py-16 text-center text-sm text-muted">
             当前分组暂无自选股
@@ -287,33 +331,53 @@ export default function WatchlistPage() {
                   <th className="px-4 py-3">名称</th>
                   <th className="px-4 py-3">K线</th>
                   <th className="px-4 py-3">价格</th>
+                  <th className="px-4 py-3">涨跌</th>
+                  <th className="px-4 py-3">成交</th>
                   <th className="px-4 py-3">加入时间</th>
                   <th className="px-4 py-3">备注</th>
                   <th className="px-4 py-3">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {activeItems.map((stock) => (
-                  <tr key={stock.id} className="hover:bg-rowHover">
-                    <td className="whitespace-nowrap px-4 py-3">
-                      <div className="font-semibold text-ink">{stock.name}</div>
-                      <div className="font-mono text-xs text-muted">{stock.ts_code}</div>
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3">
-                      <WatchlistSparkline
-                        latestClose={stock.latest_close ? Number(stock.latest_close) : null}
-                        preClose={stock.pre_close ? Number(stock.pre_close) : null}
-                        tsCode={stock.ts_code}
-                      />
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-base tabular-nums">{stock.latest_close ?? '—'}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-muted">{new Date(stock.added_at).toLocaleDateString('zh-CN')}</td>
-                    <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.note || '输入备注'}</td>
-                    <td className="px-4 py-3">
-                      <button onClick={() => void removeStock(stock.id, stock.ts_code)} className="text-sm font-semibold text-red-600 hover:underline">移除</button>
-                    </td>
-                  </tr>
-                ))}
+                {activeItems.map((stock) => {
+                  const tick = realtime.ticks[stock.ts_code]
+                  const price = tick?.price
+                  const change = tick?.change
+                  const changePct = tick?.change_pct
+                  const tone = signedTone(change)
+                  return (
+                    <tr key={stock.id} className="hover:bg-rowHover">
+                      <td className="whitespace-nowrap px-4 py-3">
+                        <div className="font-semibold text-ink">{stock.name}</div>
+                        <div className="font-mono text-xs text-muted">{stock.ts_code}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3">
+                        <WatchlistSparkline
+                          latestClose={stock.latest_close ? Number(stock.latest_close) : null}
+                          preClose={stock.pre_close ? Number(stock.pre_close) : null}
+                          tsCode={stock.ts_code}
+                        />
+                      </td>
+                      <td className={`whitespace-nowrap px-4 py-3 text-base font-semibold tabular-nums ${tone}`}>
+                        {tick ? priceValue(price) : '暂无'}
+                        <div className="mt-0.5 text-[11px] font-normal text-muted">{tick ? '实时' : '实时不可用'}</div>
+                      </td>
+                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums ${tone}`}>
+                        <div>{signedValue(change)}</div>
+                        <div className="text-xs">{percentValue(changePct)}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted tabular-nums">
+                        <div>{tick ? volumeValue(tick.volume) : '—'}</div>
+                        <div className="text-xs">{tick ? amountValue(tick.amount) : '—'}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{new Date(stock.added_at).toLocaleDateString('zh-CN')}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.note || '输入备注'}</td>
+                      <td className="px-4 py-3">
+                        <button onClick={() => void removeStock(stock.id, stock.ts_code)} className="text-sm font-semibold text-red-600 hover:underline">移除</button>
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -321,7 +385,7 @@ export default function WatchlistPage() {
 
         <div className="flex items-center justify-between border-t border-line px-4 py-3 text-sm text-muted">
           <span>{activeGroupName} · {formatNumber(activeItems.length)} 只</span>
-          <span>全部自选 {formatNumber(flatItems.length)} 只</span>
+          <span>{realtime.error ?? (realtime.status === 'open' ? '实时行情已连接' : '全部自选')} {realtime.error ? '' : `${formatNumber(flatItems.length)} 只`}</span>
         </div>
       </section>
 
