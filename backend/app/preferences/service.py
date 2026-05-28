@@ -8,8 +8,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.cost import FeeConfig, build_fee_config, fee_config_to_dict
+from app.core.config import get_settings
 
+GLOBAL_PREFERENCE_USER_ID = 0
 TRADING_FEE_KEY = "trading_fee"
+KLINE_SYNC_KEY = "kline_sync"
+KLINE_SYNC_CONCURRENCY_FIELD = "full_kline_sync_concurrency"
 
 
 async def get_preference(
@@ -83,3 +87,40 @@ async def save_trading_fee_payload(
     normalized = fee_config_to_dict(fee_config)
     await set_preference(session, user_id=user_id, key=TRADING_FEE_KEY, value=normalized)
     return normalized
+
+
+def normalize_full_kline_sync_concurrency(value: Any | None) -> int:
+    fallback = get_settings().full_kline_sync_concurrency
+    if value is None:
+        return fallback
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    if not 1 <= normalized <= 8:
+        return fallback
+    return normalized
+
+
+async def get_kline_sync_payload(session: AsyncSession) -> dict[str, int]:
+    stored = await get_preference(session, user_id=GLOBAL_PREFERENCE_USER_ID, key=KLINE_SYNC_KEY)
+    return {
+        KLINE_SYNC_CONCURRENCY_FIELD: normalize_full_kline_sync_concurrency(
+            stored.get(KLINE_SYNC_CONCURRENCY_FIELD)
+        )
+    }
+
+
+async def save_kline_sync_payload(session: AsyncSession, payload: dict[str, Any]) -> dict[str, int]:
+    normalized = {
+        KLINE_SYNC_CONCURRENCY_FIELD: normalize_full_kline_sync_concurrency(
+            payload.get(KLINE_SYNC_CONCURRENCY_FIELD)
+        )
+    }
+    await set_preference(session, user_id=GLOBAL_PREFERENCE_USER_ID, key=KLINE_SYNC_KEY, value=normalized)
+    return normalized
+
+
+async def get_full_kline_sync_concurrency(session: AsyncSession) -> int:
+    payload = await get_kline_sync_payload(session)
+    return payload[KLINE_SYNC_CONCURRENCY_FIELD]

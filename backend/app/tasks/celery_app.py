@@ -43,11 +43,11 @@ celery_app.conf.update(
         },
         "incremental-kline-daily": {
             "task": "app.tasks.data_tasks.incremental_kline_update",
-            "schedule": crontab(hour=18, minute=0),
+            "schedule": crontab(hour=17, minute=0),
         },
         "generate-signals-daily": {
             "task": "app.tasks.signal_tasks.generate_all_signals",
-            "schedule": crontab(hour=17, minute=0),
+            "schedule": crontab(hour=12, minute=0),
         },
         "compute-factors-daily": {
             "task": "app.tasks.factor_tasks.compute_daily_factors",
@@ -63,7 +63,7 @@ celery_app.conf.update(
         },
         "match-pending-orders-daily": {
             "task": "app.tasks.trading_tasks.match_pending_orders",
-            "schedule": crontab(hour=15, minute=5),
+            "schedule": crontab(hour=17, minute=5),
         },
         "snapshot-sim-nav-daily": {
             "task": "app.tasks.trading_tasks.snapshot_nav_daily",

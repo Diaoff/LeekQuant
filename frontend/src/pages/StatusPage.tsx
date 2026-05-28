@@ -3,7 +3,8 @@ import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshC
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 
 type HealthState = 'checking' | 'ok' | 'error'
-type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'all-kline' | 'fundamentals'
+type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'all-kline' | 'incremental-kline' | 'fundamentals'
+type ProgressTaskKind = 'all-kline' | 'fundamentals' | 'incremental-kline'
 
 interface ProgressMeta {
   current: number
@@ -48,6 +49,39 @@ interface DataStatus {
 }
 
 const initialHealth: EndpointHealth = { state: 'checking', message: '检查中' }
+const progressTaskLabels: Record<ProgressTaskKind, string> = {
+  'all-kline': '全量 K 线同步',
+  'incremental-kline': '增量 K 线同步',
+  fundamentals: '基本面同步',
+}
+const taskNameLabels: Record<string, string> = {
+  update_stock_basic: '股票基础信息同步',
+  'update-stock-basic-weekly': '股票基础信息同步',
+  update_trade_calendar: '交易日历同步',
+  'update-trade-calendar-weekly': '交易日历同步',
+  sync_sample_kline: '小样本 K 线同步',
+  sync_all_kline: '全量 K 线同步',
+  incremental_kline_update: '增量 K 线同步',
+  'incremental-kline-daily': '增量 K 线同步',
+  sync_fundamentals: '基本面同步',
+  'update-fundamentals-daily': '基本面同步',
+  compute_daily_factors: '每日因子计算',
+  'compute-factors-daily': '每日因子计算',
+  analyze_factor_icir: '因子 IC/IR 分析',
+  generate_all_signals: '策略信号生成',
+  'generate-signals-daily': '策略信号生成',
+  unlock_t1_daily: 'T+1 持仓解锁',
+  'unlock-t1-positions-daily': 'T+1 持仓解锁',
+  match_pending_orders: '待成交委托撮合',
+  'match-pending-orders-daily': '待成交委托撮合',
+  snapshot_nav_daily: '模拟账户净值快照',
+  'snapshot-sim-nav-daily': '模拟账户净值快照',
+}
+
+function displayTaskName(taskName: string): string {
+  const shortName = taskName.split('.').pop() ?? taskName
+  return taskNameLabels[taskName] ?? taskNameLabels[shortName] ?? taskName
+}
 
 function statusClasses(state: HealthState): string {
   if (state === 'ok') return 'border-emerald-200 bg-emerald-50 text-emerald-900'
@@ -134,6 +168,7 @@ export default function StatusPage() {
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [progressTaskId, setProgressTaskId] = React.useState<string | null>(null)
+  const [progressTaskKind, setProgressTaskKind] = React.useState<ProgressTaskKind | null>(null)
   const [progressMeta, setProgressMeta] = React.useState<ProgressMeta | null>(null)
   const [progressDone, setProgressDone] = React.useState(false)
 
@@ -179,16 +214,32 @@ export default function StatusPage() {
         const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sync-all-kline', { method: 'POST', body: JSON.stringify({}) })
         setNotice(`全量 K 线同步任务已提交：${result.task_id}`)
         setProgressTaskId(result.task_id)
+        setProgressTaskKind('all-kline')
+        setProgressMeta(null)
+        setProgressDone(false)
+        return
+      }
+      if (action === 'incremental-kline') {
+        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/incremental-kline', { method: 'POST', body: JSON.stringify({}) })
+        setNotice(`增量 K 线同步任务已提交：${result.task_id}`)
+        setProgressTaskId(result.task_id)
+        setProgressTaskKind('incremental-kline')
         setProgressMeta(null)
         setProgressDone(false)
         return
       }
       setProgressTaskId(null)
+      setProgressTaskKind(null)
       setProgressMeta(null)
       setProgressDone(false)
       if (action === 'fundamentals') {
         const result = await fetchJson<{ task_id: string }>('/api/tasks/data/fundamentals', { method: 'POST', body: JSON.stringify({}) })
         setNotice(`基本面同步任务已提交：${result.task_id}`)
+        setProgressTaskId(result.task_id)
+        setProgressTaskKind('fundamentals')
+        setProgressMeta(null)
+        setProgressDone(false)
+        return
       }
       await refreshStatus()
     } catch (caught) {
@@ -204,6 +255,7 @@ export default function StatusPage() {
 
   React.useEffect(() => {
     if (!progressTaskId) return
+    const progressLabel = progressTaskLabels[progressTaskKind ?? 'all-kline']
     const interval = setInterval(async () => {
       try {
         const result = await fetchJson<{ meta?: ProgressMeta; ready: boolean; error?: string }>(`/api/tasks/${progressTaskId}`)
@@ -212,8 +264,9 @@ export default function StatusPage() {
         }
         if (result.ready) {
           if (result.error) {
-            setError(`全量 K 线同步失败：${result.error}`)
+            setError(`${progressLabel}失败：${result.error}`)
             setProgressTaskId(null)
+            setProgressTaskKind(null)
             setProgressMeta(null)
             setProgressDone(false)
             clearInterval(interval)
@@ -221,7 +274,7 @@ export default function StatusPage() {
             return
           }
           setProgressDone(true)
-          setNotice('全量 K 线同步完成')
+          setNotice(`${progressLabel}完成`)
           clearInterval(interval)
           void refreshStatus()
         }
@@ -231,7 +284,7 @@ export default function StatusPage() {
       }
     }, 3000)
     return () => clearInterval(interval)
-  }, [progressTaskId, refreshStatus])
+  }, [progressTaskId, progressTaskKind, refreshStatus])
 
   const metrics = dataStatus ?? {
     stock_basic_count: 0,
@@ -258,7 +311,7 @@ export default function StatusPage() {
         <section className="rounded-lg border border-blue-200 bg-blue-50 p-4">
           <div className="mb-2 flex items-center gap-2">
             <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
-            <span className="text-sm font-medium text-blue-900">全量 K 线同步进行中</span>
+            <span className="text-sm font-medium text-blue-900">{progressTaskLabels[progressTaskKind ?? 'all-kline']}进行中</span>
           </div>
           <div className="h-2 w-full overflow-hidden rounded-full bg-blue-200">
             <div
@@ -275,10 +328,10 @@ export default function StatusPage() {
         <section className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4 text-emerald-600" />
-            <span className="font-medium">全量 K 线同步完成</span>
+            <span className="font-medium">{progressTaskLabels[progressTaskKind ?? 'all-kline']}完成</span>
             <button
               type="button"
-              onClick={() => { setProgressTaskId(null); setProgressDone(false); setProgressMeta(null) }}
+              onClick={() => { setProgressTaskId(null); setProgressTaskKind(null); setProgressDone(false); setProgressMeta(null) }}
               className="ml-auto text-xs text-emerald-700 underline"
             >
               关闭
@@ -292,6 +345,7 @@ export default function StatusPage() {
         <ActionButton running={runningActions['trade-calendar'] === true} icon={<CalendarDays className="h-4 w-4" aria-hidden="true" />} label="同步日历" onClick={() => void runAction('trade-calendar')} />
         <ActionButton running={runningActions['sample-kline'] === true} icon={<Play className="h-4 w-4" aria-hidden="true" />} label="小样本 K 线" onClick={() => void runAction('sample-kline')} />
         <ActionButton running={runningActions['all-kline'] === true} icon={<Layers className="h-4 w-4" aria-hidden="true" />} label="全量 K 线" onClick={() => void runAction('all-kline')} />
+        <ActionButton running={runningActions['incremental-kline'] === true} icon={<RefreshCw className="h-4 w-4" aria-hidden="true" />} label="增量 K 线" onClick={() => void runAction('incremental-kline')} />
         <ActionButton running={runningActions.fundamentals === true} icon={<Table2 className="h-4 w-4" aria-hidden="true" />} label="同步基本面" onClick={() => void runAction('fundamentals')} />
         <button
           type="button"
@@ -328,18 +382,21 @@ export default function StatusPage() {
                 <tr><th className="px-4 py-3">任务</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">开始时间</th><th className="px-4 py-3">耗时</th></tr>
               </thead>
               <tbody className="divide-y divide-line">
-                {metrics.recent_tasks.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-muted">暂无任务记录</td></tr> : metrics.recent_tasks.map((task) => (
-                  <tr key={task.id}>
-                    <td className="max-w-64 px-4 py-3">
-                      <p className="font-medium text-ink">{task.task_name}</p>
-                      <p className="mt-1 break-all font-mono text-xs text-muted">{task.task_id ?? 'local'}</p>
-                      {task.error_message && <p className="mt-1 break-words text-xs text-red-700">{task.error_message}</p>}
-                    </td>
-                    <td className="px-4 py-3"><span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(task.status)}`}>{task.status}</span></td>
-                    <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(task.started_at)}</td>
-                    <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
-                  </tr>
-                ))}
+                {metrics.recent_tasks.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-muted">暂无任务记录</td></tr> : metrics.recent_tasks.map((task) => {
+                  const taskDisplayName = displayTaskName(task.task_name)
+                  return (
+                    <tr key={task.id}>
+                      <td className="max-w-64 px-4 py-3">
+                        <p className="font-medium text-ink">{taskDisplayName}</p>
+                        <p className="mt-1 break-all font-mono text-xs text-muted">{task.task_name} · {task.task_id ?? 'local'}</p>
+                        {task.error_message && <p className="mt-1 break-words text-xs text-red-700">{task.error_message}</p>}
+                      </td>
+                      <td className="px-4 py-3"><span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(task.status)}`}>{task.status}</span></td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(task.started_at)}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>

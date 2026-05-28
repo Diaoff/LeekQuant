@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any
@@ -184,6 +184,52 @@ async def create_account(
     return _serialize_row(row)
 
 
+async def update_account(
+    session: AsyncSession,
+    *,
+    account_id: int,
+    user_id: int,
+    name: str | None = None,
+    strategy_id: int | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing = await get_account_or_404(session, account_id, user_id)
+    new_name = name if name is not None else existing["name"]
+    new_strategy_id = strategy_id
+    new_config: dict[str, Any] | None = None
+    if config is not None:
+        cur_config = existing.get("config")
+        if isinstance(cur_config, dict):
+            merged = dict(cur_config)
+            merged.update(config)
+            new_config = merged
+        else:
+            new_config = config
+    result = await session.execute(
+        text(
+            """
+            UPDATE sim_accounts
+            SET name = :name, strategy_id = :strategy_id,
+                config = COALESCE(:config, config),
+                updated_at = NOW()
+            WHERE id = :id AND user_id = :user_id
+            RETURNING id, user_id, strategy_id, name, initial_cash, available_cash,
+                      frozen_cash, total_asset, status, config, created_at, updated_at
+            """
+        ),
+        {
+            "name": new_name,
+            "strategy_id": new_strategy_id,
+            "config": json.dumps(new_config) if new_config is not None else None,
+            "id": account_id,
+            "user_id": user_id,
+        },
+    )
+    row = dict(result.mappings().one())
+    await session.commit()
+    return _serialize_row(row)
+
+
 async def list_child_rows(
     session: AsyncSession,
     *,
@@ -344,10 +390,14 @@ async def generate_order_from_signal(
     user_id: int,
     account_id: int,
     request: SignalOrderRequest,
+    exit_reason_override: str | None = None,
 ) -> dict[str, Any]:
     account = await get_account_or_404(session, account_id, user_id)
     if account["status"] != "active":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="account is not active")
+
+    if exit_reason_override:
+        request = replace(request, reason=exit_reason_override)
 
     calendar = await _get_trade_calendar(session, request.trade_date)
     position = await _get_position(session, account_id, request.ts_code)
@@ -386,6 +436,16 @@ async def generate_order_from_signal(
         return {"signal": _serialize_row(signal), "order": None, "action": "BLOCKED", "reason": "非交易日"}
 
     kline = await _get_kline(session, request.ts_code, request.trade_date)
+    if not kline or kline.get("close") is None:
+        prev_trade_date = request.trade_date
+        cal = await session.execute(
+            text("SELECT pretrade_date FROM trade_calendar WHERE cal_date = :d"),
+            {"d": request.trade_date},
+        )
+        prev_cal = cal.mappings().one_or_none()
+        if prev_cal:
+            prev_trade_date = prev_cal["pretrade_date"]
+        kline = await _get_kline(session, request.ts_code, prev_trade_date)
     if not kline or kline.get("close") is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily kline not found")
 
@@ -852,6 +912,81 @@ async def refresh_position_market_values(session: AsyncSession, *, account_id: i
     return int(result.rowcount or 0)
 
 
+async def check_stop_conditions(session: AsyncSession, *, account_id: int, nav_date: date) -> list[dict[str, Any]]:
+    account = await session.execute(
+        text("SELECT config, strategy_id FROM sim_accounts WHERE id = :account_id"),
+        {"account_id": account_id},
+    )
+    row = account.mappings().one_or_none()
+    if row is None:
+        return []
+    cfg = row["config"] or {}
+    risk_cfg = cfg.get("risk_config", {}) if isinstance(cfg, dict) else {}
+    if isinstance(risk_cfg, str):
+        risk_cfg = {}
+    stop_loss = float(risk_cfg.get("stop_loss_pct", 0))
+    take_profit = float(risk_cfg.get("take_profit_pct", 0))
+    trailing_stop = float(risk_cfg.get("trailing_stop_pct", 0))
+    trailing_activation = float(risk_cfg.get("trailing_activation_pct", 0))
+    time_stop = int(risk_cfg.get("time_stop_days", 0))
+
+    if not any([stop_loss, take_profit, trailing_stop, time_stop]):
+        return []
+
+    positions = await session.execute(
+        text("""
+            SELECT p.ts_code, p.avg_cost, p.current_price, p.shares, p.profit_rate,
+                   p.first_buy_date
+            FROM sim_positions p
+            WHERE p.account_id = :account_id AND p.shares > 0 AND p.current_price IS NOT NULL
+        """),
+        {"account_id": account_id},
+    )
+    triggered: list[dict[str, Any]] = []
+    for pos in positions.mappings().all():
+        price = float(pos["current_price"])
+        cost = float(pos["avg_cost"])
+        if cost <= 0:
+            continue
+        profit_pct = float(pos["profit_rate"])
+        exit_reason: str | None = None
+
+        if stop_loss > 0 and profit_pct <= -stop_loss:
+            exit_reason = "止损"
+        elif take_profit > 0 and profit_pct >= take_profit:
+            exit_reason = "止盈"
+        elif trailing_stop > 0 and trailing_activation > 0:
+            high = await session.execute(
+                text("""
+                    SELECT MAX(dk.high) FROM daily_kline dk
+                    JOIN sim_trades st ON st.ts_code = dk.ts_code
+                    WHERE st.account_id = :account_id AND st.ts_code = :ts_code
+                      AND st.direction = '买入' AND dk.trade_date >= st.trade_time::DATE
+                      AND dk.trade_date <= :nav_date
+                """),
+                {"account_id": account_id, "ts_code": pos["ts_code"], "nav_date": nav_date},
+            )
+            highest = float(high.scalar() or cost)
+            activated = (highest - cost) / cost >= trailing_activation
+            if activated:
+                drawdown = (highest - price) / highest
+                if drawdown >= trailing_stop:
+                    exit_reason = "移动止盈"
+        elif time_stop > 0 and pos["first_buy_date"]:
+            import datetime
+            days_held = (nav_date - pos["first_buy_date"]).days
+            if days_held >= time_stop and profit_pct <= 0:
+                exit_reason = "时间止损"
+
+        if exit_reason:
+            triggered.append({
+                "ts_code": pos["ts_code"],
+                "exit_reason": exit_reason,
+                "shares": pos["shares"],
+            })
+    return triggered
+
+
 async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int:
     calendar = await _get_trade_calendar(session, trade_date)
     if not calendar or not calendar["is_open"] or not calendar.get("pretrade_date"):
@@ -881,6 +1016,22 @@ async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int
 
 async def snapshot_daily_nav(session: AsyncSession, *, account_id: int, nav_date: date) -> dict[str, Any]:
     await refresh_position_market_values(session, account_id=account_id, nav_date=nav_date)
+
+    stopped = await check_stop_conditions(session, account_id=account_id, nav_date=nav_date)
+    for s in stopped:
+        order_signal = SignalOrderRequest(
+            ts_code=s["ts_code"],
+            signal_type="卖出",
+            trade_date=nav_date,
+        )
+        await generate_order_from_signal(
+            session,
+            user_id=0,
+            account_id=account_id,
+            request=order_signal,
+            exit_reason_override=s["exit_reason"],
+        )
+
     await refresh_account_assets(session, account_id=account_id)
     account_result = await session.execute(
         text("SELECT * FROM sim_accounts WHERE id = :account_id"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -102,7 +103,7 @@ async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> l
 
 async def select_all_stock_codes(session: AsyncSession) -> list[str]:
     result = await session.execute(
-        text("SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE ORDER BY symbol")
+        text("SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE AND market NOT IN ('科创板', '北交所') AND ts_code NOT LIKE '920%.SH' AND ts_code !~ '^200[0-9]{3}\\.SZ' AND ts_code !~ '^900[0-9]{3}\\.SH' ORDER BY symbol")
     )
     return [row[0] for row in result.all()]
 
@@ -160,6 +161,8 @@ async def sync_stock_basic(
 ) -> dict[str, Any]:
     provider_list = providers or stock_basic_providers()
     source, records = fetch_with_fallback(provider_list, "fetch_stock_basic", proxy_url=get_data_proxy_url())
+    import re as _re
+    bshare_pat = _re.compile(r"^(200\d{3}\.SZ|900\d{3}\.SH)$")
     valid_records = []
     invalid_records = []
     for record in records:
@@ -167,6 +170,8 @@ async def sync_stock_basic(
             validate_stock_basic(record)
         except Exception as exc:
             invalid_records.append({"ts_code": record.ts_code, "error": str(exc)})
+            continue
+        if bshare_pat.match(record.ts_code):
             continue
         valid_records.append(record)
 
@@ -231,10 +236,12 @@ async def sync_kline(
     providers: list[DataProvider] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     commit_each: bool = False,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
     from app.db.session import async_session_factory as _per_stock_sf
 
     provider_list = providers or default_providers()
+    concurrency = max(1, concurrency)
     if ts_codes is None:
         assert session is not None, "session required when ts_codes is None"
         codes = await select_sample_stock_codes(session)
@@ -247,14 +254,55 @@ async def sync_kline(
         raise ValueError("no stock codes available after stock basic sync; pass ts_codes explicitly")
 
     total = 0
+    completed = 0
     failures: list[dict[str, str]] = []
     source_counts: dict[str, int] = {}
+    progress_lock = asyncio.Lock()
 
-    for i, ts_code in enumerate(codes, start=1):
+    async def report_progress(ts_code: str) -> None:
+        nonlocal completed
+        if progress_callback is None:
+            return
+        async with progress_lock:
+            completed += 1
+            try:
+                progress_callback(completed, len(codes), ts_code)
+            except Exception:
+                pass
+
+    async def process_code(ts_code: str) -> dict[str, Any]:
+        if commit_each:
+            async with _per_stock_sf() as wk_session:
+                try:
+                    source, records = await asyncio.to_thread(
+                        fetch_with_fallback,
+                        providers or default_providers(),
+                        "fetch_daily_kline",
+                        ts_code,
+                        start_date,
+                        end_date,
+                        proxy_url=get_data_proxy_url(),
+                    )
+                    for record in records:
+                        validate_daily_kline(record)
+                    count = await upsert_daily_kline(wk_session, records)
+                    latest = max((record.trade_date for record in records), default=None)
+                    await record_update_success(wk_session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+                    await wk_session.commit()
+                    return {"ts_code": ts_code, "source": source, "count": count}
+                except Exception as exc:
+                    message = str(exc)
+                    try:
+                        await wk_session.rollback()
+                    except Exception:
+                        pass
+                    await record_update_failure(wk_session, "daily_kline", "fallback", message, ts_code=ts_code)
+                    await wk_session.commit()
+                    return {"ts_code": ts_code, "error": message}
+
         try:
-            if progress_callback:
-                progress_callback(i, len(codes), ts_code)
-            source, records = fetch_with_fallback(
+            source, records = await asyncio.to_thread(
+                fetch_with_fallback,
                 provider_list,
                 "fetch_daily_kline",
                 ts_code,
@@ -264,31 +312,42 @@ async def sync_kline(
             )
             for record in records:
                 validate_daily_kline(record)
-
-            if commit_each:
-                async with _per_stock_sf() as wk_session:
-                    count = await upsert_daily_kline(wk_session, records)
-                    latest = max((record.trade_date for record in records), default=None)
-                    await record_update_success(wk_session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
-                    await wk_session.commit()
-            else:
-                assert session is not None
-                count = await upsert_daily_kline(session, records)
-                latest = max((record.trade_date for record in records), default=None)
-                await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
-
-            total += count
-            source_counts[source] = source_counts.get(source, 0) + count
+            assert session is not None
+            count = await upsert_daily_kline(session, records)
+            latest = max((record.trade_date for record in records), default=None)
+            await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+            return {"ts_code": ts_code, "source": source, "count": count}
         except Exception as exc:
             message = str(exc)
-            failures.append({"ts_code": ts_code, "error": message})
-            if commit_each:
-                async with _per_stock_sf() as wk_session:
-                    await record_update_failure(wk_session, "daily_kline", "fallback", message, ts_code=ts_code)
-                    await wk_session.commit()
-            else:
-                assert session is not None
-                await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
+            assert session is not None
+            await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
+            return {"ts_code": ts_code, "error": message}
+
+    if commit_each and concurrency > 1:
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def bounded_process(ts_code: str) -> dict[str, Any]:
+            async with semaphore:
+                result = await process_code(ts_code)
+                await report_progress(ts_code)
+                return result
+
+        results = await asyncio.gather(*(bounded_process(ts_code) for ts_code in codes))
+    else:
+        results = []
+        for ts_code in codes:
+            result = await process_code(ts_code)
+            results.append(result)
+            await report_progress(ts_code)
+
+    for result in results:
+        if "error" in result:
+            failures.append({"ts_code": result["ts_code"], "error": result["error"]})
+            continue
+        count = int(result["count"])
+        total += count
+        source = str(result["source"])
+        source_counts[source] = source_counts.get(source, 0) + count
 
     if failures:
         if session is not None:
@@ -300,6 +359,8 @@ async def sync_kline(
                 message=f"{len(failures)} symbols failed during kline sync",
                 payload={"failures": failures[:20]},
             )
+            if commit_each:
+                await session.commit()
         else:
             async with _per_stock_sf() as alert_session:
                 await create_alert(
@@ -310,6 +371,7 @@ async def sync_kline(
                     message=f"{len(failures)} symbols failed during kline sync",
                     payload={"failures": failures[:20]},
                 )
+                await alert_session.commit()
 
     if not commit_each:
         assert session is not None

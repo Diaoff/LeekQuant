@@ -1,17 +1,44 @@
-"""Signal log query API."""
+"""Signal log query & trigger API."""
 from __future__ import annotations
 
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from celery.exceptions import OperationalError
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.data.repository import create_pending_task_run, mark_task_run_queue_failed
 from app.db.session import get_session
 from app.sim.service import serialize_rows
+from app.tasks.celery_app import celery_app
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
+
+
+@router.post("/trigger")
+async def trigger_signal_generation(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    task_id = f"sig-{date.today().isoformat()}-{int(__import__('time').time() * 1000)}"
+    payload: dict[str, Any] = {}
+    await create_pending_task_run(
+        session,
+        task_name="generate_all_signals",
+        task_id=task_id,
+        payload=payload,
+    )
+    try:
+        celery_app.send_task(
+            "app.tasks.signal_tasks.generate_all_signals",
+            kwargs=payload,
+            task_id=task_id,
+        )
+    except OperationalError as exc:
+        await mark_task_run_queue_failed(session, task_id=task_id, error_message=str(exc))
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return {"task_id": task_id, "status": "pending"}
 
 
 def _extract_user_id(request: Request) -> int:

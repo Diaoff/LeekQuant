@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react'
-import { ArrowUp, ArrowDown, Save, RotateCcw, Loader2, Activity, AlertTriangle, CheckCircle2, BadgePercent } from 'lucide-react'
+import { ArrowUp, ArrowDown, Save, RotateCcw, Loader2, Activity, AlertTriangle, CheckCircle2, BadgePercent, Layers } from 'lucide-react'
 import { fetchJson } from '../lib/utils'
 
 interface SourceConfig {
@@ -30,6 +30,10 @@ interface TradingFeePreference {
   transfer_fee_rate: string
 }
 
+interface KlineSyncPreference {
+  full_kline_sync_concurrency: number
+}
+
 const defaultTradingFee: TradingFeePreference = {
   commission_rate: '0.00025',
   min_commission: '5.0',
@@ -38,12 +42,23 @@ const defaultTradingFee: TradingFeePreference = {
   transfer_fee_rate: '0.00001',
 }
 
+const defaultKlineSync: KlineSyncPreference = {
+  full_kline_sync_concurrency: 2,
+}
+
+function clampKlineSyncConcurrency(value: number): number {
+  if (!Number.isFinite(value)) return defaultKlineSync.full_kline_sync_concurrency
+  return Math.min(8, Math.max(1, Math.trunc(value)))
+}
+
 export default function PreferencesPage() {
   const [items, setItems] = useState<SourceConfig[]>([])
   const [fee, setFee] = useState<TradingFeePreference>(defaultTradingFee)
+  const [klineSync, setKlineSync] = useState<KlineSyncPreference>(defaultKlineSync)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [savingFee, setSavingFee] = useState(false)
+  const [savingKlineSync, setSavingKlineSync] = useState(false)
   const [checkingAll, setCheckingAll] = useState(false)
   const [checking, setChecking] = useState<Record<string, boolean>>({})
   const [checkResults, setCheckResults] = useState<Record<string, SourceCheckResult>>({})
@@ -54,12 +69,14 @@ export default function PreferencesPage() {
     setLoading(true)
     setError(null)
     try {
-      const [sourceData, feeData] = await Promise.all([
+      const [sourceData, feeData, klineSyncData] = await Promise.all([
         fetchJson<SourceConfig[]>('/api/data/sources'),
         fetchJson<TradingFeePreference>('/api/preferences/trading-fee'),
+        fetchJson<KlineSyncPreference>('/api/preferences/kline-sync'),
       ])
       setItems(sourceData)
       setFee({ ...defaultTradingFee, ...feeData })
+      setKlineSync({ ...defaultKlineSync, ...klineSyncData })
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -87,6 +104,13 @@ export default function PreferencesPage() {
 
   const updateFee = (key: keyof TradingFeePreference, value: string | boolean) => {
     setFee((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const updateKlineSyncConcurrency = (value: string) => {
+    const parsed = Number.parseInt(value, 10)
+    setKlineSync({
+      full_kline_sync_concurrency: Number.isNaN(parsed) ? defaultKlineSync.full_kline_sync_concurrency : clampKlineSyncConcurrency(parsed),
+    })
   }
 
   const save = async () => {
@@ -128,6 +152,26 @@ export default function PreferencesPage() {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setSavingFee(false)
+    }
+  }
+
+  const saveKlineSync = async () => {
+    setSavingKlineSync(true)
+    setNotice(null)
+    setError(null)
+    try {
+      const saved = await fetchJson<KlineSyncPreference>('/api/preferences/kline-sync', {
+        method: 'PUT',
+        body: JSON.stringify({
+          full_kline_sync_concurrency: clampKlineSyncConcurrency(klineSync.full_kline_sync_concurrency),
+        }),
+      })
+      setKlineSync({ ...defaultKlineSync, ...saved })
+      setNotice('数据同步设置已保存')
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setSavingKlineSync(false)
     }
   }
 
@@ -196,6 +240,41 @@ export default function PreferencesPage() {
           {error}
         </div>
       )}
+
+      <section className="space-y-4 rounded-lg border border-line bg-bg p-4">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-surface text-accent">
+            <Layers className="h-5 w-5" />
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-ink">数据同步线程数</h2>
+            <p className="mt-1 text-sm text-slate-500">设置 K 线、基本面等逐股同步任务的受控并发数，提交任务时自动使用。</p>
+          </div>
+        </div>
+
+        <label className="block max-w-xs space-y-1.5">
+          <span className="text-sm font-medium text-ink">数据同步线程数</span>
+          <input
+            type="number"
+            inputMode="numeric"
+            min="1"
+            max="8"
+            step="1"
+            value={klineSync.full_kline_sync_concurrency}
+            onChange={(event) => updateKlineSyncConcurrency(event.target.value)}
+            className="h-10 w-full rounded-md border border-line bg-surface px-3 text-sm text-ink outline-none focus:border-accent"
+          />
+        </label>
+
+        <button
+          onClick={() => void saveKlineSync()}
+          disabled={savingKlineSync}
+          className="flex h-10 items-center gap-2 rounded-md bg-accent px-4 text-sm font-medium text-white hover:bg-accent/90 disabled:opacity-50"
+        >
+          {savingKlineSync ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          保存同步设置
+        </button>
+      </section>
 
       <section className="space-y-4 rounded-lg border border-line bg-bg p-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

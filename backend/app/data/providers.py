@@ -281,6 +281,57 @@ class EastMoneyHttpProvider:
             records.append(normalize_stock_fundamental(row, self.name, ts_code=ts_code, report_date=end_date))
         return records
 
+    def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
+        if not ts_codes:
+            return {}
+        wanted = set(ts_codes)
+        result: dict[str, Decimal] = {}
+        page = 1
+        page_size = 100
+        total: int | None = None
+        while len(result) < len(wanted):
+            payload = _http_json(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                {
+                    "pn": page,
+                    "pz": page_size,
+                    "po": "1",
+                    "np": "1",
+                    "fltt": "2",
+                    "invt": "2",
+                    "fid": "f12",
+                    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                    "fields": "f12,f2",
+                },
+            )
+            data = payload.get("data") or {}
+            if total is None:
+                total = int(data.get("total") or 0)
+            diff = data.get("diff") or []
+            if not diff:
+                break
+            for item in diff:
+                symbol = str(item.get("f12") or "").strip().zfill(6)
+                ts_code = None
+                for candidate in wanted:
+                    if candidate.startswith(symbol):
+                        ts_code = candidate
+                        break
+                if ts_code is None or ts_code in result:
+                    continue
+                try:
+                    price = Decimal(str(item.get("f2", "0")))
+                    if price > 0:
+                        result[ts_code] = price
+                except Exception:
+                    pass
+            if page * page_size >= total:
+                break
+            page += 1
+            import time
+            time.sleep(0.3)
+        return result
+
 
 @register_provider
 class TencentHttpProvider:
@@ -310,13 +361,7 @@ class TencentHttpProvider:
             normalized_codes.append(f"{symbol}.{suffix}")
             prefixed.append(("sh" if suffix == "SH" else "sz") + symbol)
 
-        request = Request("https://qt.gtimg.cn/q=" + ",".join(prefixed), headers={"User-Agent": UA})
-        try:
-            with urlopen(request, timeout=10) as response:
-                body = response.read().decode("gbk", errors="ignore")
-        except URLError as exc:
-            raise DataProviderError(f"tencent quote request failed: {exc}") from exc
-
+        body = self._request_tencent(prefixed)
         records: list[StockFundamental] = []
         wanted = {code.split(".", 1)[0]: code for code in normalized_codes}
         for line in body.strip().split(";"):
@@ -338,6 +383,50 @@ class TencentHttpProvider:
             }
             records.append(normalize_stock_fundamental(row, self.name, ts_code=ts_code, report_date=end_date))
         return records
+
+    def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
+        if not ts_codes:
+            return {}
+        prefixed: list[str] = []
+        wanted: dict[str, str] = {}
+        for ts_code in ts_codes:
+            symbol, suffix = normalize_ts_code(ts_code).split(".", 1)
+            wanted[symbol] = ts_code
+            prefixed.append(("sh" if suffix == "SH" else "sz") + symbol)
+
+        body = self._request_tencent(prefixed)
+        result: dict[str, Decimal] = {}
+        for line in body.strip().split(";"):
+            if not line.strip() or '"' not in line:
+                continue
+            key = line.split("=")[0].split("_")[-1]
+            symbol = key[2:]
+            ts_code = wanted.get(symbol)
+            vals = line.split('"')[1].split("~")
+            if ts_code is None or len(vals) < 4:
+                continue
+            try:
+                price = Decimal(vals[3])
+                if price > 0:
+                    result[ts_code] = price
+            except Exception:
+                pass
+        return result
+
+    @staticmethod
+    def _request_tencent(prefixed: list[str]) -> str:
+        chunk_size = 200
+        parts: list[str] = []
+        for i in range(0, len(prefixed), chunk_size):
+            chunk = prefixed[i : i + chunk_size]
+            url = "https://qt.gtimg.cn/q=" + ",".join(chunk)
+            request = Request(url, headers={"User-Agent": UA})
+            try:
+                with urlopen(request, timeout=10) as resp:
+                    parts.append(resp.read().decode("gbk", errors="ignore"))
+            except URLError:
+                pass
+        return ";".join(parts)
 
 
 @register_provider
@@ -558,6 +647,7 @@ class AkShareProvider:
         ProviderCapability.TRADE_CALENDAR,
         ProviderCapability.DAILY_KLINE,
         ProviderCapability.FUNDAMENTALS,
+        ProviderCapability.REALTIME_QUOTE,
     })
     priority_default = 30
 
@@ -639,6 +729,32 @@ class AkShareProvider:
             data["report_date"] = latest_report_date
             records.append(normalize_stock_fundamental(data, self.name, ts_code=ts_code, report_date=latest_report_date))
         return records
+
+    def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
+        if not ts_codes:
+            return {}
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except ImportError:
+            return {}
+        try:
+            frame = ak.stock_zh_a_spot_em()
+        except Exception:
+            return {}
+        wanted = {code.split(".", 1)[0]: code for code in ts_codes}
+        result: dict[str, Decimal] = {}
+        for row in dataframe_records(frame):
+            symbol = str(row.get("代码") or row.get("code") or "").strip().zfill(6)
+            ts_code = wanted.get(symbol)
+            if not ts_code or ts_code in result:
+                continue
+            try:
+                price = Decimal(str(row.get("最新价", "0")))
+                if price > 0:
+                    result[ts_code] = price
+            except Exception:
+                pass
+        return result
 
 register_provider(ADataProvider)
 register_provider(BaostockProvider)

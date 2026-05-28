@@ -1,4 +1,5 @@
 from datetime import date
+import asyncio
 
 import pytest
 
@@ -96,6 +97,80 @@ async def test_sync_kline_bootstraps_stock_basic_when_sample_is_empty(monkeypatc
     assert calls == {"stock": 1, "kline": 1}
     assert result["requested_symbols"] == 1
     assert result["inserted_or_updated"] == 1
+
+
+async def test_sync_kline_reports_progress_on_completion(monkeypatch) -> None:
+    import app.data.service as service
+
+    class TwoCodeSession(FakeSession):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "SELECT ts_code" in sql:
+                return FakeResult([("000001.SZ",), ("600000.SH",)])
+            return FakeResult([])
+
+    calls = []
+
+    async def fake_upsert_daily_kline(_session, records):
+        await asyncio.sleep(0)
+        return len(records)
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+
+    progress = []
+    result = await sync_kline(
+        TwoCodeSession(),
+        None,
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[FakeProvider()],
+        progress_callback=lambda current, total, code: progress.append((current, total, code)),
+        commit_each=True,
+        concurrency=2,
+    )
+
+    assert result["requested_symbols"] == 2
+    assert progress == [(1, 2, "000001.SZ"), (2, 2, "600000.SH")]
+
+
+async def test_sync_kline_keeps_serial_transaction_when_commit_each_is_false(monkeypatch) -> None:
+    import app.data.service as service
+
+    class TwoCodeSession(FakeSession):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "SELECT ts_code" in sql:
+                return FakeResult([("000001.SZ",), ("600000.SH",)])
+            return FakeResult([])
+
+    calls = {"commit": 0}
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+
+    session = TwoCodeSession()
+    result = await sync_kline(
+        session,
+        None,
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[FakeProvider()],
+        commit_each=False,
+        concurrency=4,
+    )
+
+    assert result["requested_symbols"] == 2
+    assert session.commits == 1
 
 
 async def test_select_sample_stock_codes_balances_across_code_segments() -> None:

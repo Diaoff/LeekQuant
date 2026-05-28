@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal } from 'lucide-react'
+import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal, Zap } from 'lucide-react'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
@@ -66,6 +66,17 @@ export default function SignalsPage() {
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
   const [selected, setSelected] = React.useState<SignalLog | null>(null)
+  const [triggering, setTriggering] = React.useState(false)
+  const [triggerMsg, setTriggerMsg] = React.useState<string | null>(null)
+
+  const [strategies, setStrategies] = React.useState<{ id: number; name: string }[]>([])
+  const [accounts, setAccounts] = React.useState<{ id: number; name: string }[]>([])
+
+  React.useEffect(() => {
+    void fetchJson<{ id: number; name: string }[]>('/api/strategies').then(setStrategies).catch(() => {})
+    void fetchJson<{ id: number; name: string }[]>('/api/sim/accounts').then(setAccounts).catch(() => {})
+  }, [])
+
   const [filters, setFilters] = React.useState({
     ts_code: '',
     signal_type: '',
@@ -95,6 +106,20 @@ export default function SignalsPage() {
     }
   }, [filters])
 
+  const triggerSignals = React.useCallback(async () => {
+    setTriggering(true)
+    setTriggerMsg(null)
+    try {
+      await fetchJson('/api/signals/trigger', { method: 'POST' })
+      setTriggerMsg('信号生成已提交')
+      setTimeout(() => void loadSignals(), 500)
+    } catch (caught) {
+      setTriggerMsg(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setTriggering(false)
+    }
+  }, [loadSignals])
+
   React.useEffect(() => {
     void loadSignals()
   }, [loadSignals])
@@ -106,14 +131,30 @@ export default function SignalsPage() {
           <h1 className="text-xl font-semibold text-ink">信号中心</h1>
           <p className="mt-1 text-sm text-muted">五档信号、动作结果、阻塞原因和策略快照。</p>
         </div>
-        <button
-          type="button"
-          onClick={() => void loadSignals()}
-          className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm text-ink hover:bg-rowHover"
-        >
-          <RefreshCw className="h-4 w-4" />
-          刷新
-        </button>
+        <div className="flex items-center gap-2">
+          {triggerMsg && (
+            <span className={`text-sm ${triggerMsg === '信号生成已提交' ? 'text-emerald-600' : 'text-red-600'}`}>
+              {triggerMsg}
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => void triggerSignals()}
+            disabled={triggering}
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 text-sm text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+          >
+            <Zap className={`h-4 w-4 ${triggering ? 'animate-spin' : ''}`} />
+            {triggering ? '生成中...' : '生成信号'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void loadSignals()}
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm text-ink hover:bg-rowHover"
+          >
+            <RefreshCw className="h-4 w-4" />
+            刷新
+          </button>
+        </div>
       </section>
 
       <section className="rounded-lg border border-line bg-panel p-4">
@@ -165,20 +206,30 @@ export default function SignalsPage() {
             />
           </label>
           <label className="space-y-1 text-xs text-muted">
-            策略 ID
-            <input
+            策略
+            <select
               value={filters.strategy_id}
               onChange={(event) => setFilters((prev) => ({ ...prev, strategy_id: event.target.value }))}
               className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
-            />
+            >
+              <option value="">全部策略</option>
+              {strategies.map((s) => (
+                <option key={s.id} value={String(s.id)}>{s.name}</option>
+              ))}
+            </select>
           </label>
           <label className="space-y-1 text-xs text-muted">
-            账户 ID
-            <input
+            账户
+            <select
               value={filters.account_id}
               onChange={(event) => setFilters((prev) => ({ ...prev, account_id: event.target.value }))}
               className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
-            />
+            >
+              <option value="">全部账户</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={String(a.id)}>{a.name}</option>
+              ))}
+            </select>
           </label>
         </div>
       </section>

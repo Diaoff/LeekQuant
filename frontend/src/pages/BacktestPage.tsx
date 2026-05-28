@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2, GitCompare, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react'
+import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2, GitCompare, ZoomIn, ZoomOut, RotateCcw, ShieldAlert } from 'lucide-react'
 import { createChart, createSeriesMarkers, ColorType, LineSeries, CandlestickSeries } from 'lightweight-charts'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { fetchJson, formatNumber, formatDateTime } from '../lib/utils'
@@ -100,6 +100,7 @@ interface BacktestResult {
   trade_records: unknown[] | null
   equity_curve: { date: string; total_asset: number; cash: number }[] | null
   kline_data: Record<string, KlineBar[]> | null
+  stock_names: Record<string, string> | null
   error_message: string | null
   created_at: string
   finished_at: string | null
@@ -130,6 +131,7 @@ interface TradeRecord {
   balance_before?: number
   balance_after?: number
   holding_days?: number
+  exit_reason?: string
 }
 
 export default function BacktestPage() {
@@ -234,6 +236,33 @@ export default function BacktestPage() {
     })
   }
 
+  const toggleSelectAll = () => {
+    const successIds = results.filter(r => r.status === 'success').map(r => r.id)
+    if (selectedIds.size === successIds.length) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(successIds.slice(0, MAX_COMPARE_COUNT)))
+    }
+  }
+
+  const handleBatchDelete = async () => {
+    if (selectedIds.size === 0) return
+    if (!confirm(`确认删除选中的 ${selectedIds.size} 个回测结果？`)) return
+    let deleted = 0
+    for (const id of selectedIds) {
+      try {
+        await deleteBacktest(id)
+        deleted++
+      } catch {
+        // continue
+      }
+    }
+    setSelectedIds(new Set())
+    if (selected?.id && selectedIds.has(selected.id)) setSelected(null)
+    void loadResults()
+    setNotice(`已删除 ${deleted} 个回测结果`)
+  }
+
   const handleCompare = () => {
     if (selectedIds.size < 2) {
       setNotice('请至少选择2个回测结果进行对比')
@@ -291,10 +320,25 @@ export default function BacktestPage() {
             <h2 className="text-base font-semibold text-ink">回测结果</h2>
             <button onClick={() => void loadResults()} className="ml-auto text-sm font-medium text-accent hover:underline">刷新</button>
           </div>
+          {selectedIds.size >= 2 && (
+            <div className="flex items-center gap-3 border-b border-line px-4 py-3 bg-tableHead">
+              <span className="text-sm text-muted">已选择 {selectedIds.size} 个回测</span>
+              <button onClick={handleCompare} className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent/90 transition-colors">
+                <GitCompare className="h-4 w-4" />
+                对比
+              </button>
+              <button onClick={() => void handleBatchDelete()} className="ml-auto inline-flex items-center gap-2 rounded-md border border-red-300 px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 transition-colors">
+                <Trash2 className="h-4 w-4" />
+                批量删除
+              </button>
+            </div>
+          )}
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
               <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                <tr><th className="px-4 py-3 w-12"></th><th className="px-4 py-3">策略</th><th className="px-4 py-3">区间</th><th className="px-4 py-3">初始资金</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">收益率</th><th className="px-4 py-3">操作</th></tr>
+                <tr><th className="w-10 px-2 py-3">
+                  <input type="checkbox" checked={results.length > 0 && selectedIds.size === results.filter(r => r.status === 'success').length} onChange={toggleSelectAll} className="h-4 w-4 rounded border-slate-300 text-accent focus:ring-accent" />
+                </th><th className="px-4 py-3">策略</th><th className="px-4 py-3">区间</th><th className="px-4 py-3">初始资金</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">收益率</th><th className="px-4 py-3">操作</th></tr>
               </thead>
               <tbody className="divide-y divide-line">
                 {loading ? (
@@ -304,8 +348,7 @@ export default function BacktestPage() {
                     </td>
                   </tr>
                 ) : results.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无回测结果，请先在策略中心运行回测</td></tr> : results.map((r) => {
-                  const perf = r.performance as Record<string, string> | null
-                  const totalReturn = perf?.total_return ?? '—'
+                  const totalReturn = r.total_return !== null ? (Number(r.total_return) * 100).toFixed(2) : null
                   return (
                     <tr key={r.id} className="hover:bg-rowHover">
                       <td className="px-4 py-3">
@@ -323,7 +366,7 @@ export default function BacktestPage() {
                       <td className="px-4 py-3">
                         <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-line bg-tableHead text-muted'}`}>{r.status}</span>
                       </td>
-                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums font-medium ${String(totalReturn).startsWith('-') ? 'text-emerald-600' : totalReturn !== '—' ? 'text-red-600' : ''}`}>{totalReturn !== '—' ? `${totalReturn}%` : '—'}</td>
+                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums font-medium ${totalReturn !== null && Number(totalReturn) >= 0 ? 'text-red-600' : totalReturn !== null ? 'text-emerald-600' : ''}`}>{totalReturn !== null ? `${totalReturn}%` : '—'}</td>
                        <td className="px-4 py-3 flex items-center gap-2">
                          {r.status === 'success' && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
                          {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600" title={r.error_message}>失败</span>}
@@ -335,25 +378,13 @@ export default function BacktestPage() {
                          >
                            {deleting === r.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
                          </button>
-                       </td>
+                        </td>
                     </tr>
                   )
                 })}
               </tbody>
             </table>
           </div>
-          {selectedIds.size >= 2 && (
-            <div className="border-t border-line px-4 py-3 flex items-center gap-3 bg-tableHead">
-              <span className="text-sm text-muted">已选择 {selectedIds.size} 个回测</span>
-              <button
-                onClick={handleCompare}
-                className="inline-flex items-center gap-2 rounded-md bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-accent/90 transition-colors"
-              >
-                <GitCompare className="h-4 w-4" />
-                对比
-              </button>
-            </div>
-          )}
         </section>
       )}
 
@@ -690,6 +721,18 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
     }
   }, [selectedKlines, selectedTsCode, trades])
 
+  const riskCfg = result.performance?.risk_config as Record<string, number> | undefined
+  const riskLabel = !riskCfg
+    ? '—'
+    : [riskCfg.stop_loss_pct, riskCfg.take_profit_pct, riskCfg.trailing_stop_pct, riskCfg.time_stop_days].every(v => !v || Number(v) === 0)
+      ? '未设置'
+      : [
+          riskCfg.stop_loss_pct ? `${(Number(riskCfg.stop_loss_pct) * 100).toFixed(0)}%` : '',
+          riskCfg.take_profit_pct ? `${(Number(riskCfg.take_profit_pct) * 100).toFixed(0)}%` : '',
+          riskCfg.trailing_stop_pct ? `${(Number(riskCfg.trailing_stop_pct) * 100).toFixed(0)}%` : '',
+          riskCfg.time_stop_days ? `${riskCfg.time_stop_days}天` : '',
+        ].filter(Boolean).join(' / ')
+
   const metrics = [
     { icon: <DollarSign className="h-4 w-4 text-accent" />, label: '初始资金', value: formatNumber(Number(result.initial_cash), 2) },
     { icon: <TrendingUp className="h-4 w-4 text-red-600" />, label: '总收益率', value: result.total_return !== null ? `${(Number(result.total_return) * 100).toFixed(2)}%` : '—' },
@@ -697,6 +740,7 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
     { icon: <Activity className="h-4 w-4 text-warn" />, label: '最大回撤', value: result.max_drawdown !== null ? `${(Number(result.max_drawdown) * 100).toFixed(2)}%` : '—' },
     { icon: <Percent className="h-4 w-4 text-slate-600" />, label: '夏普比率', value: result.sharpe_ratio !== null ? formatNumber(Number(result.sharpe_ratio), 2) : '—' },
     { icon: <BarChart3 className="h-4 w-4 text-slate-600" />, label: '交易次数', value: formatNumber(result.trade_count ?? trades.length) },
+    { icon: <ShieldAlert className="h-4 w-4 text-amber-600" />, label: '止损 / 止盈 / 移动 / 时间', value: riskLabel },
   ]
 
   const totalPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0)
@@ -800,6 +844,7 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
               trades={trades}
               selectedTradeIndex={selectedTradeIndex}
               onSelectTrade={setSelectedTradeIndex}
+              stockNames={result.stock_names ?? {}}
             />
           </div>
         </>
@@ -829,10 +874,12 @@ function TradeRecordsTable({
   trades,
   selectedTradeIndex,
   onSelectTrade,
+  stockNames,
 }: {
   trades: TradeRecord[]
   selectedTradeIndex: number | null
   onSelectTrade: (index: number) => void
+  stockNames: Record<string, string>
 }) {
   const [sortKey, setSortKey] = React.useState<SortKey>('index')
   const [sortDir, setSortDir] = React.useState<SortDir>('asc')
@@ -879,8 +926,10 @@ function TradeRecordsTable({
               <th className="cursor-pointer select-none whitespace-nowrap px-2 py-2.5" style={{ width: 50 }} onClick={() => handleSort('index')}>序号{sortIndicator('index')}</th>
               <th className="cursor-pointer select-none whitespace-nowrap px-2 py-2.5" style={{ width: 100 }} onClick={() => handleSort('trade_date')}>日期{sortIndicator('trade_date')}</th>
               <th className="cursor-pointer select-none whitespace-nowrap px-2 py-2.5" style={{ width: 100 }} onClick={() => handleSort('ts_code')}>股票代码{sortIndicator('ts_code')}</th>
+              <th className="whitespace-nowrap px-2 py-2.5" style={{ width: 120 }}>股票名称</th>
               <th className="whitespace-nowrap px-2 py-2.5" style={{ width: 80 }}>方向</th>
               <th className="whitespace-nowrap px-2 py-2.5" style={{ width: 90 }}>动作</th>
+              <th className="hidden whitespace-nowrap px-2 py-2.5 sm:table-cell" style={{ width: 80 }}>卖出原因</th>
               <th className="hidden whitespace-nowrap px-2 py-2.5 lg:table-cell" style={{ width: 150 }}>信号原因</th>
               <th className="cursor-pointer select-none whitespace-nowrap px-2 py-2.5" style={{ width: 80 }} onClick={() => handleSort('price')}>价格{sortIndicator('price')}</th>
               <th className="cursor-pointer select-none whitespace-nowrap px-2 py-2.5" style={{ width: 80 }} onClick={() => handleSort('volume')}>数量{sortIndicator('volume')}</th>
@@ -911,6 +960,7 @@ function TradeRecordsTable({
                 <td className="whitespace-nowrap px-2 py-2 tabular-nums text-muted">{t._idx + 1}</td>
                 <td className="whitespace-nowrap px-2 py-2 text-muted">{t.trade_date}</td>
                 <td className="whitespace-nowrap px-2 py-2 font-mono font-medium">{t.ts_code}</td>
+                <td className="whitespace-nowrap px-2 py-2 text-muted">{stockNames[t.ts_code] ?? '—'}</td>
                 <td className="px-2 py-2">
                   <span className={`inline-block rounded border px-2 py-0.5 text-xs font-medium ${t.direction === '买入' ? 'border-red-200 bg-red-50 text-red-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>{t.direction}</span>
                 </td>
@@ -920,6 +970,17 @@ function TradeRecordsTable({
                       {t.action.replace('BUY', '买入').replace('SELL_PARTIAL', '部分卖出').replace('SELL_ALL', '全部卖出')}
                     </span>
                   )}
+                </td>
+                <td className="hidden whitespace-nowrap px-2 py-2 sm:table-cell">
+                  {t.exit_reason ? (
+                    <span className={`inline-block rounded border px-2 py-0.5 text-xs font-medium ${
+                      t.exit_reason === '止损' ? 'border-red-200 bg-red-50 text-red-700'
+                      : t.exit_reason === '止盈' ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                      : t.exit_reason === '移动止盈' ? 'border-amber-200 bg-amber-50 text-amber-700'
+                      : t.exit_reason === '时间止损' ? 'border-slate-200 bg-slate-50 text-slate-600'
+                      : 'border-gray-200 bg-gray-50 text-gray-600'
+                    }`}>{t.exit_reason}</span>
+                  ) : '—'}
                 </td>
                 <td className="hidden truncate px-2 py-2 text-muted lg:table-cell" title={t.signal_reason}>{t.signal_reason ?? '—'}</td>
                 <td className="whitespace-nowrap px-2 py-2 tabular-nums">¥{formatNumber(t.price, 2)}</td>

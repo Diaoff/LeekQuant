@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, Banknote, BriefcaseBusiness, LineChart, Loader2, Play, Plus, RefreshCw, X } from 'lucide-react'
+import { AlertTriangle, Banknote, BriefcaseBusiness, LineChart, Loader2, Play, Plus, RefreshCw, X, GitBranch } from 'lucide-react'
 import { ColorType, LineSeries, createChart, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
@@ -13,6 +13,7 @@ interface Account {
   frozen_cash: string
   total_asset: string
   status: string
+  config: Record<string, unknown> | null
   updated_at: string
 }
 
@@ -148,6 +149,115 @@ const matchModeOptions = [
   { value: 'limit', label: '限价' },
 ] as const
 
+function RiskConfigSection({
+  account,
+  patchAccount,
+  saving,
+}: {
+  account: Account
+  patchAccount: (id: number, body: Record<string, unknown>, notice?: string) => Promise<void>
+  saving: boolean
+}) {
+  const riskConfig = (account.config as Record<string, unknown> | null)?.['risk_config'] as Record<string, unknown> | undefined ?? {}
+  const [editing, setEditing] = React.useState(false)
+  const [form, setForm] = React.useState({
+    stop_loss_pct: String(riskConfig.stop_loss_pct ?? ''),
+    take_profit_pct: String(riskConfig.take_profit_pct ?? ''),
+    trailing_stop_pct: String(riskConfig.trailing_stop_pct ?? ''),
+    trailing_activation_pct: String(riskConfig.trailing_activation_pct ?? ''),
+    time_stop_days: String(riskConfig.time_stop_days ?? ''),
+  })
+
+  const handleSave = () => {
+    const rc: Record<string, number> = {}
+    if (form.stop_loss_pct) rc.stop_loss_pct = Number(form.stop_loss_pct) / 100
+    if (form.take_profit_pct) rc.take_profit_pct = Number(form.take_profit_pct) / 100
+    if (form.trailing_stop_pct) rc.trailing_stop_pct = Number(form.trailing_stop_pct) / 100
+    if (form.trailing_activation_pct) rc.trailing_activation_pct = Number(form.trailing_activation_pct) / 100
+    if (form.time_stop_days) rc.time_stop_days = Number(form.time_stop_days)
+    void patchAccount(account.id, { config: { risk_config: rc } }, '风控配置已更新')
+    setEditing(false)
+  }
+
+  return (
+    <section className="rounded-lg border border-line bg-panel p-4">
+      <div className="flex items-center gap-3">
+        <AlertTriangle className="h-4 w-4 text-muted" />
+        <span className="text-sm font-medium text-ink">风控设置</span>
+        {!editing && (
+          <button
+            type="button"
+            onClick={() => {
+              setForm({
+                stop_loss_pct: riskConfig.stop_loss_pct != null ? String(Number(riskConfig.stop_loss_pct) * 100) : '',
+                take_profit_pct: riskConfig.take_profit_pct != null ? String(Number(riskConfig.take_profit_pct) * 100) : '',
+                trailing_stop_pct: riskConfig.trailing_stop_pct != null ? String(Number(riskConfig.trailing_stop_pct) * 100) : '',
+                trailing_activation_pct: riskConfig.trailing_activation_pct != null ? String(Number(riskConfig.trailing_activation_pct) * 100) : '',
+                time_stop_days: riskConfig.time_stop_days != null ? String(riskConfig.time_stop_days) : '',
+              })
+              setEditing(true)
+            }}
+            className="ml-auto text-sm font-medium text-accent hover:underline"
+          >
+            编辑
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="mt-3 space-y-2">
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              止损 (%)
+              <input value={form.stop_loss_pct} onChange={(e) => setForm((f) => ({ ...f, stop_loss_pct: e.target.value }))} className="h-8 rounded border border-line bg-surface px-2 text-sm text-ink outline-none" placeholder="例: 8" />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              止盈 (%)
+              <input value={form.take_profit_pct} onChange={(e) => setForm((f) => ({ ...f, take_profit_pct: e.target.value }))} className="h-8 rounded border border-line bg-surface px-2 text-sm text-ink outline-none" placeholder="例: 20" />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              移动止盈回撤 (%)
+              <input value={form.trailing_stop_pct} onChange={(e) => setForm((f) => ({ ...f, trailing_stop_pct: e.target.value }))} className="h-8 rounded border border-line bg-surface px-2 text-sm text-ink outline-none" placeholder="例: 10" />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              移动止盈激活 (%)
+              <input value={form.trailing_activation_pct} onChange={(e) => setForm((f) => ({ ...f, trailing_activation_pct: e.target.value }))} className="h-8 rounded border border-line bg-surface px-2 text-sm text-ink outline-none" placeholder="例: 15" />
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-muted">
+              时间止损 (天)
+              <input value={form.time_stop_days} onChange={(e) => setForm((f) => ({ ...f, time_stop_days: e.target.value }))} className="h-8 rounded border border-line bg-surface px-2 text-sm text-ink outline-none" placeholder="例: 60" />
+            </label>
+          </div>
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={handleSave}
+              className="inline-flex h-8 items-center rounded-md bg-accent px-3 text-xs font-medium text-white disabled:opacity-60"
+            >
+              {saving ? '保存中...' : '保存'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditing(false)}
+              className="text-xs font-medium text-muted hover:underline"
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-2 grid grid-cols-5 gap-2 text-xs text-muted">
+          <div>止损: <span className="text-ink">{riskConfig.stop_loss_pct != null ? `${Number(riskConfig.stop_loss_pct) * 100}%` : '-'}</span></div>
+          <div>止盈: <span className="text-ink">{riskConfig.take_profit_pct != null ? `${Number(riskConfig.take_profit_pct) * 100}%` : '-'}</span></div>
+          <div>移动回撤: <span className="text-ink">{riskConfig.trailing_stop_pct != null ? `${Number(riskConfig.trailing_stop_pct) * 100}%` : '-'}</span></div>
+          <div>移动激活: <span className="text-ink">{riskConfig.trailing_activation_pct != null ? `${Number(riskConfig.trailing_activation_pct) * 100}%` : '-'}</span></div>
+          <div>时间止损: <span className="text-ink">{riskConfig.time_stop_days != null ? `${riskConfig.time_stop_days}天` : '-'}</span></div>
+        </div>
+      )}
+    </section>
+  )
+}
+
 export default function SimulationPage() {
   const [accounts, setAccounts] = React.useState<Account[]>([])
   const [selectedId, setSelectedId] = React.useState<number | null>(null)
@@ -161,7 +271,9 @@ export default function SimulationPage() {
   const [saving, setSaving] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
-  const [form, setForm] = React.useState({ name: '', initial_cash: '100000' })
+  const [form, setForm] = React.useState({ name: '', initial_cash: '100000', strategy_id: '' })
+  const [strategies, setStrategies] = React.useState<{ id: number; name: string }[]>([])
+  const [editingStrategy, setEditingStrategy] = React.useState<{ id: number; selected: string } | null>(null)
   const [matchModes, setMatchModes] = React.useState<Record<number, 'close' | 'open' | 'limit'>>({})
 
   const selected = accounts.find((account) => account.id === selectedId) ?? null
@@ -203,9 +315,17 @@ export default function SimulationPage() {
     }
   }, [])
 
+  const loadStrategies = React.useCallback(async () => {
+    try {
+      const data = await fetchJson<{ id: number; name: string; status: string }[]>('/api/strategies')
+      setStrategies(data)
+    } catch { /* ignore */ }
+  }, [])
+
   React.useEffect(() => {
     void loadAccounts()
-  }, [loadAccounts])
+    void loadStrategies()
+  }, [loadAccounts, loadStrategies])
 
   React.useEffect(() => {
     if (selectedId) void loadDetail(selectedId)
@@ -216,14 +336,31 @@ export default function SimulationPage() {
     setSaving(true)
     setError(null)
     try {
+      const body: Record<string, unknown> = { name: form.name || '模拟账户', initial_cash: form.initial_cash }
+      if (form.strategy_id) body.strategy_id = parseInt(form.strategy_id, 10)
       const account = await fetchJson<Account>('/api/sim/accounts', {
         method: 'POST',
-        body: JSON.stringify({ name: form.name || '模拟账户', initial_cash: form.initial_cash }),
+        body: JSON.stringify(body),
       })
       setAccounts((prev) => [account, ...prev])
       setSelectedId(account.id)
       setNotice('账户已创建')
-      setForm({ name: '', initial_cash: '100000' })
+      setForm({ name: '', initial_cash: '100000', strategy_id: '' })
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const patchAccount = async (accountId: number, body: Record<string, unknown>, noticeMsg?: string) => {
+    setSaving(true)
+    setError(null)
+    try {
+      const updated = await fetchJson<Account>(`/api/sim/accounts/${accountId}`, { method: 'PATCH', body: JSON.stringify(body) })
+      setAccounts((prev) => prev.map((a) => a.id === accountId ? updated : a))
+      setNotice(noticeMsg ?? '账户已更新')
+      setEditingStrategy(null)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -306,6 +443,19 @@ export default function SimulationPage() {
                 placeholder="初始资金"
                 className="h-9 w-full rounded-md border border-line bg-surface px-3 text-sm text-ink outline-none"
               />
+              <div className="relative">
+                <select
+                  value={form.strategy_id}
+                  onChange={(event) => setForm((prev) => ({ ...prev, strategy_id: event.target.value }))}
+                  className="h-9 w-full appearance-none rounded-md border border-line bg-surface px-3 pr-8 text-sm text-ink outline-none"
+                >
+                  <option value="">不绑定策略</option>
+                  {strategies.map((st) => (
+                    <option key={st.id} value={st.id}>{st.name}</option>
+                  ))}
+                </select>
+                <GitBranch className="pointer-events-none absolute right-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+              </div>
               <button
                 disabled={saving}
                 className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-accent px-3 text-sm font-medium text-white disabled:opacity-60"
@@ -359,6 +509,57 @@ export default function SimulationPage() {
                   </div>
                 ))}
               </section>
+
+              <section className="rounded-lg border border-line bg-panel p-4">
+                <div className="flex items-center gap-3">
+                  <GitBranch className="h-4 w-4 text-muted" />
+                  <span className="text-sm font-medium text-ink">绑定策略</span>
+
+                  {editingStrategy?.id === selected.id ? (
+                    <div className="ml-auto flex items-center gap-2">
+                      <select
+                        value={editingStrategy.selected}
+                        onChange={(e) => setEditingStrategy({ id: selected.id, selected: e.target.value })}
+                        className="h-8 rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
+                        autoFocus
+                      >
+                        <option value="">不绑定</option>
+                        {strategies.map((st) => (
+                          <option key={st.id} value={st.id}>{st.name}</option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={saving}
+                        onClick={() => void patchAccount(selected.id, { strategy_id: editingStrategy.selected ? parseInt(editingStrategy.selected, 10) : null })}
+                        className="text-sm font-medium text-accent hover:underline disabled:opacity-50"
+                      >
+                        {saving ? '保存中...' : '保存'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingStrategy(null)}
+                        className="text-sm font-medium text-muted hover:underline"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <span className="ml-auto text-sm text-muted">{selected.strategy_name ?? '未绑定'}</span>
+                      <button
+                        type="button"
+                        onClick={() => setEditingStrategy({ id: selected.id, selected: String(strategies.find(s => s.name === selected.strategy_name)?.id ?? '') })}
+                        className="text-sm font-medium text-accent hover:underline"
+                      >
+                        更改
+                      </button>
+                    </>
+                  )}
+                </div>
+              </section>
+
+              <RiskConfigSection account={selected} patchAccount={patchAccount} saving={saving} />
 
               <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
                 <DataTable title="持仓" loading={detailLoading} empty="暂无持仓">

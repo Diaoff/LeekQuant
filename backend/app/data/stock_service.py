@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -16,6 +18,7 @@ from app.data.repository import (
     record_update_success,
     upsert_stock_fundamentals,
 )
+from app.db.session import async_session_factory
 
 LOCAL_USER_ID = 1
 
@@ -225,34 +228,35 @@ async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 
         text(
             f"""
             WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) *
+                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm, pb, ps_ttm, pcf_ttm,
+                       market_cap, float_market_cap, report_date, data_source
                 FROM stock_fundamentals
                 ORDER BY ts_code, report_date DESC
             ),
-            latest_kline AS (
-                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
-                FROM daily_kline
-                ORDER BY ts_code, trade_date DESC
-            ),
-            kline_counts AS (
-                SELECT ts_code, COUNT(*) AS count
-                FROM daily_kline
-                GROUP BY ts_code
+            page_stocks AS (
+                SELECT
+                    s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
+                    s.list_date, s.delist_date, s.is_st, s.is_delisted,
+                    f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
+                    f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source
+                FROM stock_basic s
+                LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
+                {where_sql}
+                ORDER BY s.symbol
+                LIMIT :limit OFFSET :offset
             )
-            SELECT
-                s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
-                s.list_date, s.delist_date, s.is_st, s.is_delisted,
-                f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
-                f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source,
+            SELECT ps.*,
                 k.trade_date AS latest_trade_date, k.close AS latest_close,
                 COALESCE(kc.count, 0) AS daily_kline_count
-            FROM stock_basic s
-            LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
-            LEFT JOIN latest_kline k ON k.ts_code = s.ts_code
-            LEFT JOIN kline_counts kc ON kc.ts_code = s.ts_code
-            {where_sql}
-            ORDER BY s.symbol
-            LIMIT :limit OFFSET :offset
+            FROM page_stocks ps
+            LEFT JOIN LATERAL (
+                SELECT trade_date, close FROM daily_kline
+                WHERE ts_code = ps.ts_code ORDER BY trade_date DESC LIMIT 1
+            ) k ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS count FROM daily_kline WHERE ts_code = ps.ts_code
+            ) kc ON true
+            ORDER BY ps.symbol
             """
         ),
         params,
@@ -277,19 +281,10 @@ async def _list_stocks_with_fuzzy_query(
         text(
             f"""
             WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) *
+                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm, pb, ps_ttm, pcf_ttm,
+                       market_cap, float_market_cap, report_date, data_source
                 FROM stock_fundamentals
                 ORDER BY ts_code, report_date DESC
-            ),
-            latest_kline AS (
-                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close
-                FROM daily_kline
-                ORDER BY ts_code, trade_date DESC
-            ),
-            kline_counts AS (
-                SELECT ts_code, COUNT(*) AS count
-                FROM daily_kline
-                GROUP BY ts_code
             )
             SELECT
                 s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
@@ -300,8 +295,13 @@ async def _list_stocks_with_fuzzy_query(
                 COALESCE(kc.count, 0) AS daily_kline_count
             FROM stock_basic s
             LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
-            LEFT JOIN latest_kline k ON k.ts_code = s.ts_code
-            LEFT JOIN kline_counts kc ON kc.ts_code = s.ts_code
+            LEFT JOIN LATERAL (
+                SELECT trade_date, close FROM daily_kline
+                WHERE ts_code = s.ts_code ORDER BY trade_date DESC LIMIT 1
+            ) k ON true
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS count FROM daily_kline WHERE ts_code = s.ts_code
+            ) kc ON true
             {where_sql}
             ORDER BY s.symbol
             """
@@ -661,44 +661,146 @@ async def delete_watchlist_item(session: AsyncSession, item_id: int, user_id: in
 
 
 async def sync_fundamentals(
-    session: AsyncSession,
+    session: AsyncSession | None,
     ts_codes: list[str] | None,
     start_date: date,
     end_date: date,
     providers: list[DataProvider] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    commit_each: bool = False,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
+    from app.data.service import select_all_stock_codes
+
     provider_list = providers or default_providers()
-    codes = [normalize_ts_code(code) for code in ts_codes] if ts_codes else await _select_fundamental_codes(session)
+    concurrency = max(1, concurrency)
+    if ts_codes is None:
+        assert session is not None, "session required when ts_codes is None"
+        codes = await select_all_stock_codes(session)
+    else:
+        codes = [normalize_ts_code(code) for code in ts_codes]
     if not codes:
         raise ValueError("no stock codes available for fundamentals sync")
 
     total = 0
+    completed = 0
     failures: list[dict[str, str]] = []
     source_counts: dict[str, int] = {}
+    progress_lock = asyncio.Lock()
 
-    for code in codes:
+    async def report_progress(ts_code: str) -> None:
+        nonlocal completed
+        if progress_callback is None:
+            return
+        async with progress_lock:
+            completed += 1
+            try:
+                progress_callback(completed, len(codes), ts_code)
+            except Exception:
+                pass
+
+    async def process_code(code: str) -> dict[str, Any]:
         try:
-            source, records = fetch_with_fallback(provider_list, "fetch_stock_fundamentals", [code], start_date, end_date, proxy_url=get_data_proxy_url())
+            if commit_each:
+                async with async_session_factory() as wk_session:
+                    try:
+                        source, records = await asyncio.to_thread(
+                            fetch_with_fallback,
+                            providers or default_providers(),
+                            "fetch_stock_fundamentals",
+                            [code],
+                            start_date,
+                            end_date,
+                            proxy_url=get_data_proxy_url(),
+                        )
+                        count = await upsert_stock_fundamentals(wk_session, records)
+                        latest = max((record.report_date for record in records), default=None)
+                        await record_update_success(wk_session, "fundamentals", source, ts_code=code, last_trade_date=latest)
+                        await wk_session.commit()
+                        return {"ts_code": code, "source": source, "count": count}
+                    except Exception as exc:
+                        message = str(exc)
+                        try:
+                            await wk_session.rollback()
+                        except Exception:
+                            pass
+                        await record_update_failure(wk_session, "fundamentals", "fallback", message, ts_code=code)
+                        await wk_session.commit()
+                        return {"ts_code": code, "error": message}
+
+            source, records = await asyncio.to_thread(
+                fetch_with_fallback,
+                provider_list,
+                "fetch_stock_fundamentals",
+                [code],
+                start_date,
+                end_date,
+                proxy_url=get_data_proxy_url(),
+            )
+            assert session is not None
             count = await upsert_stock_fundamentals(session, records)
-            total += count
-            source_counts[source] = source_counts.get(source, 0) + count
             latest = max((record.report_date for record in records), default=None)
             await record_update_success(session, "fundamentals", source, ts_code=code, last_trade_date=latest)
+            return {"ts_code": code, "source": source, "count": count}
         except Exception as exc:
             message = str(exc)
-            failures.append({"ts_code": code, "error": message})
+            assert session is not None
             await record_update_failure(session, "fundamentals", "fallback", message, ts_code=code)
+            return {"ts_code": code, "error": message}
+
+    if commit_each and concurrency > 1:
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def bounded_process(code: str) -> dict[str, Any]:
+            async with semaphore:
+                result = await process_code(code)
+                await report_progress(code)
+                return result
+
+        results = await asyncio.gather(*(bounded_process(code) for code in codes))
+    else:
+        results = []
+        for code in codes:
+            result = await process_code(code)
+            results.append(result)
+            await report_progress(code)
+
+    for result in results:
+        if "error" in result:
+            failures.append({"ts_code": result["ts_code"], "error": result["error"]})
+            continue
+        count = int(result["count"])
+        total += count
+        source = str(result["source"])
+        source_counts[source] = source_counts.get(source, 0) + count
 
     if failures:
-        await create_alert(
-            session,
-            level="warning" if total else "error",
-            category="data_sync",
-            title="Fundamentals sync completed with failures",
-            message=f"{len(failures)} symbols failed during fundamentals sync",
-            payload={"failures": failures[:20]},
-        )
-    await session.commit()
+        if session is not None:
+            await create_alert(
+                session,
+                level="warning" if total else "error",
+                category="data_sync",
+                title="Fundamentals sync completed with failures",
+                message=f"{len(failures)} symbols failed during fundamentals sync",
+                payload={"failures": failures[:20]},
+            )
+            if commit_each:
+                await session.commit()
+        else:
+            async with async_session_factory() as alert_session:
+                await create_alert(
+                    alert_session,
+                    level="warning" if total else "error",
+                    category="data_sync",
+                    title="Fundamentals sync completed with failures",
+                    message=f"{len(failures)} symbols failed during fundamentals sync",
+                    payload={"failures": failures[:20]},
+                )
+                await alert_session.commit()
+
+    if not commit_each:
+        assert session is not None
+        await session.commit()
     if total == 0 and failures:
         raise RuntimeError(f"all fundamentals sync attempts failed: {failures[0]['error']}")
     return {
@@ -718,6 +820,10 @@ async def _select_fundamental_codes(session: AsyncSession, limit: int = 100) -> 
             SELECT ts_code
             FROM stock_basic
             WHERE is_delisted = FALSE
+              AND market NOT IN ('科创板', '北交所')
+              AND ts_code NOT LIKE '920%.SH'
+              AND ts_code !~ '^200[0-9]{3}\\.SZ'
+              AND ts_code !~ '^900[0-9]{3}\\.SH'
             ORDER BY symbol
             LIMIT :limit
             """

@@ -101,9 +101,10 @@ class BacktestConfig:
 class BacktestContext:
     """Context object exposed to user strategy code."""
 
-    def __init__(self, klines: list[KBar], positions: dict[str, Position], total_asset: Decimal):
+    def __init__(self, klines: list[KBar], positions: dict[str, Position], total_asset: Decimal, current_price: Decimal | None = None):
         self._klines = klines
         self._current_position: float = 0.0
+        self.current_price = float(current_price) if current_price is not None else None
 
     @property
     def close(self) -> list[float]:

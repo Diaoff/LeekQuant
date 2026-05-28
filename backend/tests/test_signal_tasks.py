@@ -47,6 +47,12 @@ class ScriptedSession:
     async def rollback(self):
         self.rollbacks += 1
 
+    def begin_nested(self):
+        class _Nested:
+            async def __aenter__(self, *_a, **_kw): pass
+            async def __aexit__(self, *_a, **_kw): pass
+        return _Nested()
+
 
 def kline_rows():
     rows = []
@@ -115,7 +121,7 @@ async def test_generate_all_signals_collects_strategy_errors_and_continues():
     assert result["signals_logged"] == 1
     assert result["error_count"] == 1
     assert result["errors"][0]["strategy_id"] == 3
-    assert session.rollbacks == 1
+    assert session.rollbacks == 0
 
 
 @pytest.mark.asyncio

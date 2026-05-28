@@ -398,6 +398,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 if "performance" in results and isinstance(results["performance"], dict):
                     results["performance"]["engine"] = engine
                     results["performance"]["filters"] = filters
+                    results["performance"]["risk_config"] = results.get("execution_assumptions", {})
                     results["performance"].update(_stock_scope_diagnostics(list(all_klines.keys())))
             except Exception as exc:
                 import traceback
@@ -447,4 +448,8 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             await session.commit()
             return results
 
-    return asyncio.run(_run())
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        import traceback
+        return {"error": f"unhandled exception in backtest {backtest_id}: {traceback.format_exc()}"}

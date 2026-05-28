@@ -84,3 +84,36 @@ async def test_trading_fee_api_uses_request_user_id() -> None:
 
     assert result["commission_rate"] == "0.00025"
     assert session.params[0]["user_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_kline_sync_returns_default_when_preference_missing() -> None:
+    session = CaptureSession([FakeResult([])])
+
+    result = await service.get_kline_sync_payload(session)
+
+    assert result == {"full_kline_sync_concurrency": 2}
+    assert session.params[0]["user_id"] == 0
+    assert session.params[0]["key"] == "kline_sync"
+
+
+@pytest.mark.asyncio
+async def test_save_kline_sync_uses_global_preference_key() -> None:
+    session = CaptureSession()
+
+    result = await service.save_kline_sync_payload(session, {"full_kline_sync_concurrency": 6})
+
+    assert result == {"full_kline_sync_concurrency": 6}
+    assert session.commits == 1
+    assert session.params[0]["user_id"] == 0
+    assert session.params[0]["key"] == "kline_sync"
+
+
+@pytest.mark.asyncio
+async def test_kline_sync_api_accepts_concurrency_alias() -> None:
+    session = CaptureSession()
+    request = preferences.KlineSyncPreference(concurrency=4)
+
+    result = await preferences.update_kline_sync(request, session)
+
+    assert result == {"full_kline_sync_concurrency": 4}

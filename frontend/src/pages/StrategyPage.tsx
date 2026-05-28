@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, Plus, Play, Save, Trash2, Loader2 } from 'lucide-react'
+import { AlertTriangle, Plus, Play, Save, Trash2, Loader2, ToggleLeft, ToggleRight } from 'lucide-react'
 import Editor, { loader } from '@monaco-editor/react'
 import * as monaco from 'monaco-editor'
 import { fetchJson, formatDateTime, formatNumber } from '../lib/utils'
@@ -56,6 +56,13 @@ interface BacktestSubmitResponse {
   strategy_id: number
   task_id: string
   status: string
+}
+
+interface BatchBacktestSubmitResponse {
+  backtest_ids: number[]
+  task_ids: string[]
+  total: number
+  strategy_names: string[]
 }
 
 interface BacktestListResult {
@@ -159,6 +166,8 @@ export default function StrategyPage() {
   const [loadingRuns, setLoadingRuns] = React.useState(false)
   const [showBacktestModal, setShowBacktestModal] = React.useState(false)
   const [targetStrategy, setTargetStrategy] = React.useState<Strategy | null>(null)
+  const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
+  const [batchMode, setBatchMode] = React.useState(false)
   const [backtestParams, setBacktestParams] = React.useState<BacktestParams>({
     start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
     end_date: new Date().toISOString().split('T')[0],
@@ -220,7 +229,7 @@ export default function StrategyPage() {
     setSaving(true)
     setError(null)
     try {
-      const body = { name: name.trim(), description: description.trim() || null, source_code: sourceCode }
+      const body = { name: name.trim(), description: description.trim() || null, source_code: sourceCode, status: 'active' }
       if (editing) {
         await fetchJson(`/api/strategies/${editing.id}`, { method: 'PATCH', body: JSON.stringify(body) })
         setNotice('策略已更新')
@@ -249,6 +258,19 @@ export default function StrategyPage() {
     }
   }
 
+  const toggleStatus = async (s: Strategy) => {
+    setError(null)
+    setNotice(null)
+    const next = s.status === 'active' ? 'paused' : 'active'
+    try {
+      await fetchJson(`/api/strategies/${s.id}`, { method: 'PATCH', body: JSON.stringify({ status: next }) })
+      setNotice(next === 'active' ? '策略已启用' : '策略已暂停')
+      await loadStrategies()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
   const selectTargetType = (targetType: BacktestTargetType) => {
     setBacktestParams({
       ...backtestParams,
@@ -267,6 +289,7 @@ export default function StrategyPage() {
   }
 
   const runBacktest = async (strategy: Strategy) => {
+    setBatchMode(false)
     setTargetStrategy(strategy)
     setBacktestParams({
       start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
@@ -283,7 +306,42 @@ export default function StrategyPage() {
     setShowBacktestModal(true)
   }
 
+  const confirmBatchBacktest = async () => {
+    setError(null)
+    setNotice(null)
+    try {
+      const config: Record<string, unknown> = {}
+      if (backtestParams.stop_loss_pct) config.stop_loss_pct = parseFloat(backtestParams.stop_loss_pct) / 100
+      if (backtestParams.take_profit_pct) config.take_profit_pct = parseFloat(backtestParams.take_profit_pct) / 100
+      if (backtestParams.trailing_stop_pct) config.trailing_stop_pct = parseFloat(backtestParams.trailing_stop_pct) / 100
+      if (backtestParams.time_stop_days) config.time_stop_days = parseInt(backtestParams.time_stop_days, 10)
+      const body = {
+        strategy_ids: [...selectedIds],
+        start_date: backtestParams.start_date,
+        end_date: backtestParams.end_date,
+        initial_cash: backtestParams.initial_cash,
+        config: Object.keys(config).length > 0 ? config : undefined,
+        target_type: backtestParams.target_type,
+        target_value: backtestParams.target_type === 'all' ? null : backtestParams.target_value,
+        exclude_st: backtestParams.exclude_st,
+        exclude_loss_pe: backtestParams.exclude_loss_pe,
+      }
+      const result = await fetchJson<BatchBacktestSubmitResponse>('/api/backtests/batch', { method: 'POST', body: JSON.stringify(body) })
+      setNotice(`已提交 ${result.total} 个回测任务: ${result.strategy_names.join(', ')}`)
+      setShowBacktestModal(false)
+      setBatchMode(false)
+      setSelectedIds(new Set())
+      await loadRunHistory()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }
+
   const confirmBacktest = async () => {
+    if (batchMode) {
+      await confirmBatchBacktest()
+      return
+    }
     if (!targetStrategy) return
     setError(null)
     setNotice(null)
@@ -319,6 +377,42 @@ export default function StrategyPage() {
     (backtestParams.target_type === 'market' && selectedMarkets(backtestParams.target_value).length > 0) ||
     (backtestParams.target_type === 'watchlist_group' && typeof backtestParams.target_value === 'string' && backtestParams.target_value.trim().length > 0)
 
+  const toggleSelect = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelectAll = () => {
+    if (strategies.length === 0) return
+    if (selectedIds.size === strategies.length) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(strategies.map((s) => s.id)))
+    }
+  }
+
+  const openBatchBacktest = () => {
+    setBatchMode(true)
+    setTargetStrategy(null)
+    setBacktestParams({
+      start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
+      end_date: new Date().toISOString().split('T')[0],
+      initial_cash: 100000,
+      target_type: 'all',
+      target_value: '',
+      ...defaultFiltersForTarget('all'),
+      stop_loss_pct: '',
+      take_profit_pct: '',
+      trailing_stop_pct: '',
+      time_stop_days: '',
+    })
+    setShowBacktestModal(true)
+  }
+
   const loadRunHistory = async () => {
     setLoadingRuns(true)
     try {
@@ -350,6 +444,12 @@ export default function StrategyPage() {
         <section className="overflow-hidden rounded-lg border border-line bg-panel shadow-sm">
           <div className="flex items-center gap-3 border-b border-line px-4 py-3">
             <h2 className="text-base font-semibold text-ink">我的策略</h2>
+            {selectedIds.size >= 2 && (
+              <button onClick={openBatchBacktest} className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700">
+                <Play className="h-4 w-4" />
+                批量回测({selectedIds.size})
+              </button>
+            )}
             <button onClick={createNew} className="ml-auto inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700">
               <Plus className="h-4 w-4" />
               新建策略
@@ -358,17 +458,28 @@ export default function StrategyPage() {
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
               <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                <tr><th className="px-4 py-3">名称</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">更新时间</th><th className="px-4 py-3">操作</th></tr>
+                <tr>
+                  <th className="w-10 px-2 py-3">
+                    <input type="checkbox" onChange={toggleSelectAll} checked={strategies.length > 0 && selectedIds.size === strategies.length} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+                  </th>
+                  <th className="px-4 py-3">名称</th>
+                  <th className="px-4 py-3">状态</th>
+                  <th className="px-4 py-3">更新时间</th>
+                  <th className="px-4 py-3">操作</th>
+                </tr>
               </thead>
               <tbody className="divide-y divide-line">
                 {loading ? (
                   <tr>
-                    <td colSpan={4} className="px-4 py-4">
-                      <Skeleton.Table rows={3} columns={4} />
+                    <td colSpan={5} className="px-4 py-4">
+                      <Skeleton.Table rows={3} columns={5} />
                     </td>
                   </tr>
-                ) : strategies.length === 0 ? <tr><td colSpan={4} className="px-4 py-8 text-center text-muted">暂无策略，点击上方按钮创建</td></tr> : strategies.map((s) => (
+                ) : strategies.length === 0 ? <tr><td colSpan={5} className="px-4 py-8 text-center text-muted">暂无策略，点击上方按钮创建</td></tr> : strategies.map((s) => (
                   <tr key={s.id} className="hover:bg-rowHover">
+                    <td className="px-2 py-3">
+                      <input type="checkbox" checked={selectedIds.has(s.id)} onChange={() => toggleSelect(s.id)} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+                    </td>
                     <td className="px-4 py-3 font-medium">{s.name}</td>
                     <td className="px-4 py-3">
                       <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${s.status === 'active' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-line bg-tableHead text-muted'}`}>{s.status}</span>
@@ -376,6 +487,12 @@ export default function StrategyPage() {
                     <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(s.updated_at)}</td>
                     <td className="px-4 py-3">
                       <div className="flex gap-2">
+                        {s.status !== 'archived' && (
+                          <button onClick={() => void toggleStatus(s)} className="inline-flex items-center gap-1 text-sm font-medium text-amber-600 hover:underline" title={s.status === 'active' ? '暂停' : '启用'}>
+                            {s.status === 'active' ? <ToggleRight className="h-3.5 w-3.5" /> : <ToggleLeft className="h-3.5 w-3.5" />}
+                            {s.status === 'active' ? '暂停' : '启用'}
+                          </button>
+                        )}
                         <button onClick={() => editStrategy(s)} className="text-sm font-medium text-accent hover:underline">编辑</button>
                         <button onClick={() => void runBacktest(s)} className="inline-flex items-center gap-1 text-sm font-medium text-mint hover:underline"><Play className="h-3 w-3" />回测</button>
                         <button onClick={() => void deleteStrategy(s.id)} className="text-sm font-medium text-red-600 hover:underline">删除</button>
@@ -491,7 +608,7 @@ export default function StrategyPage() {
       {showBacktestModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowBacktestModal(false)}>
           <div className={`w-full max-w-lg rounded-lg p-6 ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'bg-slate-800 text-slate-100' : 'bg-white text-ink'}`} onClick={(e) => e.stopPropagation()}>
-            <h3 className="mb-4 text-lg font-semibold">回测参数设置</h3>
+            <h3 className="mb-4 text-lg font-semibold">{batchMode ? `回测参数设置（${selectedIds.size} 个策略，将依次执行）` : '回测参数设置'}</h3>
             <div className="space-y-4">
               <div>
                 <label className="mb-1 block text-sm font-medium text-slate-600">标的范围</label>

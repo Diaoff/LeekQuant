@@ -54,17 +54,34 @@ def _exec_strategy(source_code: str, ctx: BacktestContext) -> dict[str, Any] | N
     return result if isinstance(result, dict) else None
 
 
+async def _fetch_midday_quotes(stock_codes: list[str]) -> dict[str, Decimal]:
+    if not stock_codes:
+        return {}
+    try:
+        from app.data.providers import TencentHttpProvider, AkShareProvider
+    except ImportError:
+        return {}
+    for provider_cls, name in [(TencentHttpProvider, "tencent"), (AkShareProvider, "akshare")]:
+        try:
+            provider = provider_cls()
+            result = await asyncio.to_thread(provider.fetch_realtime_quote, stock_codes)
+            if result:
+                return result
+        except Exception:
+            continue
+    return {}
+
+
 async def _last_open_trade_date(session, requested: date | None) -> date | None:
     if requested is not None:
         return requested
     result = await session.execute(
         text(
             """
-            SELECT cal_date
-            FROM trade_calendar
-            WHERE is_open = TRUE AND cal_date <= CURRENT_DATE
-            ORDER BY cal_date DESC
-            LIMIT 1
+            SELECT COALESCE(
+                (SELECT MAX(trade_date) FROM daily_kline),
+                (SELECT cal_date FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE ORDER BY cal_date DESC LIMIT 1)
+            )
             """
         )
     )
@@ -89,10 +106,22 @@ async def _stock_codes(session) -> list[str]:
     result = await session.execute(
         text(
             """
-            SELECT ts_code
-            FROM stock_basic
-            WHERE is_delisted = FALSE
-            ORDER BY symbol
+            WITH latest_fund AS (
+                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm
+                FROM stock_fundamentals
+                ORDER BY ts_code, report_date DESC
+            )
+            SELECT sb.ts_code
+            FROM stock_basic sb
+            LEFT JOIN latest_fund f ON f.ts_code = sb.ts_code
+            WHERE sb.is_delisted = FALSE
+              AND sb.is_st = FALSE
+              AND (f.pe_ttm IS NULL OR f.pe_ttm > 0)
+              AND sb.market NOT IN ('科创板', '北交所')
+              AND sb.ts_code NOT LIKE '920%.SH'
+              AND sb.ts_code !~ '^200[0-9]{3}\\.SZ'
+              AND sb.ts_code !~ '^900[0-9]{3}\\.SH'
+            ORDER BY sb.symbol
             """
         )
     )
@@ -133,73 +162,125 @@ async def _recent_klines(session, ts_code: str, trade_date: date) -> list[KBar]:
     return [_parse_kbar(row) for row in reversed(rows)]
 
 
+async def _batch_klines(session, trade_date: date) -> dict[str, list[KBar]]:
+    start_date = trade_date.replace(year=trade_date.year - 1)
+    result = await session.execute(
+        text(
+            """
+            SELECT ts_code, trade_date, open, high, low, close, pre_close,
+                   volume, amount, adj_factor, is_suspended,
+                   is_limit_up, is_limit_down
+            FROM daily_kline
+            WHERE trade_date BETWEEN :start AND :trade_date
+            ORDER BY ts_code, trade_date DESC
+            """
+        ),
+        {"start": start_date, "trade_date": trade_date},
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    bars: dict[str, list[KBar]] = {}
+    for row in rows:
+        code = row["ts_code"]
+        if code not in bars:
+            bars[code] = []
+        bars[code].append(_parse_kbar(row))
+        if len(bars[code]) > LOOKBACK_BARS:
+            bars[code].pop(0)
+    for code in bars:
+        bars[code].sort(key=lambda k: k.trade_date)
+    return bars
+
+
 async def generate_all_signals_for_date(session, *, trade_date: date | None = None) -> dict[str, Any]:
-    run_date = await _last_open_trade_date(session, trade_date)
-    if run_date is None:
-        return {"skipped": True, "reason": "no open trade date"}
+    if trade_date is not None:
+        run_date = trade_date
+    else:
+        run_date = date.today()
+        cal = await session.execute(
+            text("SELECT is_open FROM trade_calendar WHERE cal_date = :d"),
+            {"d": run_date},
+        )
+        row = cal.mappings().one_or_none()
+        if not row or not row["is_open"]:
+            return {"skipped": True, "reason": "today is not an open trade day"}
 
     strategies = await _active_strategies(session)
     stock_codes = await _stock_codes(session)
+    quotes = await _fetch_midday_quotes(stock_codes)
     stats: dict[str, Any] = {
         "trade_date": run_date.isoformat(),
         "strategy_count": len(strategies),
         "stock_count": len(stock_codes),
+        "quotes_fetched": len(quotes),
         "signals_logged": 0,
         "orders_created": 0,
         "errors": [],
     }
     accounts_by_strategy: dict[int, list[dict[str, Any]]] = {}
+    COMMIT_INTERVAL = 500
 
     for strategy in strategies:
         strategy_id = int(strategy["id"])
         accounts_by_strategy[strategy_id] = await _bound_accounts(session, strategy_id)
+        klines_batch = await _batch_klines(session, run_date)
         for ts_code in stock_codes:
+            klines = klines_batch.get(ts_code)
+            if not klines:
+                continue
+
             try:
-                klines = await _recent_klines(session, ts_code, run_date)
-                if not klines or klines[-1].trade_date != run_date:
-                    continue
-                ctx = BacktestContext(klines, {}, Decimal("0"))
-                signal = _exec_strategy(strategy["source_code"], ctx)
-                if not signal:
-                    continue
+                async with session.begin_nested():
+                    current_price = quotes.get(ts_code)
+                    ctx = BacktestContext(klines, {}, Decimal("0"), current_price=current_price)
+                    signal = _exec_strategy(strategy["source_code"], ctx)
+                    if not signal:
+                        continue
 
-                request = SignalOrderRequest(
-                    ts_code=ts_code,
-                    signal_type=str(signal.get("signal_type") or "观望"),
-                    trade_date=run_date,
-                    strategy_id=strategy_id,
-                    target_position=_dec(signal.get("target_position")) if signal.get("target_position") is not None else None,
-                    confidence=_dec(signal.get("confidence")) if signal.get("confidence") is not None else None,
-                    reason=signal.get("reason"),
-                    snapshot={
+                    prev_close = klines[-1].close
+                    snapshot: dict[str, Any] = {
                         "strategy_name": strategy.get("name"),
-                        "close": str(klines[-1].close),
+                        "prev_close": str(prev_close),
+                        "market_price_type": "实时行情",
                         "source": "generate_all_signals",
-                    },
-                )
-                await _insert_signal(
-                    session,
-                    user_id=int(strategy["user_id"]),
-                    account_id=None,
-                    request=request,
-                    current_position=Decimal(str(signal.get("current_position", 0))),
-                    action="PENDING",
-                    snapshot=request.snapshot or {},
-                )
-                stats["signals_logged"] += 1
+                    }
+                    if current_price is not None:
+                        snapshot["current_price"] = str(current_price)
 
-                for account in accounts_by_strategy[strategy_id]:
-                    order_result = await generate_order_from_signal(
-                        session,
-                        user_id=int(account["user_id"]),
-                        account_id=int(account["id"]),
-                        request=request,
+                    request = SignalOrderRequest(
+                        ts_code=ts_code,
+                        signal_type=str(signal.get("signal_type") or "观望"),
+                        trade_date=run_date,
+                        strategy_id=strategy_id,
+                        target_position=_dec(signal.get("target_position")) if signal.get("target_position") is not None else None,
+                        confidence=_dec(signal.get("confidence")) if signal.get("confidence") is not None else None,
+                        reason=signal.get("reason"),
+                        snapshot=snapshot,
                     )
-                    if order_result.get("order") is not None:
-                        stats["orders_created"] += 1
+                    await _insert_signal(
+                        session,
+                        user_id=int(strategy["user_id"]),
+                        account_id=None,
+                        request=request,
+                        current_position=Decimal(str(signal.get("current_position", 0))),
+                        action="PENDING",
+                        snapshot=request.snapshot or {},
+                    )
+                    stats["signals_logged"] += 1
+
+                    for account in accounts_by_strategy[strategy_id]:
+                        order_result = await generate_order_from_signal(
+                            session,
+                            user_id=int(account["user_id"]),
+                            account_id=int(account["id"]),
+                            request=request,
+                        )
+                        if order_result.get("order") is not None:
+                            stats["orders_created"] += 1
+
+                if stats["signals_logged"] % COMMIT_INTERVAL == 0:
+                    await session.commit()
             except Exception as exc:
                 stats["errors"].append({"strategy_id": strategy_id, "ts_code": ts_code, "error": str(exc)})
-                await session.rollback()
 
     await session.commit()
     stats["error_count"] = len(stats["errors"])

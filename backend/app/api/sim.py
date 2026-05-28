@@ -20,6 +20,7 @@ from app.sim.service import (
     list_child_rows,
     match_order,
     serialize_rows,
+    update_account,
 )
 
 router = APIRouter(prefix="/api/sim", tags=["simulation"])
@@ -40,6 +41,12 @@ class AccountCreateRequest(BaseModel):
     initial_cash: Decimal = Field(gt=0)
     strategy_id: int | None = None
     config: dict[str, Any] = Field(default_factory=dict)
+
+
+class AccountUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    strategy_id: int | None = None
+    config: dict[str, Any] | None = None
 
 
 class SignalCreateRequest(BaseModel):
@@ -91,6 +98,23 @@ async def get_account_detail(
 ) -> dict[str, Any]:
     row = await get_account_or_404(session, account_id, _extract_user_id(req))
     return serialize_rows([row])[0]
+
+
+@router.patch("/accounts/{account_id}")
+async def patch_account(
+    account_id: int,
+    request: AccountUpdateRequest,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return await update_account(
+        session,
+        account_id=account_id,
+        user_id=_extract_user_id(req),
+        name=request.name,
+        strategy_id=request.strategy_id,
+        config=request.config,
+    )
 
 
 @router.get("/accounts/{account_id}/positions")

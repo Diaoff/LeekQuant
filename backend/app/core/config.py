@@ -20,12 +20,20 @@ class Settings(BaseSettings):
         alias="BACKEND_CORS_ORIGINS",
     )
     data_proxy_url: str | None = Field(default=None, alias="DATA_PROXY_URL")
+    full_kline_sync_concurrency: int = Field(default=2, alias="FULL_KLINE_SYNC_CONCURRENCY")
 
     @field_validator("database_url")
     @classmethod
     def require_asyncpg_driver(cls, value: str) -> str:
         if not value.startswith("postgresql+asyncpg://"):
             raise ValueError("DATABASE_URL must use postgresql+asyncpg://")
+        return value
+
+    @field_validator("full_kline_sync_concurrency")
+    @classmethod
+    def validate_full_kline_sync_concurrency(cls, value: int) -> int:
+        if not 1 <= value <= 8:
+            raise ValueError("FULL_KLINE_SYNC_CONCURRENCY must be between 1 and 8")
         return value
 
     @property
@@ -40,4 +48,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

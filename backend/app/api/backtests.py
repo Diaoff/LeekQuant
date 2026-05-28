@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from celery import chain
+
 from app.backtest.tasks import run_backtest_task
 from app.data.stock_service import get_klines
 from app.db.session import get_session
@@ -123,6 +125,76 @@ def _target_label(target_type: str | None, target_value: Any) -> str:
     return "全市场"
 
 
+async def _create_backtest_record(
+    session: AsyncSession,
+    user_id: int,
+    strategy_id: int,
+    start_date: date,
+    end_date: date,
+    initial_cash: float,
+    benchmark_code: str | None,
+    params_snapshot: dict,
+) -> int:
+    result = await session.execute(
+        text(
+            """
+            INSERT INTO backtest_results (
+                user_id, strategy_id, start_date, end_date,
+                initial_cash, benchmark_code, params_snapshot, task_id
+            ) VALUES (
+                :user_id, :strategy_id, :start_date, :end_date,
+                :initial_cash, :benchmark_code, CAST(:params AS JSONB), ''
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "user_id": user_id,
+            "strategy_id": strategy_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "initial_cash": initial_cash,
+            "benchmark_code": benchmark_code or "",
+            "params": json.dumps(params_snapshot, ensure_ascii=False, default=str),
+        },
+    )
+    return dict(result.mappings().one())["id"]
+
+
+class BatchBacktestRequest(BaseModel):
+    strategy_ids: list[int] = Field(min_length=1, max_length=20)
+    start_date: date
+    end_date: date
+    initial_cash: float = 100000
+    benchmark_code: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    target_type: Literal["all", "market", "watchlist_group"] = "all"
+    target_value: str | list[str] | None = None
+    exclude_st: bool | None = None
+    exclude_loss_pe: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "BatchBacktestRequest":
+        if self.target_type == "all":
+            self.target_value = None
+        elif self.target_type == "market":
+            markets = _normalize_market_targets(self.target_value)
+            if not markets:
+                raise ValueError("target_value must be one of 主板 / 创业板 / 科创板 / 北交所")
+            self.target_value = markets
+        else:
+            if not isinstance(self.target_value, str) or not self.target_value.strip():
+                raise ValueError("target_value is required for watchlist_group")
+            self.target_value = self.target_value.strip()
+
+        default_filter = self.target_type in {"all", "market"}
+        if self.exclude_st is None:
+            self.exclude_st = default_filter
+        if self.exclude_loss_pe is None:
+            self.exclude_loss_pe = default_filter
+        return self
+
+
 def _with_target_fields(row: dict[str, Any]) -> dict[str, Any]:
     snapshot = _decode_json_dict(row.get("params_snapshot"))
     target = _decode_json_dict(snapshot.get("target"))
@@ -171,13 +243,7 @@ async def submit_backtest(
 ) -> dict[str, Any]:
     user_id = _extract_user_id(req)
     strategy = await session.execute(
-        text(
-            """
-            SELECT id
-            FROM strategies
-            WHERE id = :id AND user_id = :user_id
-            """
-        ),
+        text("SELECT id FROM strategies WHERE id = :id AND user_id = :user_id"),
         {"id": request.strategy_id, "user_id": user_id},
     )
     row = strategy.mappings().one_or_none()
@@ -201,32 +267,12 @@ async def submit_backtest(
         },
     }
 
-    result = await session.execute(
-        text(
-            """
-            INSERT INTO backtest_results (
-                user_id, strategy_id, start_date, end_date,
-                initial_cash, benchmark_code, params_snapshot, task_id
-            ) VALUES (
-                :user_id, :strategy_id, :start_date, :end_date,
-                :initial_cash, :benchmark_code, CAST(:params AS JSONB), :task_id
-            )
-            RETURNING id, strategy_id, status, created_at
-            """
-        ),
-        {
-            "user_id": user_id,
-            "strategy_id": request.strategy_id,
-            "start_date": request.start_date,
-            "end_date": request.end_date,
-            "initial_cash": request.initial_cash,
-            "benchmark_code": request.benchmark_code,
-            "params": json.dumps(params_snapshot, ensure_ascii=False, default=str),
-            "task_id": "",
-        },
+    backtest_id = await _create_backtest_record(
+        session, user_id, request.strategy_id,
+        request.start_date, request.end_date,
+        request.initial_cash, request.benchmark_code,
+        params_snapshot,
     )
-    bt_row = dict(result.mappings().one())
-    backtest_id = bt_row["id"]
 
     task_id = uuid4().hex
     await session.execute(
@@ -242,9 +288,7 @@ async def submit_backtest(
         )
     except OperationalError as exc:
         await session.execute(
-            text(
-                "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
-            ),
+            text("UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"),
             {"err": f"task queue unavailable: {exc}", "id": backtest_id},
         )
         await session.commit()
@@ -258,6 +302,89 @@ async def submit_backtest(
         "strategy_id": request.strategy_id,
         "task_id": task_id,
         "status": "pending",
+    }
+
+
+@router.post("/batch", status_code=status.HTTP_201_CREATED)
+async def submit_batch_backtest(
+    req: Request,
+    request: BatchBacktestRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    user_id = _extract_user_id(req)
+
+    strategies = await session.execute(
+        text("SELECT id, name FROM strategies WHERE id = ANY(:ids) AND user_id = :user_id"),
+        {"ids": request.strategy_ids, "user_id": user_id},
+    )
+    rows = strategies.mappings().all()
+    found_ids = {r["id"] for r in rows}
+    missing = set(request.strategy_ids) - found_ids
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"strategies not found: {sorted(missing)}",
+        )
+    name_map = {r["id"]: r["name"] for r in rows}
+
+    params_snapshot = {
+        "start_date": request.start_date.isoformat(),
+        "end_date": request.end_date.isoformat(),
+        "initial_cash": request.initial_cash,
+        "benchmark_code": request.benchmark_code,
+        "config": request.config,
+        "filters": {
+            "exclude_st": bool(request.exclude_st),
+            "exclude_loss_pe": bool(request.exclude_loss_pe),
+        },
+        "target": {
+            "type": request.target_type,
+            "value": request.target_value,
+            "label": _target_label(request.target_type, request.target_value),
+        },
+    }
+
+    backtest_ids: list[int] = []
+    for sid in request.strategy_ids:
+        bid = await _create_backtest_record(
+            session, user_id, sid,
+            request.start_date, request.end_date,
+            request.initial_cash, request.benchmark_code,
+            params_snapshot,
+        )
+        backtest_ids.append(bid)
+
+    task_ids: list[str] = []
+    for bid in backtest_ids:
+        tid = uuid4().hex
+        await session.execute(
+            text("UPDATE backtest_results SET task_id = :task_id, status = 'pending' WHERE id = :id"),
+            {"task_id": tid, "id": bid},
+        )
+        task_ids.append(tid)
+
+    await session.commit()
+
+    try:
+        sigs = [run_backtest_task.si(backtest_id=bid) for bid in backtest_ids]
+        chain(*sigs).apply_async()
+    except OperationalError as exc:
+        for bid in backtest_ids:
+            await session.execute(
+                text("UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"),
+                {"err": f"task queue unavailable: {exc}", "id": bid},
+            )
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+
+    return {
+        "backtest_ids": backtest_ids,
+        "task_ids": task_ids,
+        "total": len(backtest_ids),
+        "strategy_names": [name_map[sid] for sid in request.strategy_ids],
     }
 
 
@@ -327,20 +454,33 @@ async def get_backtest(
 
     payload = _with_target_fields(dict(row))
 
-    if include_kline and payload.get("trade_records"):
-        trades = payload["trade_records"]
-        if isinstance(trades, str):
-            trades = json.loads(trades)
+    raw_trades = payload.get("trade_records")
+    trades = raw_trades
+    if isinstance(trades, str):
+        trades = json.loads(trades)
 
-        ts_codes = sorted({t.get("ts_code") for t in trades if t.get("ts_code")})
-        if ts_codes:
-            start_date = payload["start_date"]
-            end_date = payload["end_date"]
-            kline_data: dict[str, list[dict[str, Any]]] = {}
-            for ts_code in ts_codes:
-                klines = await get_klines(session, ts_code, start_date, end_date)
-                kline_data[ts_code] = _serialize_kline_rows(klines)
-            payload["kline_data"] = kline_data
+    if trades:
+        all_ts_codes = sorted({t.get("ts_code") for t in trades if t.get("ts_code")})
+        if all_ts_codes:
+            names_result = await session.execute(
+                text(
+                    """
+                    SELECT ts_code, name FROM stock_basic
+                    WHERE ts_code = ANY(:ts_codes)
+                    """
+                ),
+                {"ts_codes": all_ts_codes},
+            )
+            payload["stock_names"] = {r["ts_code"]: r["name"] for r in names_result.mappings().all()}
+
+            if include_kline:
+                start_date = payload["start_date"]
+                end_date = payload["end_date"]
+                kline_data: dict[str, list[dict[str, Any]]] = {}
+                for ts_code in all_ts_codes:
+                    klines = await get_klines(session, ts_code, start_date, end_date)
+                    kline_data[ts_code] = _serialize_kline_rows(klines)
+                payload["kline_data"] = kline_data
 
     return payload
 

@@ -2,7 +2,7 @@ from datetime import date
 from decimal import Decimal
 import importlib.util
 import json
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -376,6 +376,78 @@ async def test_sync_fundamentals_allows_partial_failures(monkeypatch) -> None:
     assert calls == {"upsert": 1, "success": 1, "failure": 1, "alerts": 1}
 
 
+@pytest.mark.asyncio
+async def test_sync_fundamentals_commit_each_uses_per_stock_sessions(monkeypatch) -> None:
+    import app.data.stock_service as service
+
+    class Provider:
+        name = "eastmoney"
+
+        def fetch_stock_fundamentals(self, ts_codes, start_date, end_date):
+            if ts_codes == ["600000.SH"]:
+                raise RuntimeError("offline")
+            return [StockFundamental(ts_code=ts_codes[0], report_date=start_date, pe_ttm=Decimal("9"))]
+
+    class SessionFactory:
+        def __init__(self):
+            self.sessions: list[CaptureSession] = []
+
+        def __call__(self):
+            factory = self
+
+            class Context:
+                async def __aenter__(self):
+                    session = CaptureSession()
+                    factory.sessions.append(session)
+                    return session
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return None
+
+            return Context()
+
+    session_factory = SessionFactory()
+    calls = {"upsert": 0, "success": 0, "failure": 0, "alerts": 0}
+    progress: list[tuple[int, int, str]] = []
+
+    async def fake_upsert(_session, records):
+        calls["upsert"] += len(records)
+        return len(records)
+
+    async def fake_success(*_args, **_kwargs):
+        calls["success"] += 1
+
+    async def fake_failure(*_args, **_kwargs):
+        calls["failure"] += 1
+
+    async def fake_alert(*_args, **_kwargs):
+        calls["alerts"] += 1
+
+    monkeypatch.setattr(service, "async_session_factory", session_factory)
+    monkeypatch.setattr(service, "upsert_stock_fundamentals", fake_upsert)
+    monkeypatch.setattr(service, "record_update_success", fake_success)
+    monkeypatch.setattr(service, "record_update_failure", fake_failure)
+    monkeypatch.setattr(service, "create_alert", fake_alert)
+
+    result = await sync_fundamentals(
+        None,
+        ["000001.SZ", "600000.SH"],
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[Provider()],
+        progress_callback=lambda current, total, code: progress.append((current, total, code)),
+        commit_each=True,
+        concurrency=2,
+    )
+
+    assert result["requested_symbols"] == 2
+    assert result["inserted_or_updated"] == 1
+    assert result["failures"] == [{"ts_code": "600000.SH", "error": "eastmoney: offline"}]
+    assert calls == {"upsert": 1, "success": 1, "failure": 1, "alerts": 1}
+    assert progress == [(1, 2, "000001.SZ"), (2, 2, "600000.SH")]
+    assert [session.commits for session in session_factory.sessions] == [1, 1, 1]
+
+
 def test_fundamentals_task_writes_pending_task_run(monkeypatch) -> None:
     from app.api import tasks as task_api
 
@@ -384,6 +456,11 @@ def test_fundamentals_task_writes_pending_task_run(monkeypatch) -> None:
     async def override_session():
         yield fake_session
 
+    async def guard_noop(_session):
+        return None
+
+    monkeypatch.setattr(task_api, "_guard_fundamentals_sync", guard_noop)
+    monkeypatch.setattr(task_api, "get_full_kline_sync_concurrency", AsyncMock(return_value=2))
     monkeypatch.setattr(task_api, "uuid4", lambda: type("FakeUUID", (), {"hex": "task-456"})())
     apply_async = Mock()
     monkeypatch.setattr(task_api.sync_fundamentals_task, "apply_async", apply_async)
@@ -399,6 +476,6 @@ def test_fundamentals_task_writes_pending_task_run(monkeypatch) -> None:
     assert response.json() == {"task_id": "task-456", "status": "pending"}
     assert fake_session.params[0]["task_name"] == "sync_fundamentals"
     apply_async.assert_called_once_with(
-        kwargs={"ts_codes": ["000001.SZ"], "start_date": None, "end_date": None},
+        kwargs={"ts_codes": ["000001.SZ"], "start_date": None, "end_date": None, "concurrency": 2},
         task_id="task-456",
     )
