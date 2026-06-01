@@ -18,6 +18,7 @@ from app.data.repository import (
     record_update_success,
     upsert_stock_fundamentals,
 )
+from app.data.stock_scope import supported_stock_sql_condition
 from app.db.session import async_session_factory
 
 LOCAL_USER_ID = 1
@@ -820,10 +821,7 @@ async def _select_fundamental_codes(session: AsyncSession, limit: int = 100) -> 
             SELECT ts_code
             FROM stock_basic
             WHERE is_delisted = FALSE
-              AND market NOT IN ('科创板', '北交所')
-              AND ts_code NOT LIKE '920%.SH'
-              AND ts_code !~ '^200[0-9]{3}\\.SZ'
-              AND ts_code !~ '^900[0-9]{3}\\.SH'
+              AND """ + supported_stock_sql_condition() + """
             ORDER BY symbol
             LIMIT :limit
             """

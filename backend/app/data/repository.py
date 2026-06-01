@@ -9,6 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.models import DailyKline, StockBasic, StockFundamental, TradeCalendarDay
+from app.data.stock_scope import excluded_stock_sql_condition, supported_stock_sql_condition
 
 
 async def upsert_stock_basic(session: AsyncSession, records: list[StockBasic]) -> int:
@@ -63,6 +64,73 @@ async def backfill_stock_basic_market(session: AsyncSession) -> int:
         )
     )
     return getattr(result, "rowcount", 0) or 0
+
+
+async def delete_unsupported_stock_data(session: AsyncSession) -> dict[str, int]:
+    supported = supported_stock_sql_condition("stock_basic")
+    excluded = excluded_stock_sql_condition()
+    statements = [
+        (
+            "sim_trades",
+            "DELETE FROM sim_trades WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = sim_trades.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "sim_orders",
+            "DELETE FROM sim_orders WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = sim_orders.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "sim_positions",
+            "DELETE FROM sim_positions WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = sim_positions.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "signal_log",
+            "DELETE FROM signal_log WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = signal_log.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "scoring_rank",
+            "DELETE FROM scoring_rank WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = scoring_rank.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "factor_values",
+            "DELETE FROM factor_values WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = factor_values.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "stock_fundamentals",
+            "DELETE FROM stock_fundamentals WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = stock_fundamentals.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "watchlist",
+            "DELETE FROM watchlist WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = watchlist.ts_code AND "
+            + supported
+            + ")",
+        ),
+        (
+            "daily_kline",
+            "DELETE FROM daily_kline WHERE NOT EXISTS (SELECT 1 FROM stock_basic WHERE stock_basic.ts_code = daily_kline.ts_code AND "
+            + supported
+            + ")",
+        ),
+        ("stock_basic", "DELETE FROM stock_basic WHERE " + excluded),
+    ]
+    deleted: dict[str, int] = {}
+    for name, statement in statements:
+        result = await session.execute(text(statement))
+        deleted[name] = getattr(result, "rowcount", 0) or 0
+    return deleted
 
 
 async def upsert_trade_calendar(session: AsyncSession, records: list[TradeCalendarDay]) -> int:

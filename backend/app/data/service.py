@@ -12,12 +12,14 @@ from app.data.fetcher import DataProvider, default_providers, fetch_with_fallbac
 from app.data.repository import (
     backfill_stock_basic_market,
     create_alert,
+    delete_unsupported_stock_data,
     record_update_failure,
     record_update_success,
     upsert_daily_kline,
     upsert_stock_basic,
     upsert_trade_calendar,
 )
+from app.data.stock_scope import SUPPORTED_STOCK_SQL_CONDITION, is_supported_stock_basic
 from app.data.validators import validate_daily_kline, validate_stock_basic, validate_trade_calendar
 
 SAMPLE_STOCK_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -26,7 +28,6 @@ SAMPLE_STOCK_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("chinext", ("300", "301")),
     ("sh_main", ("600", "601")),
     ("sh_secondary", ("603", "605")),
-    ("star", ("688",)),
 )
 
 
@@ -94,6 +95,7 @@ async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> l
             FROM stock_basic
             WHERE is_delisted = FALSE
               AND symbol ~ '^[036][0-9]{5}$'
+              AND """ + SUPPORTED_STOCK_SQL_CONDITION + """
             ORDER BY symbol
             """
         ),
@@ -103,7 +105,11 @@ async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> l
 
 async def select_all_stock_codes(session: AsyncSession) -> list[str]:
     result = await session.execute(
-        text("SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE AND market NOT IN ('科创板', '北交所') AND ts_code NOT LIKE '920%.SH' AND ts_code !~ '^200[0-9]{3}\\.SZ' AND ts_code !~ '^900[0-9]{3}\\.SH' ORDER BY symbol")
+        text(
+            "SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE AND "
+            + SUPPORTED_STOCK_SQL_CONDITION
+            + " ORDER BY symbol"
+        )
     )
     return [row[0] for row in result.all()]
 
@@ -161,17 +167,17 @@ async def sync_stock_basic(
 ) -> dict[str, Any]:
     provider_list = providers or stock_basic_providers()
     source, records = fetch_with_fallback(provider_list, "fetch_stock_basic", proxy_url=get_data_proxy_url())
-    import re as _re
-    bshare_pat = _re.compile(r"^(200\d{3}\.SZ|900\d{3}\.SH)$")
     valid_records = []
     invalid_records = []
+    excluded_records = []
     for record in records:
         try:
             validate_stock_basic(record)
         except Exception as exc:
             invalid_records.append({"ts_code": record.ts_code, "error": str(exc)})
             continue
-        if bshare_pat.match(record.ts_code):
+        if not is_supported_stock_basic(record):
+            excluded_records.append({"ts_code": record.ts_code, "market": record.market, "exchange": record.exchange})
             continue
         valid_records.append(record)
 
@@ -191,6 +197,7 @@ async def sync_stock_basic(
 
     count = await upsert_stock_basic(session, valid_records)
     await backfill_stock_basic_market(session)
+    deleted = await delete_unsupported_stock_data(session)
     await record_update_success(session, "stock_basic", source)
     if invalid_records:
         await create_alert(
@@ -202,7 +209,14 @@ async def sync_stock_basic(
             payload={"invalid_records": invalid_records[:20]},
         )
     await session.commit()
-    return {"source": source, "inserted_or_updated": count, "skipped": len(invalid_records)}
+    return {
+        "source": source,
+        "inserted_or_updated": count,
+        "skipped": len(invalid_records) + len(excluded_records),
+        "skipped_invalid": len(invalid_records),
+        "skipped_excluded": len(excluded_records),
+        "deleted_unsupported": deleted,
+    }
 
 
 async def sync_trade_calendar(

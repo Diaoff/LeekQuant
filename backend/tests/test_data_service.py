@@ -187,7 +187,6 @@ async def test_select_sample_stock_codes_balances_across_code_segments() -> None
         ("601001.SH", "601001"),
         ("603000.SH", "603000"),
         ("605001.SH", "605001"),
-        ("688001.SH", "688001"),
     ]
 
     codes = await select_sample_stock_codes(StaticStockSession(rows), limit=6)
@@ -198,7 +197,7 @@ async def test_select_sample_stock_codes_balances_across_code_segments() -> None
         "300001.SZ",
         "600000.SH",
         "603000.SH",
-        "688001.SH",
+        "000002.SZ",
     ]
 
 
@@ -238,6 +237,10 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
         calls["backfill"] = calls.get("backfill", 0) + 1
         return 0
 
+    async def fake_delete_unsupported_stock_data(_session):
+        calls["delete"] = calls.get("delete", 0) + 1
+        return {"stock_basic": 0}
+
     async def fake_record_update_success(*_args, **_kwargs):
         calls["success"] += 1
 
@@ -246,13 +249,65 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
     monkeypatch.setattr(service, "backfill_stock_basic_market", fake_backfill_stock_basic_market)
+    monkeypatch.setattr(service, "delete_unsupported_stock_data", fake_delete_unsupported_stock_data)
     monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     result = await sync_stock_basic(FakeSession(), providers=[MixedProvider()])
 
-    assert result == {"source": "mixed", "inserted_or_updated": 1, "skipped": 1}
-    assert calls == {"stock": 1, "alerts": 1, "success": 1, "backfill": 1}
+    assert result == {
+        "source": "mixed",
+        "inserted_or_updated": 1,
+        "skipped": 1,
+        "skipped_invalid": 1,
+        "skipped_excluded": 0,
+        "deleted_unsupported": {"stock_basic": 0},
+    }
+    assert calls == {"stock": 1, "alerts": 1, "success": 1, "backfill": 1, "delete": 1}
+
+
+async def test_sync_stock_basic_skips_excluded_markets(monkeypatch) -> None:
+    import app.data.service as service
+
+    class MixedMarketProvider:
+        name = "mixed-market"
+
+        def fetch_stock_basic(self):
+            return [
+                StockBasic(ts_code="000001.SZ", symbol="000001", name="平安银行", market="主板", exchange="SZ"),
+                StockBasic(ts_code="688001.SH", symbol="688001", name="华兴源创", market="科创板", exchange="SH"),
+                StockBasic(ts_code="430001.BJ", symbol="430001", name="北交测试", market="北交所", exchange="BJ"),
+                StockBasic(ts_code="200001.SZ", symbol="200001", name="深B测试", market="主板", exchange="SZ"),
+                StockBasic(ts_code="900001.SH", symbol="900001", name="沪B测试", market="主板", exchange="SH"),
+            ]
+
+    captured = {"records": []}
+
+    async def fake_upsert_stock_basic(_session, records):
+        captured["records"] = records
+        return len(records)
+
+    async def fake_backfill_stock_basic_market(_session):
+        return 0
+
+    async def fake_delete_unsupported_stock_data(_session):
+        return {"stock_basic": 3, "daily_kline": 5}
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
+    monkeypatch.setattr(service, "backfill_stock_basic_market", fake_backfill_stock_basic_market)
+    monkeypatch.setattr(service, "delete_unsupported_stock_data", fake_delete_unsupported_stock_data)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+
+    result = await sync_stock_basic(FakeSession(), providers=[MixedMarketProvider()])
+
+    assert [record.ts_code for record in captured["records"]] == ["000001.SZ"]
+    assert result["inserted_or_updated"] == 1
+    assert result["skipped"] == 4
+    assert result["skipped_excluded"] == 4
+    assert result["deleted_unsupported"] == {"stock_basic": 3, "daily_kline": 5}
 
 
 async def test_sync_stock_basic_fails_when_all_rows_are_invalid(monkeypatch) -> None:

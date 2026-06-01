@@ -76,6 +76,7 @@ const taskNameLabels: Record<string, string> = {
   'match-pending-orders-daily': '待成交委托撮合',
   snapshot_nav_daily: '模拟账户净值快照',
   'snapshot-sim-nav-daily': '模拟账户净值快照',
+  realtime_risk_guard: '实时风控守护',
 }
 
 function displayTaskName(taskName: string): string {

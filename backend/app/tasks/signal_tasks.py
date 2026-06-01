@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy import text
 
 from app.backtest.adapter import BacktestContext, KBar
+from app.data.stock_scope import supported_stock_sql_condition
 from app.data.providers import DataProviderError
 from app.libs import MyTT
 from app.preferences.service import get_full_kline_sync_concurrency
@@ -145,10 +146,7 @@ async def _stock_codes(session) -> list[str]:
             WHERE sb.is_delisted = FALSE
               AND sb.is_st = FALSE
               AND (f.pe_ttm IS NULL OR f.pe_ttm > 0)
-              AND sb.market NOT IN ('科创板', '北交所')
-              AND sb.ts_code NOT LIKE '920%.SH'
-              AND sb.ts_code !~ '^200[0-9]{3}\\.SZ'
-              AND sb.ts_code !~ '^900[0-9]{3}\\.SH'
+              AND """ + supported_stock_sql_condition("sb") + """
             ORDER BY sb.symbol
             """
         )
