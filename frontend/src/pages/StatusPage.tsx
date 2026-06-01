@@ -1,6 +1,6 @@
 import React from 'react'
 import { Activity, AlertTriangle, CheckCircle2, Clock3, Database, Play, RefreshCw, Server, Table2, CalendarDays, Layers } from 'lucide-react'
-import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
+import { fetchJson, formatDate, formatDateTime, formatDuration, formatNumber } from '../lib/utils'
 
 type HealthState = 'checking' | 'ok' | 'error'
 type ActionKey = 'stock-basic' | 'trade-calendar' | 'sample-kline' | 'all-kline' | 'incremental-kline' | 'fundamentals'
@@ -393,7 +393,7 @@ export default function StatusPage() {
                       </td>
                       <td className="px-4 py-3"><span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${taskStatusClasses(task.status)}`}>{task.status}</span></td>
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{formatDateTime(task.started_at)}</td>
-                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{task.duration_ms === null ? '进行中' : `${task.duration_ms} ms`}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-muted">{formatDuration(task.duration_ms)}</td>
                     </tr>
                   )
                 })}

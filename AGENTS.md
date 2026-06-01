@@ -51,13 +51,17 @@ All 9 design docs are in `docs/`. The two most comprehensive:
 
 ## Development milestones (from docs)
 
-| Phase | Content | ~Duration |
+| Phase | Content | Status |
 |---|---|---|
-| M1 | Infra: PostgreSQL, data sources, K-line incremental pull | 1 week |
-| M2 | Stock pools, watchlists, strategy CRUD, Monaco Editor, Hikyuu backtest | 2 weeks |
-| M3 | 5-level signals, full sim trading engine (6 tables) | 2 weeks |
-| M4 | Multi-factor scoring, IC/IR analysis, real-time WebSocket push | 2 weeks |
-| M5 | NAV curves, parameter sensitivity, multi-account, docs | 1 week |
+| M0 | Skeleton: Docker Compose, PostgreSQL, Redis, FastAPI, React shell | ✅ Done |
+| M1 | Infra: PostgreSQL, data sources, K-line incremental pull | ✅ Done |
+| M2 | Watchlists, strategy CRUD, Monaco Editor | ✅ Done |
+| M3 | Strategy & backtest: Hikyuu async backtest, trade records | ✅ Done |
+| M4 | 5-level signals, full sim trading engine (6 tables) | ✅ Done |
+| M5 | Multi-factor scoring, IC/IR analysis | ✅ Done |
+| M6a | HTTP snapshot realtime: EastMoney HTTP, Redis Pub/Sub, WebSocket subscribe, frontend | ✅ Done |
+| M6b | WebSocket streaming: EastMoney WS push, task/signal WS channels, reconnect | Pending |
+| M7 | Polish: auth, stock pools, factor expression engine, weekly/monthly MV, monitoring, docs | Pending |
 
 ## Builds and tooling
 

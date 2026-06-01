@@ -51,11 +51,24 @@ def _extract_user_id(request: Request) -> int:
     return 1
 
 
+@router.delete("/clear")
+async def clear_signals(
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    user_id = _extract_user_id(req)
+    result = await session.execute(
+        text("DELETE FROM signal_log WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    )
+    await session.commit()
+    return {"deleted": result.rowcount}
+
+
 @router.get("")
 async def list_signals(
     req: Request,
     strategy_id: int | None = None,
-    account_id: int | None = None,
     ts_code: str | None = None,
     signal_type: str | None = None,
     start_date: date | None = None,
@@ -65,14 +78,11 @@ async def list_signals(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     user_id = _extract_user_id(req)
-    clauses = ["sl.user_id = :user_id"]
+    clauses = ["sl.user_id = :user_id", "sl.account_id IS NULL"]
     params: dict[str, Any] = {"user_id": user_id}
     if strategy_id is not None:
         clauses.append("sl.strategy_id = :strategy_id")
         params["strategy_id"] = strategy_id
-    if account_id is not None:
-        clauses.append("sl.account_id = :account_id")
-        params["account_id"] = account_id
     if ts_code:
         clauses.append("sl.ts_code = :ts_code")
         params["ts_code"] = ts_code.strip().upper()
@@ -114,13 +124,12 @@ async def list_signals(
         text(
             f"""
             SELECT sl.id, sl.user_id, sl.strategy_id, s.name AS strategy_name,
-                   sl.account_id, a.name AS account_name, sl.ts_code, sb.name AS stock_name,
+                   sl.ts_code, sb.name AS stock_name,
                    sl.trade_date, sl.signal_type, sl.target_position,
                    sl.current_position, sl.action, sl.confidence, sl.reason,
                    sl.snapshot, sl.created_at
             FROM signal_log sl
             LEFT JOIN strategies s ON s.id = sl.strategy_id
-            LEFT JOIN sim_accounts a ON a.id = sl.account_id
             LEFT JOIN stock_basic sb ON sb.ts_code = sl.ts_code
             WHERE {where_sql}
             ORDER BY sl.trade_date DESC, sl.created_at DESC, sl.id DESC

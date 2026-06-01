@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.cost import AShareCostCalculator, FeeConfig, build_fee_config
 from app.backtest.signals import SignalInput, apply_cn_rules, map_signal_to_action
+from app.data.providers import DataProviderError
+from app.realtime.providers import EastMoneyRealtimeProvider
 
 LOT_SIZE = 100
 MONEY_QUANT = Decimal("0.0001")
@@ -93,6 +95,162 @@ def serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_serialize_row(dict(row)) for row in rows]
 
 
+async def _realtime_prices(ts_codes: list[str]) -> tuple[dict[str, Decimal], str | None]:
+    if not ts_codes:
+        return {}, None
+    try:
+        ticks = await EastMoneyRealtimeProvider(ts_codes).fetch_snapshot()
+    except DataProviderError as exc:
+        return {}, str(exc)
+    return {tick.ts_code: tick.price for tick in ticks}, None
+
+
+def _apply_realtime_position_values(
+    positions: list[dict[str, Any]],
+    prices: dict[str, Decimal],
+) -> tuple[list[dict[str, Any]], Decimal, Decimal, bool]:
+    enriched: list[dict[str, Any]] = []
+    total_value = Decimal("0")
+    total_unrealized_pnl = Decimal("0")
+    has_realtime = False
+    for position in positions:
+        row = dict(position)
+        ts_code = str(row["ts_code"])
+        row["stock_name"] = row.get("stock_name") or ts_code
+        price = prices.get(ts_code)
+        if price is not None:
+            shares = int(row.get("shares") or 0)
+            avg_cost = _dec(row.get("avg_cost"))
+            market_value = _money(price * shares)
+            row["current_price"] = price
+            row["market_value"] = market_value
+            row["unrealized_pnl"] = _money((price - avg_cost) * shares)
+            row["profit_rate"] = ((price - avg_cost) / avg_cost).quantize(RATIO_QUANT) if avg_cost > 0 else Decimal("0")
+            row["valuation_source"] = "realtime"
+            has_realtime = True
+        else:
+            row["valuation_source"] = "stored"
+        total_value += _dec(row.get("market_value"))
+        total_unrealized_pnl += _dec(row.get("unrealized_pnl"))
+        enriched.append(row)
+    return enriched, _money(total_value), _money(total_unrealized_pnl), has_realtime
+
+
+async def enrich_account_with_realtime_valuation(
+    session: AsyncSession,
+    account: dict[str, Any],
+) -> dict[str, Any]:
+    positions = await _account_positions(session, int(account["id"]))
+    prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
+    enriched_positions, position_value, unrealized_pnl, has_realtime = _apply_realtime_position_values(positions, prices)
+    row = dict(account)
+    row["position_value"] = position_value
+    row["unrealized_pnl"] = unrealized_pnl
+    row["total_asset"] = _money(_dec(row.get("available_cash")) + _dec(row.get("frozen_cash")) + position_value)
+    baseline_asset = await _latest_nav_total_asset(session, int(account["id"]))
+    if baseline_asset and baseline_asset > 0:
+        row["today_pnl"] = _money(_dec(row["total_asset"]) - baseline_asset)
+        today_pnl_rate = ((_dec(row["total_asset"]) - baseline_asset) / baseline_asset).quantize(RATIO_QUANT)
+        row["today_pnl_rate"] = format(today_pnl_rate, "f")
+    else:
+        row["today_pnl"] = _money(Decimal("0"))
+        row["today_pnl_rate"] = "0.00000000"
+    row["valuation_source"] = "realtime" if has_realtime else "stored"
+    row["valuation_error"] = error
+    row["positions"] = serialize_rows(enriched_positions)
+    return _serialize_row(row)
+
+
+async def _latest_nav_total_asset(session: AsyncSession, account_id: int) -> Decimal | None:
+    result = await session.execute(
+        text(
+            """
+            SELECT total_asset
+            FROM sim_daily_nav
+            WHERE account_id = :account_id
+            ORDER BY nav_date DESC
+            LIMIT 1
+            """
+        ),
+        {"account_id": account_id},
+    )
+    row = result.mappings().one_or_none()
+    return _dec(row["total_asset"]) if row else None
+
+
+async def _account_positions(session: AsyncSession, account_id: int) -> list[dict[str, Any]]:
+    result = await session.execute(
+        text(
+            """
+            SELECT p.id, p.account_id, p.ts_code, COALESCE(sb.name, p.ts_code) AS stock_name,
+                   p.shares, p.available_shares, p.frozen_shares, p.avg_cost,
+                   p.current_price, p.market_value, p.unrealized_pnl, p.profit_rate,
+                   p.first_buy_date, p.updated_at
+            FROM sim_positions p
+            LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
+            WHERE p.account_id = :account_id
+            ORDER BY p.updated_at DESC, p.id DESC
+            """
+        ),
+        {"account_id": account_id},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+async def list_accounts_with_realtime_valuation(
+    session: AsyncSession,
+    user_id: int,
+    status_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    accounts = await list_accounts(session, user_id, status_filter)
+    enriched = [await enrich_account_with_realtime_valuation(session, account) for account in accounts]
+    return sorted(enriched, key=lambda account: _dec(account.get("total_asset")), reverse=True)
+
+
+async def get_account_with_realtime_valuation(
+    session: AsyncSession,
+    account_id: int,
+    user_id: int,
+) -> dict[str, Any]:
+    account = await get_account_or_404(session, account_id, user_id)
+    return await enrich_account_with_realtime_valuation(session, account)
+
+
+async def list_positions_with_realtime_valuation(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    account_id: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    await get_account_or_404(session, account_id, user_id)
+    limit = min(max(limit, 1), 500)
+    result = await session.execute(
+        text(
+            """
+            SELECT p.id, p.account_id, p.ts_code, COALESCE(sb.name, p.ts_code) AS stock_name,
+                   p.shares, p.available_shares, p.frozen_shares, p.avg_cost,
+                   p.current_price, p.market_value, p.unrealized_pnl, p.profit_rate,
+                   p.first_buy_date, p.updated_at
+            FROM sim_positions p
+            LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
+            WHERE p.account_id = :account_id
+            ORDER BY p.updated_at DESC, p.id DESC
+            LIMIT :limit
+            """
+        ),
+        {"account_id": account_id, "limit": limit},
+    )
+    positions = [dict(row) for row in result.mappings().all()]
+    prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
+    enriched, _position_value, _unrealized_pnl, _has_realtime = _apply_realtime_position_values(positions, prices)
+    serialized = serialize_rows(enriched)
+    if error:
+        for row in serialized:
+            row["valuation_error"] = error
+    return serialized
+
+
 async def get_account_or_404(session: AsyncSession, account_id: int, user_id: int) -> dict[str, Any]:
     result = await session.execute(
         text(
@@ -129,7 +287,7 @@ async def list_accounts(session: AsyncSession, user_id: int, status_filter: str 
             FROM sim_accounts a
             LEFT JOIN strategies s ON s.id = a.strategy_id
             WHERE {" AND ".join(clauses)}
-            ORDER BY a.updated_at DESC, a.id DESC
+            ORDER BY a.total_asset DESC, a.id DESC
             """
         ),
         params,
@@ -191,11 +349,12 @@ async def update_account(
     user_id: int,
     name: str | None = None,
     strategy_id: int | None = None,
+    strategy_id_provided: bool = False,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     existing = await get_account_or_404(session, account_id, user_id)
     new_name = name if name is not None else existing["name"]
-    new_strategy_id = strategy_id
+    new_strategy_id = strategy_id if strategy_id_provided else existing["strategy_id"]
     new_config: dict[str, Any] | None = None
     if config is not None:
         cur_config = existing.get("config")
@@ -228,6 +387,21 @@ async def update_account(
     row = dict(result.mappings().one())
     await session.commit()
     return _serialize_row(row)
+
+
+async def delete_account(
+    session: AsyncSession,
+    *,
+    account_id: int,
+    user_id: int,
+) -> bool:
+    await get_account_or_404(session, account_id, user_id)
+    result = await session.execute(
+        text("DELETE FROM sim_accounts WHERE id = :id AND user_id = :user_id"),
+        {"id": account_id, "user_id": user_id},
+    )
+    await session.commit()
+    return bool(result.rowcount)
 
 
 async def list_child_rows(
@@ -283,6 +457,28 @@ async def _get_kline(session: AsyncSession, ts_code: str, trade_date: date) -> d
     return dict(row) if row else None
 
 
+async def _get_latest_kline_before_or_on(session: AsyncSession, ts_code: str, trade_date: date) -> dict[str, Any] | None:
+    result = await session.execute(
+        text(
+            """
+            SELECT dk.ts_code, dk.trade_date, dk.open, dk.high, dk.low, dk.close,
+                   dk.pre_close, dk.is_suspended, dk.is_limit_up, dk.is_limit_down,
+                   sb.is_st, sb.market
+            FROM daily_kline dk
+            LEFT JOIN stock_basic sb ON sb.ts_code = dk.ts_code
+            WHERE dk.ts_code = :ts_code
+              AND dk.trade_date <= :trade_date
+              AND dk.close IS NOT NULL
+            ORDER BY dk.trade_date DESC
+            LIMIT 1
+            """
+        ),
+        {"ts_code": ts_code, "trade_date": trade_date},
+    )
+    row = result.mappings().one_or_none()
+    return dict(row) if row else None
+
+
 async def _get_position(session: AsyncSession, account_id: int, ts_code: str) -> dict[str, Any] | None:
     result = await session.execute(
         text("SELECT * FROM sim_positions WHERE account_id = :account_id AND ts_code = :ts_code"),
@@ -310,6 +506,15 @@ def _resolve_match_price(order: dict[str, Any], kline: dict[str, Any], match_mod
     if order_price < low or order_price > high:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="限价未触达")
     return order_price
+
+
+def _resolve_order_price_fallback(order: dict[str, Any]) -> Decimal:
+    if order.get("price") is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily kline not found and order price is missing")
+    price = _dec(order["price"])
+    if price <= 0:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="order price must be positive")
+    return price
 
 
 def _limit_rate(kline: dict[str, Any]) -> Decimal:
@@ -384,6 +589,10 @@ async def _insert_signal(
     return dict(result.mappings().one())
 
 
+def _strategy_signal_response(strategy_signal_id: int | None) -> dict[str, Any] | None:
+    return {"id": strategy_signal_id} if strategy_signal_id is not None else None
+
+
 async def generate_order_from_signal(
     session: AsyncSession,
     *,
@@ -391,6 +600,13 @@ async def generate_order_from_signal(
     account_id: int,
     request: SignalOrderRequest,
     exit_reason_override: str | None = None,
+    order_price_override: Decimal | None = None,
+    prevent_duplicate_sell_order: bool = False,
+    strategy_signal_id: int | None = None,
+    auto_commit: bool = True,
+    allow_missing_kline_with_order_price: bool = False,
+    auto_match: bool = False,
+    auto_match_mode: str = "close",
 ) -> dict[str, Any]:
     account = await get_account_or_404(session, account_id, user_id)
     if account["status"] != "active":
@@ -423,17 +639,21 @@ async def generate_order_from_signal(
     )
 
     if not calendar or not calendar["is_open"]:
-        signal = await _insert_signal(
-            session,
-            user_id=user_id,
-            account_id=account_id,
-            request=request,
-            current_position=current_position,
-            action="BLOCKED",
-            snapshot={**snapshot, "blocked_reason": "非交易日"},
-        )
-        await session.commit()
-        return {"signal": _serialize_row(signal), "order": None, "action": "BLOCKED", "reason": "非交易日"}
+        signal = _strategy_signal_response(strategy_signal_id)
+        if signal is None:
+            signal = await _insert_signal(
+                session,
+                user_id=user_id,
+                account_id=account_id,
+                request=request,
+                current_position=current_position,
+                action="BLOCKED",
+                snapshot={**snapshot, "blocked_reason": "非交易日"},
+            )
+            signal = _serialize_row(signal)
+        if auto_commit:
+            await session.commit()
+        return {"signal": signal, "order": None, "action": "BLOCKED", "reason": "非交易日"}
 
     kline = await _get_kline(session, request.ts_code, request.trade_date)
     if not kline or kline.get("close") is None:
@@ -447,7 +667,22 @@ async def generate_order_from_signal(
             prev_trade_date = prev_cal["pretrade_date"]
         kline = await _get_kline(session, request.ts_code, prev_trade_date)
     if not kline or kline.get("close") is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily kline not found")
+        kline = await _get_latest_kline_before_or_on(session, request.ts_code, request.trade_date)
+    if not kline or kline.get("close") is None:
+        if allow_missing_kline_with_order_price and order_price_override is not None:
+            kline = {
+                "ts_code": request.ts_code,
+                "trade_date": request.trade_date,
+                "close": order_price_override,
+                "pre_close": None,
+                "is_suspended": False,
+                "is_limit_up": False,
+                "is_limit_down": False,
+                "is_realtime_fallback": True,
+            }
+            snapshot["kline_fallback"] = "realtime_order_price"
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily kline not found")
 
     is_limit_up, is_limit_down = _computed_limit_flags(kline)
     action, blocked_reason = apply_cn_rules(
@@ -460,24 +695,29 @@ async def generate_order_from_signal(
     )
     if action in ("HOLD", "BLOCKED"):
         reason = blocked_reason or state.reason or "观望"
-        signal = await _insert_signal(
-            session,
-            user_id=user_id,
-            account_id=account_id,
-            request=request,
-            current_position=current_position,
-            action=action,
-            snapshot={**snapshot, "blocked_reason": blocked_reason} if blocked_reason else snapshot,
-        )
-        await session.commit()
-        return {"signal": _serialize_row(signal), "order": None, "action": action, "reason": reason}
+        signal = _strategy_signal_response(strategy_signal_id)
+        if signal is None:
+            signal = await _insert_signal(
+                session,
+                user_id=user_id,
+                account_id=account_id,
+                request=request,
+                current_position=current_position,
+                action=action,
+                snapshot={**snapshot, "blocked_reason": blocked_reason} if blocked_reason else snapshot,
+            )
+            signal = _serialize_row(signal)
+        if auto_commit:
+            await session.commit()
+        return {"signal": signal, "order": None, "action": action, "reason": reason}
 
-    price = _dec(kline["close"])
+    price = _money(_dec(order_price_override)) if order_price_override is not None else _dec(kline["close"])
     target_position = _dec(state.target_position)
     target_value = _money(total_asset * target_position)
     direction = "买入" if action == "BUY" else "卖出"
     frozen_amount = Decimal("0")
     volume = 0
+    no_order_reason: str | None = None
 
     if direction == "买入":
         delta_value = max(target_value - market_value, Decimal("0"))
@@ -493,7 +733,7 @@ async def generate_order_from_signal(
                 break
             volume -= LOT_SIZE
         if volume < LOT_SIZE:
-            blocked_reason = "委托数量不足100股"
+            no_order_reason = "目标买入金额或可用资金不足一手，未下单"
     else:
         if not position or int(position["available_shares"]) <= 0:
             blocked_reason = "无可用持仓"
@@ -506,28 +746,81 @@ async def generate_order_from_signal(
             if volume < LOT_SIZE:
                 blocked_reason = "委托数量不足100股"
 
+    if no_order_reason:
+        signal = _strategy_signal_response(strategy_signal_id)
+        if signal is None:
+            signal = await _insert_signal(
+                session,
+                user_id=user_id,
+                account_id=account_id,
+                request=replace(request, reason=no_order_reason),
+                current_position=current_position,
+                action="HOLD",
+                snapshot={**snapshot, "no_order_reason": no_order_reason},
+            )
+            signal = _serialize_row(signal)
+        if auto_commit:
+            await session.commit()
+        return {"signal": signal, "order": None, "action": "HOLD", "reason": no_order_reason}
+
     if blocked_reason:
-        signal = await _insert_signal(
+        signal = _strategy_signal_response(strategy_signal_id)
+        if signal is None:
+            signal = await _insert_signal(
+                session,
+                user_id=user_id,
+                account_id=account_id,
+                request=request,
+                current_position=current_position,
+                action="BLOCKED",
+                snapshot={**snapshot, "blocked_reason": blocked_reason},
+            )
+            signal = _serialize_row(signal)
+        if auto_commit:
+            await session.commit()
+        return {"signal": signal, "order": None, "action": "BLOCKED", "reason": blocked_reason}
+
+    if direction == "卖出" and prevent_duplicate_sell_order:
+        pending_result = await session.execute(
+            text(
+                """
+                SELECT id
+                FROM sim_orders
+                WHERE account_id = :account_id
+                  AND ts_code = :ts_code
+                  AND direction = '卖出'
+                  AND status IN ('待成交', '部分成交')
+                ORDER BY submit_time DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"account_id": account_id, "ts_code": request.ts_code},
+        )
+        pending_order = pending_result.mappings().one_or_none()
+        if pending_order is not None:
+            if auto_commit:
+                await session.commit()
+            return {
+                "signal": _strategy_signal_response(strategy_signal_id),
+                "order": _serialize_row(dict(pending_order)),
+                "action": "HOLD",
+                "reason": "已有待成交卖出委托",
+            }
+
+    order_signal_id = strategy_signal_id
+    order_signal = None
+    if order_signal_id is None:
+        signal_row = await _insert_signal(
             session,
             user_id=user_id,
             account_id=account_id,
             request=request,
             current_position=current_position,
-            action="BLOCKED",
-            snapshot={**snapshot, "blocked_reason": blocked_reason},
+            action=action,
+            snapshot=snapshot,
         )
-        await session.commit()
-        return {"signal": _serialize_row(signal), "order": None, "action": "BLOCKED", "reason": blocked_reason}
-
-    signal = await _insert_signal(
-        session,
-        user_id=user_id,
-        account_id=account_id,
-        request=request,
-        current_position=current_position,
-        action=action,
-        snapshot=snapshot,
-    )
+        order_signal_id = int(signal_row["id"])
+        order_signal = _serialize_row(signal_row)
     result = await session.execute(
         text(
             """
@@ -543,7 +836,7 @@ async def generate_order_from_signal(
         ),
         {
             "account_id": account_id,
-            "signal_id": signal["id"],
+            "signal_id": order_signal_id,
             "ts_code": request.ts_code,
             "direction": direction,
             "price": price,
@@ -571,7 +864,7 @@ async def generate_order_from_signal(
                 """
                 INSERT INTO sim_cash_flow (account_id, flow_type, amount, balance_after, remark)
                 VALUES (
-                    :account_id, '冻结', -:amount,
+                    :account_id, '冻结', -CAST(:amount AS NUMERIC),
                     (SELECT available_cash FROM sim_accounts WHERE id = :account_id),
                     :remark
                 )
@@ -593,8 +886,22 @@ async def generate_order_from_signal(
             {"account_id": account_id, "ts_code": request.ts_code, "volume": volume},
         )
 
-    await session.commit()
-    return {"signal": _serialize_row(signal), "order": _serialize_row(order), "action": action, "reason": ""}
+    match_result: dict[str, Any] | None = None
+    if auto_match:
+        match_result = await match_order(
+            session,
+            user_id=user_id,
+            order_id=int(order["id"]),
+            trade_date=request.trade_date,
+            match_mode=auto_match_mode,
+            auto_commit=auto_commit,
+        )
+    elif auto_commit:
+        await session.commit()
+    response = {"signal": order_signal, "order": _serialize_row(order), "action": action, "reason": ""}
+    if match_result is not None:
+        response["match"] = match_result
+    return response
 
 
 async def match_order(
@@ -604,6 +911,7 @@ async def match_order(
     order_id: int,
     trade_date: date | None = None,
     match_mode: str = "close",
+    auto_commit: bool = True,
 ) -> dict[str, Any]:
     if match_mode not in {"close", "open", "limit"}:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid match_mode")
@@ -616,7 +924,7 @@ async def match_order(
             LEFT JOIN user_preferences p
               ON p.user_id = a.user_id AND p.key = 'trading_fee'
             WHERE o.id = :order_id AND a.user_id = :user_id
-            FOR UPDATE
+            FOR UPDATE OF o, a
             """
         ),
         {"order_id": order_id, "user_id": user_id},
@@ -633,23 +941,26 @@ async def match_order(
     if not calendar or not calendar["is_open"]:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="非交易日")
     kline = await _get_kline(session, order["ts_code"], match_date)
+    match_mode_used = match_mode
     if not kline or kline.get("close") is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily kline not found")
-    is_limit_up, is_limit_down = _computed_limit_flags(kline)
-    action, reason = apply_cn_rules(
-        "BUY" if order["direction"] == "买入" else "SELL_ALL",
-        is_suspended=bool(kline.get("is_suspended")),
-        is_limit_up=is_limit_up,
-        is_limit_down=is_limit_down,
-    )
-    if action == "BLOCKED":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
+        price = _resolve_order_price_fallback(order)
+        match_mode_used = "order_price_fallback"
+    else:
+        is_limit_up, is_limit_down = _computed_limit_flags(kline)
+        action, reason = apply_cn_rules(
+            "BUY" if order["direction"] == "买入" else "SELL_ALL",
+            is_suspended=bool(kline.get("is_suspended")),
+            is_limit_up=is_limit_up,
+            is_limit_down=is_limit_down,
+        )
+        if action == "BLOCKED":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
+        price = _resolve_match_price(order, kline, match_mode)
 
     account_id = int(order["account_id"])
     ts_code = str(order["ts_code"])
     direction = str(order["direction"])
     volume = int(order["volume"]) - int(order["filled_volume"])
-    price = _resolve_match_price(order, kline, match_mode)
     amount = _money(price * Decimal(volume))
     fees = AShareCostCalculator(_fee_config(order.get("config"), _global_fee_config(order))).calculate(direction, amount)
 
@@ -741,8 +1052,8 @@ async def match_order(
                 UPDATE sim_positions
                 SET shares = shares - :volume,
                     frozen_shares = frozen_shares - :volume,
-                    current_price = :price,
-                    market_value = (shares - :volume) * :price,
+                    current_price = CAST(:price AS NUMERIC),
+                    market_value = (shares - :volume) * CAST(:price AS NUMERIC),
                     available_shares = LEAST(available_shares, shares - :volume),
                     updated_at = NOW()
                 WHERE account_id = :account_id AND ts_code = :ts_code
@@ -800,7 +1111,7 @@ async def match_order(
                 """
                 INSERT INTO sim_cash_flow (account_id, related_trade_id, flow_type, amount, balance_after, remark)
                 VALUES (
-                    :account_id, :trade_id, '手续费', -:amount,
+                    :account_id, :trade_id, '手续费', -CAST(:amount AS NUMERIC),
                     (SELECT available_cash FROM sim_accounts WHERE id = :account_id),
                     :remark
                 )
@@ -810,8 +1121,9 @@ async def match_order(
         )
 
     await refresh_account_assets(session, account_id=account_id)
-    await session.commit()
-    return {"trade": _serialize_row(trade), "status": "全部成交"}
+    if auto_commit:
+        await session.commit()
+    return {"trade": _serialize_row(trade), "status": "全部成交", "match_mode_used": match_mode_used}
 
 
 async def cancel_order(session: AsyncSession, *, user_id: int, order_id: int) -> dict[str, Any]:
@@ -989,26 +1301,33 @@ async def check_stop_conditions(session: AsyncSession, *, account_id: int, nav_d
 
 async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int:
     calendar = await _get_trade_calendar(session, trade_date)
-    if not calendar or not calendar["is_open"] or not calendar.get("pretrade_date"):
+    if not calendar or not calendar["is_open"]:
         return 0
-    prev_date = calendar["pretrade_date"]
     result = await session.execute(
         text(
             """
-            WITH buy_trades AS (
+            WITH today_buys AS (
                 SELECT account_id, ts_code, SUM(volume)::INTEGER AS volume
                 FROM sim_trades
-                WHERE direction = '买入' AND trade_time::DATE = :prev_date
+                WHERE direction = '买入' AND trade_time::DATE = :trade_date
                 GROUP BY account_id, ts_code
+            ),
+            sellable AS (
+                SELECT p.id,
+                       GREATEST(0, p.shares - p.frozen_shares - COALESCE(tb.volume, 0))::INTEGER AS expected_available
+                FROM sim_positions p
+                LEFT JOIN today_buys tb
+                  ON tb.account_id = p.account_id AND tb.ts_code = p.ts_code
             )
             UPDATE sim_positions p
-            SET available_shares = LEAST(p.shares, p.available_shares + b.volume),
+            SET available_shares = s.expected_available,
                 updated_at = NOW()
-            FROM buy_trades b
-            WHERE p.account_id = b.account_id AND p.ts_code = b.ts_code
+            FROM sellable s
+            WHERE p.id = s.id
+              AND p.available_shares <> s.expected_available
             """
         ),
-        {"prev_date": prev_date},
+        {"trade_date": trade_date},
     )
     await session.commit()
     return int(result.rowcount or 0)

@@ -597,6 +597,130 @@ def sample_backtest_config(**kwargs):
 
 
 @pytest.mark.backtest
+class TestBacktestSignalPriority:
+    """Test same-day multi-stock signal ordering."""
+
+    def test_confidence_orders_buy_signals_before_stock_pool_order(self):
+        strategy = '''
+def generate_signal(ctx):
+    if ctx.close[-1] == 10.1:
+        return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.30}
+    return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.90}
+'''
+        config = sample_backtest_config(
+            source_code=strategy,
+            stock_pool=["000001.SZ", "000002.SZ"],
+            initial_cash=Decimal("20000"),
+        )
+        runner = BacktestRunner(config)
+        result = runner.run({
+            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+        })
+
+        assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
+        buy_signals = [s for s in runner.signals if s["action"] == "BUY"]
+        assert buy_signals[0]["buy_priority_source"] == "confidence"
+        assert buy_signals[0]["buy_priority_score"] == "0.9"
+
+    def test_factor_score_orders_buy_signals_without_confidence(self):
+        strategy = '''
+def generate_signal(ctx):
+    return {"signal_type": "买入", "target_position": 0.4}
+'''
+        trade_date = date(2026, 5, 1)
+        config = sample_backtest_config(
+            source_code=strategy,
+            stock_pool=["000001.SZ", "000002.SZ"],
+            initial_cash=Decimal("20000"),
+            factor_scores_by_date={
+                trade_date: {
+                    "000001.SZ": {"total_score": Decimal("0.20"), "rank": 2},
+                    "000002.SZ": {"total_score": Decimal("0.95"), "rank": 1},
+                }
+            },
+        )
+        runner = BacktestRunner(config)
+        result = runner.run({
+            "000001.SZ": generate_klines("000001.SZ", days=1),
+            "000002.SZ": generate_klines("000002.SZ", days=1),
+        })
+
+        assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
+        assert runner.signals[0]["factor_rank"] == 1
+
+    def test_confidence_source_precedes_factor_score_source(self):
+        strategy = '''
+def generate_signal(ctx):
+    if ctx.close[-1] == 10.1:
+        return {"signal_type": "买入", "target_position": 0.4}
+    return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.10}
+'''
+        trade_date = date(2026, 5, 1)
+        config = sample_backtest_config(
+            source_code=strategy,
+            stock_pool=["000001.SZ", "000002.SZ"],
+            initial_cash=Decimal("20000"),
+            factor_scores_by_date={
+                trade_date: {
+                    "000001.SZ": {"total_score": Decimal("0.99"), "rank": 1},
+                }
+            },
+        )
+        runner = BacktestRunner(config)
+        result = runner.run({
+            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+        })
+
+        assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
+
+    def test_sell_signals_execute_before_buys(self):
+        strategy = '''
+def generate_signal(ctx):
+    if ctx.close[-1] == 10.1:
+        return {"signal_type": "卖出", "current_position": 0.5}
+    return {"signal_type": "买入", "target_position": 1.0, "confidence": 1.0}
+'''
+        config = sample_backtest_config(
+            source_code=strategy,
+            stock_pool=["000001.SZ", "000002.SZ"],
+            initial_cash=Decimal("1000"),
+        )
+        runner = BacktestRunner(config)
+        runner.positions["000001.SZ"] = Position(ts_code="000001.SZ", shares=1000, avg_cost=Decimal("10"))
+        runner._entry_dates["000001.SZ"] = date(2026, 4, 30)
+        result = runner.run({
+            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+        })
+
+        assert [t["direction"] for t in result["trade_records"][:2]] == ["全部卖出", "买入"]
+        assert result["trade_records"][1]["ts_code"] == "000002.SZ"
+
+    def test_tiebreakers_use_target_position_then_ts_code(self):
+        strategy = '''
+def generate_signal(ctx):
+    if ctx.close[-1] == 10.3:
+        return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.5}
+    return {"signal_type": "买入", "target_position": 0.2, "confidence": 0.5}
+'''
+        config = sample_backtest_config(
+            source_code=strategy,
+            stock_pool=["000002.SZ", "000001.SZ", "000003.SZ"],
+            initial_cash=Decimal("100000"),
+        )
+        runner = BacktestRunner(config)
+        result = runner.run({
+            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
+            "000003.SZ": generate_klines("000003.SZ", days=1, base_price=10.3),
+        })
+
+        assert [t["ts_code"] for t in result["trade_records"]] == ["000003.SZ", "000001.SZ", "000002.SZ"]
+
+
+@pytest.mark.backtest
 class TestCandlePathInference:
     """Test K线内价格路径推断（借鉴 QuantDinger）。"""
 

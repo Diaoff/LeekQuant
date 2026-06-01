@@ -136,7 +136,15 @@ cp .env.example .env
 ```bash
 docker compose up -d
 ```
-这将启动 6 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`frontend`
+这将启动 7 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`frontend`、`realtime_risk_guard`。
+
+模拟盘实时止盈/止损依赖 `realtime_risk_guard` 后台进程。使用本地脚本启动时请带上 Celery 组件：
+
+```bash
+./restart.sh --with-celery
+```
+
+实时风控日志位于 `.logs/realtime-risk-guard.log`，达到阈值但未下单时会记录阻断原因。
 
 ### 4️⃣ 访问应用
 | 服务 | 地址 |

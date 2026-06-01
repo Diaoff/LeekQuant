@@ -3,8 +3,10 @@ from decimal import Decimal
 
 from fastapi.testclient import TestClient
 
+from app.data.providers import DataProviderError
 from app.db.session import get_session
 from app.main import app
+from app.realtime.models import RealtimeTick
 
 
 class FakeResult:
@@ -68,8 +70,6 @@ def test_signals_api_returns_paginated_stable_shape():
                         "user_id": 1,
                         "strategy_id": 2,
                         "strategy_name": "策略",
-                        "account_id": 3,
-                        "account_name": "模拟",
                         "ts_code": "000001.SZ",
                         "stock_name": "平安银行",
                         "trade_date": date(2026, 5, 21),
@@ -93,7 +93,7 @@ def test_signals_api_returns_paginated_stable_shape():
     app.dependency_overrides[get_session] = override_session
     try:
         client = TestClient(app)
-        response = client.get("/api/signals?account_id=3&signal_type=买入&page_size=10")
+        response = client.get("/api/signals?signal_type=买入&page_size=10")
     finally:
         app.dependency_overrides.clear()
 
@@ -102,7 +102,10 @@ def test_signals_api_returns_paginated_stable_shape():
     assert body["total"] == 1
     assert body["summary"]["buy_count"] == 1
     assert body["items"][0]["target_position"] == "1.000000"
-    assert "sl.account_id = :account_id" in fake_session.statements[0]
+    assert "sl.account_id IS NULL" in fake_session.statements[0]
+    assert "sl.account_id IS NULL" in fake_session.statements[1]
+    assert "sl.account_id IS NULL" in fake_session.statements[2]
+    assert "sl.account_id = :account_id" not in fake_session.statements[0]
     assert fake_session.params[2]["limit"] == 10
 
 
@@ -146,6 +149,454 @@ def test_create_sim_account_initializes_cash_fields():
     assert body["available_cash"] == "100000.0000"
     assert body["total_asset"] == "100000.0000"
     assert fake_session.params[0]["initial_cash"] == Decimal("100000.0000")
+    assert fake_session.commits == 1
+
+
+def _patch_account_fake_session():
+    existing_row = {
+        "id": 1,
+        "user_id": 1,
+        "strategy_id": 7,
+        "name": "M4",
+        "initial_cash": Decimal("100000.0000"),
+        "available_cash": Decimal("100000.0000"),
+        "frozen_cash": Decimal("0.0000"),
+        "total_asset": Decimal("100000.0000"),
+        "status": "active",
+        "config": {"risk_config": {"max_position_pct": 0.5}, "fee_config": {"commission_rate": 0.00025}},
+        "created_at": date(2026, 5, 21),
+        "updated_at": date(2026, 5, 21),
+        "user_trading_fee_config": None,
+    }
+    updated_row = {
+        **existing_row,
+        "updated_at": date(2026, 5, 22),
+    }
+    return FakeSession([FakeResult([existing_row]), FakeResult([updated_row])])
+
+
+def _patch_account(body):
+    fake_session = _patch_account_fake_session()
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.patch("/api/sim/accounts/1", json=body)
+    finally:
+        app.dependency_overrides.clear()
+
+    return response, fake_session
+
+
+def test_patch_sim_account_config_keeps_bound_strategy_when_strategy_id_missing():
+    response, fake_session = _patch_account({"config": {"risk_config": {"max_position_pct": 0.8}}})
+
+    assert response.status_code == 200
+    assert fake_session.params[1]["strategy_id"] == 7
+    assert fake_session.params[1]["name"] == "M4"
+    assert fake_session.params[1]["config"] == (
+        '{"risk_config": {"max_position_pct": 0.8}, "fee_config": {"commission_rate": 0.00025}}'
+    )
+    assert fake_session.commits == 1
+
+
+def test_patch_sim_account_strategy_id_null_unbinds_strategy():
+    response, fake_session = _patch_account({"strategy_id": None})
+
+    assert response.status_code == 200
+    assert fake_session.params[1]["strategy_id"] is None
+    assert fake_session.params[1]["config"] is None
+
+
+def test_patch_sim_account_strategy_id_binds_strategy():
+    response, fake_session = _patch_account({"strategy_id": 2})
+
+    assert response.status_code == 200
+    assert fake_session.params[1]["strategy_id"] == 2
+    assert fake_session.params[1]["config"] is None
+
+
+def test_patch_sim_account_strategy_id_and_config_update_together():
+    response, fake_session = _patch_account(
+        {"strategy_id": 2, "config": {"risk_config": {"stop_loss_pct": 0.08}}}
+    )
+
+    assert response.status_code == 200
+    assert fake_session.params[1]["strategy_id"] == 2
+    assert fake_session.params[1]["config"] == (
+        '{"risk_config": {"stop_loss_pct": 0.08}, "fee_config": {"commission_rate": 0.00025}}'
+    )
+
+
+def test_sim_account_list_uses_realtime_prices_for_total_asset(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        return [RealtimeTick(ts_code="000001.SZ", price=Decimal("12.0000"))]
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("1000.0000"),
+                        "frozen_cash": Decimal("200.0000"),
+                        "total_asset": Decimal("11200.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "strategy_name": None,
+                    }
+                ]
+            ),
+            FakeResult(
+                [
+                    {
+                        "id": 9,
+                        "account_id": 1,
+                        "ts_code": "000001.SZ",
+                        "stock_name": "平安银行",
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("10.0000"),
+                        "market_value": Decimal("10000.0000"),
+                        "unrealized_pnl": Decimal("0.0000"),
+                        "profit_rate": Decimal("0.00000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([{"total_asset": Decimal("12000.0000")}]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["position_value"] == "12000.0000"
+    assert body[0]["unrealized_pnl"] == "2000.0000"
+    assert body[0]["today_pnl"] == "1200.0000"
+    assert body[0]["today_pnl_rate"] == "0.10000000"
+    assert body[0]["total_asset"] == "13200.0000"
+    assert body[0]["valuation_source"] == "realtime"
+    assert body[0]["positions"][0]["stock_name"] == "平安银行"
+    assert body[0]["positions"][0]["current_price"] == "12.0000"
+    assert body[0]["positions"][0]["market_value"] == "12000.0000"
+    assert body[0]["positions"][0]["unrealized_pnl"] == "2000.0000"
+    assert body[0]["positions"][0]["profit_rate"] == "0.20000000"
+
+
+def test_sim_account_list_sorts_by_realtime_total_asset_desc(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        return [
+            RealtimeTick(ts_code="000001.SZ", price=Decimal("12.0000")),
+            RealtimeTick(ts_code="600000.SH", price=Decimal("20.0000")),
+        ]
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "Low",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("1000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("500000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "strategy_name": None,
+                    },
+                    {
+                        "id": 2,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "High",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("2000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("100000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "strategy_name": None,
+                    },
+                ]
+            ),
+            FakeResult(
+                [
+                    {
+                        "id": 9,
+                        "account_id": 1,
+                        "ts_code": "000001.SZ",
+                        "stock_name": "平安银行",
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("10.0000"),
+                        "market_value": Decimal("10000.0000"),
+                        "unrealized_pnl": Decimal("0.0000"),
+                        "profit_rate": Decimal("0.00000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([]),
+            FakeResult(
+                [
+                    {
+                        "id": 10,
+                        "account_id": 2,
+                        "ts_code": "600000.SH",
+                        "stock_name": "浦发银行",
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("10.0000"),
+                        "market_value": Decimal("10000.0000"),
+                        "unrealized_pnl": Decimal("0.0000"),
+                        "profit_rate": Decimal("0.00000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [account["name"] for account in body] == ["High", "Low"]
+    assert [account["total_asset"] for account in body] == ["22000.0000", "13000.0000"]
+    assert "ORDER BY a.total_asset DESC, a.id DESC" in fake_session.statements[0]
+
+
+def test_sim_positions_endpoint_uses_realtime_prices(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        return [RealtimeTick(ts_code="000001.SZ", price=Decimal("8.5000"))]
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("1000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("11000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "user_trading_fee_config": None,
+                    }
+                ]
+            ),
+            FakeResult(
+                [
+                    {
+                        "id": 9,
+                        "account_id": 1,
+                        "ts_code": "000001.SZ",
+                        "stock_name": "平安银行",
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("10.0000"),
+                        "market_value": Decimal("10000.0000"),
+                        "unrealized_pnl": Decimal("0.0000"),
+                        "profit_rate": Decimal("0.00000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([{"total_asset": Decimal("12200.0000")}]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts/1/positions")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["stock_name"] == "平安银行"
+    assert body[0]["current_price"] == "8.5000"
+    assert body[0]["market_value"] == "8500.0000"
+    assert body[0]["unrealized_pnl"] == "-1500.0000"
+    assert body[0]["profit_rate"] == "-0.15000000"
+    assert body[0]["valuation_source"] == "realtime"
+
+
+def test_sim_account_list_falls_back_to_stored_valuation_on_realtime_error(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        raise DataProviderError("行情接口超时")
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("1000.0000"),
+                        "frozen_cash": Decimal("200.0000"),
+                        "total_asset": Decimal("11200.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "strategy_name": None,
+                    }
+                ]
+            ),
+            FakeResult(
+                [
+                    {
+                        "id": 9,
+                        "account_id": 1,
+                        "ts_code": "000001.SZ",
+                        "stock_name": None,
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("11.0000"),
+                        "market_value": Decimal("11000.0000"),
+                        "unrealized_pnl": Decimal("1000.0000"),
+                        "profit_rate": Decimal("0.10000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([{"total_asset": Decimal("12200.0000")}]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["position_value"] == "11000.0000"
+    assert body[0]["unrealized_pnl"] == "1000.0000"
+    assert body[0]["today_pnl"] == "0.0000"
+    assert body[0]["today_pnl_rate"] == "0.00000000"
+    assert body[0]["total_asset"] == "12200.0000"
+    assert body[0]["valuation_source"] == "stored"
+    assert body[0]["valuation_error"] == "行情接口超时"
+    assert body[0]["positions"][0]["stock_name"] == "000001.SZ"
+
+
+def test_delete_sim_account_deletes_owned_account():
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("100000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("100000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "user_trading_fee_config": None,
+                    }
+                ]
+            ),
+            FakeResult([]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.delete("/api/sim/accounts/1")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+    assert "DELETE FROM sim_accounts" in fake_session.statements[1]
+    assert fake_session.params[1] == {"id": 1, "user_id": 1}
     assert fake_session.commits == 1
 
 

@@ -135,7 +135,7 @@ def fetch_with_fallback(
         raise DataProviderError(f"no enabled providers support {capability or method_name}")
     with _data_proxy_ctx(proxy_url):
         for provider in provider_list:
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     records = _try_once(provider, method_name, args)
                     if records:
@@ -144,8 +144,8 @@ def fetch_with_fallback(
                     break
                 except _RETRYABLE as exc:
                     msg = f"{provider.name}: {exc}"
-                    if attempt == 0:
-                        time.sleep(1)
+                    if attempt < 2:
+                        time.sleep(1 + attempt)
                         continue
                     errors.append(msg)
                     break

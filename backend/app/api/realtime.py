@@ -5,11 +5,14 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.providers import DataProviderError
+from app.db.session import get_session
 from app.realtime.bus import RealtimeBus, RealtimeSubscription, RealtimeUnavailable, get_realtime_bus
 from app.realtime.models import normalize_ts_code
 from app.realtime.providers import EastMoneyRealtimeProvider
+from app.realtime.risk_guard import get_risk_guard_status
 
 router = APIRouter(tags=["realtime"])
 logger = logging.getLogger(__name__)
@@ -53,6 +56,13 @@ async def realtime_snapshot(ts_codes: str) -> dict[str, Any]:
     except DataProviderError as exc:
         return {"items": [], "errors": [str(exc)]}
     return {"items": [tick.to_payload() for tick in ticks], "errors": []}
+
+
+@router.get("/api/realtime/risk-guard/status")
+async def realtime_risk_guard_status(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    return await get_risk_guard_status(session)
 
 
 async def _pump_ticks(

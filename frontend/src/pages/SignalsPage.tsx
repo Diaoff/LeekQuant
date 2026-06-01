@@ -1,12 +1,11 @@
 import React from 'react'
-import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal, Zap } from 'lucide-react'
+import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal, Trash2, Zap } from 'lucide-react'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
 interface SignalLog {
   id: number
   strategy_name: string | null
-  account_name: string | null
   ts_code: string
   stock_name: string | null
   trade_date: string
@@ -68,13 +67,12 @@ export default function SignalsPage() {
   const [selected, setSelected] = React.useState<SignalLog | null>(null)
   const [triggering, setTriggering] = React.useState(false)
   const [triggerMsg, setTriggerMsg] = React.useState<string | null>(null)
+  const [clearing, setClearing] = React.useState(false)
 
   const [strategies, setStrategies] = React.useState<{ id: number; name: string }[]>([])
-  const [accounts, setAccounts] = React.useState<{ id: number; name: string }[]>([])
 
   React.useEffect(() => {
     void fetchJson<{ id: number; name: string }[]>('/api/strategies').then(setStrategies).catch(() => {})
-    void fetchJson<{ id: number; name: string }[]>('/api/sim/accounts').then(setAccounts).catch(() => {})
   }, [])
 
   const [filters, setFilters] = React.useState({
@@ -83,7 +81,6 @@ export default function SignalsPage() {
     start_date: '',
     end_date: '',
     strategy_id: '',
-    account_id: '',
   })
 
   const loadSignals = React.useCallback(async () => {
@@ -120,6 +117,19 @@ export default function SignalsPage() {
     }
   }, [loadSignals])
 
+  const clearSignals = React.useCallback(async () => {
+    if (!window.confirm('确定清空所有信号？此操作不可撤销。')) return
+    setClearing(true)
+    try {
+      await fetchJson('/api/signals/clear', { method: 'DELETE' })
+      void loadSignals()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setClearing(false)
+    }
+  }, [loadSignals])
+
   React.useEffect(() => {
     void loadSignals()
   }, [loadSignals])
@@ -148,6 +158,15 @@ export default function SignalsPage() {
           </button>
           <button
             type="button"
+            onClick={() => void clearSignals()}
+            disabled={clearing}
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 text-sm text-red-700 hover:bg-red-100 disabled:opacity-50"
+          >
+            <Trash2 className={`h-4 w-4 ${clearing ? 'animate-pulse' : ''}`} />
+            {clearing ? '清空中...' : '清空'}
+          </button>
+          <button
+            type="button"
             onClick={() => void loadSignals()}
             className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm text-ink hover:bg-rowHover"
           >
@@ -162,7 +181,7 @@ export default function SignalsPage() {
           <SlidersHorizontal className="h-4 w-4 text-muted" />
           筛选
         </div>
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
           <label className="space-y-1 text-xs text-muted">
             股票
             <div className="flex h-9 items-center gap-2 rounded-md border border-line bg-surface px-2">
@@ -218,19 +237,6 @@ export default function SignalsPage() {
               ))}
             </select>
           </label>
-          <label className="space-y-1 text-xs text-muted">
-            账户
-            <select
-              value={filters.account_id}
-              onChange={(event) => setFilters((prev) => ({ ...prev, account_id: event.target.value }))}
-              className="h-9 w-full rounded-md border border-line bg-surface px-2 text-sm text-ink outline-none"
-            >
-              <option value="">全部账户</option>
-              {accounts.map((a) => (
-                <option key={a.id} value={String(a.id)}>{a.name}</option>
-              ))}
-            </select>
-          </label>
         </div>
       </section>
 
@@ -282,7 +288,7 @@ export default function SignalsPage() {
                     <th className="px-4 py-3 font-medium">信号</th>
                     <th className="px-4 py-3 font-medium">动作</th>
                     <th className="px-4 py-3 font-medium">目标仓位</th>
-                    <th className="px-4 py-3 font-medium">策略/账户</th>
+                    <th className="px-4 py-3 font-medium">策略</th>
                     <th className="px-4 py-3 font-medium">原因</th>
                   </tr>
                 </thead>
@@ -307,7 +313,6 @@ export default function SignalsPage() {
                       <td className="px-4 py-3 text-muted">{formatNumber(Number(signal.target_position) * 100, 2)}%</td>
                       <td className="px-4 py-3 text-muted">
                         <div>{signal.strategy_name ?? '未绑定策略'}</div>
-                        <div className="text-xs">{signal.account_name ?? '未绑定账户'}</div>
                       </td>
                       <td className="max-w-[260px] truncate px-4 py-3 text-muted">{signal.reason ?? String(signal.snapshot?.blocked_reason ?? '')}</td>
                     </tr>

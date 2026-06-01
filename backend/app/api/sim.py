@@ -5,7 +5,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,10 +14,14 @@ from app.sim.service import (
     SignalOrderRequest,
     cancel_order,
     create_account,
+    delete_account,
     generate_order_from_signal,
     get_account_or_404,
+    get_account_with_realtime_valuation,
     list_accounts,
+    list_accounts_with_realtime_valuation,
     list_child_rows,
+    list_positions_with_realtime_valuation,
     match_order,
     serialize_rows,
     update_account,
@@ -71,7 +75,7 @@ async def get_accounts(
     status_filter: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    return await list_accounts(session, _extract_user_id(req), status_filter)
+    return await list_accounts_with_realtime_valuation(session, _extract_user_id(req), status_filter)
 
 
 @router.post("/accounts", status_code=status.HTTP_201_CREATED)
@@ -96,8 +100,7 @@ async def get_account_detail(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    row = await get_account_or_404(session, account_id, _extract_user_id(req))
-    return serialize_rows([row])[0]
+    return await get_account_with_realtime_valuation(session, account_id, _extract_user_id(req))
 
 
 @router.patch("/accounts/{account_id}")
@@ -113,8 +116,21 @@ async def patch_account(
         user_id=_extract_user_id(req),
         name=request.name,
         strategy_id=request.strategy_id,
+        strategy_id_provided="strategy_id" in request.model_fields_set,
         config=request.config,
     )
+
+
+@router.delete("/accounts/{account_id}")
+async def delete_account_endpoint(
+    account_id: int,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, bool]:
+    deleted = await delete_account(session, account_id=account_id, user_id=_extract_user_id(req))
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="account not found")
+    return {"deleted": True}
 
 
 @router.get("/accounts/{account_id}/positions")
@@ -124,12 +140,10 @@ async def get_positions(
     limit: int = Query(default=100, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    return await list_child_rows(
+    return await list_positions_with_realtime_valuation(
         session,
         user_id=_extract_user_id(req),
         account_id=account_id,
-        table="sim_positions",
-        order_by="updated_at DESC, id DESC",
         limit=limit,
     )
 
@@ -223,6 +237,8 @@ async def create_signal_order(
             reason=request.reason,
             snapshot=request.snapshot,
         ),
+        auto_match=True,
+        auto_match_mode="close",
     )
 
 

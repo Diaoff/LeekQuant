@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -17,6 +17,7 @@ from app.main import app
 from app.realtime.bus import RedisRealtimeBus, RealtimeUnavailable
 from app.realtime.models import RealtimeTick, realtime_channel
 from app.realtime.providers import EastMoneyRealtimeProvider
+from app.realtime.risk_guard import get_risk_guard_status
 
 
 def test_realtime_tick_serializes_standard_fields() -> None:
@@ -44,6 +45,85 @@ def test_realtime_tick_serializes_standard_fields() -> None:
         "ask1": "12.35",
         "ts": "2026-05-24T09:30:00+00:00",
     }
+
+
+class FakeResult:
+    def __init__(self, rows=None, rowcount=1):
+        self._rows = rows or []
+        self.rowcount = rowcount
+
+    def mappings(self):
+        return self
+
+    def one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+
+class FakeSession:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def execute(self, statement, params=None):
+        return FakeResult(self.rows)
+
+
+@pytest.mark.asyncio
+async def test_risk_guard_status_missing_when_no_heartbeat() -> None:
+    status = await get_risk_guard_status(FakeSession([]))  # type: ignore[arg-type]
+
+    assert status["status"] == "missing"
+    assert status["last_seen_at"] is None
+    assert status["loaded_positions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_risk_guard_status_running_from_recent_heartbeat() -> None:
+    seen_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    status = await get_risk_guard_status(
+        FakeSession(
+            [
+                {
+                    "started_at": seen_at,
+                    "payload": {"refresh_interval_seconds": 30},
+                    "result": {
+                        "last_seen_at": seen_at.isoformat(),
+                        "refresh_interval_seconds": 30,
+                        "loaded_positions": 2,
+                        "tracked_symbols": 1,
+                        "last_error": None,
+                        "last_trigger": {"ts_code": "000001.SZ", "reason": "止盈"},
+                        "last_blocked_reason": None,
+                    },
+                    "error_message": None,
+                }
+            ]
+        )  # type: ignore[arg-type]
+    )
+
+    assert status["status"] == "running"
+    assert status["loaded_positions"] == 2
+    assert status["tracked_symbols"] == 1
+    assert status["last_trigger"]["ts_code"] == "000001.SZ"
+
+
+@pytest.mark.asyncio
+async def test_risk_guard_status_stale_after_interval_grace() -> None:
+    seen_at = datetime.now(timezone.utc) - timedelta(seconds=130)
+    status = await get_risk_guard_status(
+        FakeSession(
+            [
+                {
+                    "started_at": seen_at,
+                    "payload": {"refresh_interval_seconds": 30},
+                    "result": {"last_seen_at": seen_at.isoformat(), "refresh_interval_seconds": 30},
+                    "error_message": "snapshot down",
+                }
+            ]
+        )  # type: ignore[arg-type]
+    )
+
+    assert status["status"] == "stale"
+    assert status["last_error"] == "snapshot down"
 
 
 @pytest.mark.asyncio

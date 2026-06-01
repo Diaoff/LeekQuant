@@ -27,7 +27,7 @@ Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法�
 
 ### 1.3 核心功能范围
 
-- A 股股票池：全市场股票列表、动态筛选、ST / 退市标识。
+- A 股市场：全市场股票列表、动态筛选、ST / 退市标识。
 - 历史 K 线：日 / 周 / 月，增量拉取，复权，停牌和退市数据完整保留。
 - 自选股：按用户和分组管理，实时行情看板。
 - 实时股价推送：东方财富 WebSocket 自建解析，或 AllTick 作为替代通道。
@@ -50,15 +50,15 @@ Leek Quant 采用前后端分离 + 异步任务 + 统一 PostgreSQL 存储架构
 flowchart TB
     subgraph FE["前端层：React + Vite + Tailwind + shadcn/ui"]
         Dashboard["Dashboard / 自选股看板"]
-        Market["股票池 / 全市场筛选"]
+        Market["全市场筛选"]
         StrategyUI["策略中心：Monaco Editor"]
         ChartUI["K线 / 净值 / 因子图表<br/>TradingView Lightweight Charts"]
         SimUI["模拟交易页面"]
     end
 
     subgraph API["API层：FastAPI"]
-        Auth["轻量用户认证<br/>JWT / Session"]
-        DataAPI["行情 / 股票池 / 自选股 API"]
+        Auth["轻量用户认证<br/>JWT / Session（M7+ 延后）"]
+        DataAPI["行情 / 自选股 API"]
         StrategyAPI["策略 CRUD / 回测 API"]
         SignalAPI["信号 / 模拟交易 API"]
         WSAPI["WebSocket 推送网关"]
@@ -131,7 +131,7 @@ flowchart TB
 | backend | FastAPI + SQLAlchemy + Alembic | REST API、WebSocket、认证、任务提交 |
 | celery_worker | Celery | 数据拉取、回测、因子、模拟交易等耗时任务 |
 | celery_beat | Celery Beat | 定时触发交易日历、K线更新、信号生成、净值快照 |
-| realtime_ws | Python asyncio / websockets | 东方财富实时行情连接、解析、Redis 广播 |
+| realtime_ws | Python asyncio / websockets | 东方财富实时行情连接、解析、Redis 广播（首版已合并到 backend 进程） |
 | postgres | PostgreSQL 15+ | 统一持久化存储 |
 | redis | Redis 7 | Celery Broker / Result Backend、热点缓存、Pub/Sub |
 
@@ -203,7 +203,7 @@ CREATE INDEX idx_stock_basic_industry ON stock_basic(industry);
 CREATE INDEX idx_stock_basic_status ON stock_basic(is_st, is_delisted);
 ```
 
-`is_st` 与 `is_delisted` 每日更新，股票池筛选和回测默认可配置是否排除 ST / 退市股票。退市股票不删除，历史 K 线继续保留，保证历史回测完整。
+`is_st` 与 `is_delisted` 每日更新，市场筛选和回测默认可配置是否排除 ST / 退市股票。退市股票不删除，历史 K 线继续保留，保证历史回测完整。
 
 #### 3.3.2 日线 K 线：`daily_kline`
 
@@ -250,6 +250,8 @@ CREATE INDEX idx_daily_kline_code_date_desc ON daily_kline(ts_code, trade_date D
 ```
 
 周线和月线不建议首版单独拉取。首选从日线聚合生成物化视图，避免多源数据口径不一致。
+
+> **M7+ 延后项**：周线/月线物化视图首版未实现。当前前端图表可直接从日线数据聚合展示周线/月线，无需数据库物化视图。
 
 ```sql
 CREATE MATERIALIZED VIEW weekly_kline AS
@@ -337,7 +339,9 @@ CREATE INDEX idx_fundamentals_report_date ON stock_fundamentals(report_date DESC
 CREATE INDEX idx_fundamentals_code_date ON stock_fundamentals(ts_code, report_date DESC);
 ```
 
-### 3.4 用户、股票池与策略
+### 3.4 用户、自选股与策略
+
+> **设计决策**：首版已移除 `stock_pools` / `stock_pool_items` 表。回测目标筛选改为 `backtest_results.params_snapshot.target` 配置（支持 `all` / `market` / `watchlist_group` 三种作用域），因子排行改为 `scoring_rank.scope_type` + `scope_value` 作用域。股票池的动态筛选和因子导入功能延后至 M7+。
 
 ```sql
 CREATE TABLE watchlist (
@@ -353,33 +357,9 @@ CREATE TABLE watchlist (
 
 CREATE INDEX idx_watchlist_user_group ON watchlist(user_id, group_name, sort_order);
 
-CREATE TABLE stock_pools (
-    id            BIGSERIAL PRIMARY KEY,
-    user_id       BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name          VARCHAR(100) NOT NULL,
-    description   TEXT,
-    filters       JSONB NOT NULL DEFAULT '{}'::JSONB,
-    is_dynamic    BOOLEAN NOT NULL DEFAULT TRUE,
-    last_built_at TIMESTAMPTZ,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE stock_pool_items (
-    pool_id        BIGINT NOT NULL REFERENCES stock_pools(id) ON DELETE CASCADE,
-    ts_code        VARCHAR(10) NOT NULL REFERENCES stock_basic(ts_code),
-    score          NUMERIC(12,6),
-    reason         JSONB,
-    added_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (pool_id, ts_code)
-);
-
-CREATE INDEX idx_pool_items_code ON stock_pool_items(ts_code);
-
 CREATE TABLE strategies (
     id             BIGSERIAL PRIMARY KEY,
     user_id        BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    pool_id        BIGINT REFERENCES stock_pools(id) ON DELETE SET NULL,
     name           VARCHAR(100) NOT NULL,
     description    TEXT,
     source_code    TEXT NOT NULL,
@@ -395,17 +375,22 @@ CREATE TABLE strategies (
 CREATE INDEX idx_strategies_user_status ON strategies(user_id, status);
 ```
 
-`stock_pools.filters` 示例：
+`strategies.config` 示例（含回测目标筛选和风控配置）：
 
 ```json
 {
-  "exclude_st": true,
-  "exclude_delisted": true,
-  "market": ["主板", "创业板", "科创板"],
-  "industry": ["半导体", "软件开发"],
-  "market_cap": {"min": 3000000000, "max": 80000000000},
-  "pe_ttm": {"min": 0, "max": 80},
-  "factor_rank": {"factor": "quality_score", "top_pct": 0.3}
+  "fee_config": {"commission_rate": 0.00025, "min_commission": 5.0},
+  "risk_config": {"stop_loss_pct": 0.08, "take_profit_pct": 0.20}
+}
+```
+
+`backtest_results.params_snapshot.target` 示例：
+
+```json
+{
+  "type": "market",
+  "value": ["主板", "创业板"],
+  "filters": {"exclude_st": true, "exclude_loss_pe": true}
 }
 ```
 
@@ -416,7 +401,6 @@ CREATE TABLE backtest_results (
     id               BIGSERIAL PRIMARY KEY,
     user_id          BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     strategy_id      BIGINT REFERENCES strategies(id) ON DELETE SET NULL,
-    pool_id          BIGINT REFERENCES stock_pools(id) ON DELETE SET NULL,
     task_id          VARCHAR(128),
     start_date       DATE NOT NULL,
     end_date         DATE NOT NULL,
@@ -502,21 +486,25 @@ CREATE TABLE scoring_rank (
     id               BIGSERIAL PRIMARY KEY,
     trade_date       DATE NOT NULL,
     ts_code          VARCHAR(10) NOT NULL REFERENCES stock_basic(ts_code),
-    pool_id          BIGINT REFERENCES stock_pools(id) ON DELETE SET NULL,
+    scope_type       VARCHAR(32) NOT NULL DEFAULT 'all',
+    scope_value      VARCHAR(128),
     total_score      NUMERIC(20,8) NOT NULL,
     rank             INTEGER NOT NULL,
     percentile_rank  NUMERIC(10,8),
     factor_breakdown JSONB NOT NULL DEFAULT '{}'::JSONB,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (scope_type IN ('all', 'watchlist_group'))
 );
 
 CREATE UNIQUE INDEX uq_scoring_rank_scope ON scoring_rank(
     trade_date,
     ts_code,
-    COALESCE(pool_id, 0)
+    scope_type,
+    COALESCE(scope_value, '')
 );
-CREATE INDEX idx_scoring_rank_date_rank ON scoring_rank(trade_date DESC, rank);
-CREATE INDEX idx_scoring_rank_pool_date ON scoring_rank(pool_id, trade_date DESC, rank);
+CREATE INDEX idx_scoring_rank_date_rank ON scoring_rank(trade_date DESC, scope_type, rank);
+CREATE INDEX idx_scoring_rank_scope_date ON scoring_rank(scope_type, scope_value, trade_date DESC, rank);
 
 CREATE TABLE factor_analysis (
     id               BIGSERIAL PRIMARY KEY,
@@ -858,7 +846,7 @@ DO UPDATE SET
 ```mermaid
 sequenceDiagram
     participant EM as 东方财富 WebSocket
-    participant Parser as realtime_ws 解析器
+    participant Parser as backend 实时行情解析
     participant Redis as Redis Pub/Sub
     participant API as FastAPI WebSocket
     participant UI as React 自选股看板
@@ -906,7 +894,7 @@ FastAPI
     -> celery.send_task("run_backtest", backtest_id)
 
 Celery Worker
-  -> 加载 strategy / stock_pool / daily_kline
+  -> 加载 strategy / daily_kline
   -> HikyuuBacktestAdapter
        1. PostgreSQL K线 -> Hikyuu KData / 临时数据驱动
        2. 用户 Python 策略 -> Signal / System 组件
@@ -926,7 +914,7 @@ class HikyuuBacktestAdapter:
     def run(self, config: dict) -> dict:
         """
         config:
-          strategy_id, source_code, stock_pool, start_date, end_date,
+          strategy_id, source_code, target, start_date, end_date,
           initial_cash, fee_model, benchmark_code, adjust
         return:
           performance, trade_records, equity_curve, per_stock
@@ -977,7 +965,7 @@ def load_market_data(self, ts_code: str, start: date, end: date) -> list[dict]:
 | 佣金 | 双向收取，最低 5 元 | `sim_trades.commission` 记录 |
 | 过户费 | 按市场配置，默认沪深双向可配置 | `sim_trades.transfer_fee` 记录 |
 | 停牌 | 停牌日不生成成交 | `is_suspended` 拦截委托 |
-| ST / 退市 | 策略或股票池可排除，涨跌幅限制不同 | 下单前按 `stock_basic` 状态校验 |
+| ST / 退市 | 策略可排除，涨跌幅限制不同 | 下单前按 `stock_basic` 状态校验 |
 
 费用模型配置建议：
 
@@ -1247,6 +1235,8 @@ def unlock_t1_positions(db, trade_date: date):
 
 参考 Qlib 表达式范式，但首版不依赖完整 Qlib 运行时。
 
+> **首版简化实现**：当前版本使用 Python 直接计算因子值（如 `pe_ttm`, `pb`, `roe`, `revenue_growth`, `mom_20d`, `mom_60d`, `rsi6`, `vol_20d`），而非 Qlib-like 表达式引擎。完整的表达式解析与动态计算能力计划在 M7+ 实现。
+
 ```yaml
 factors:
   PE_INV:
@@ -1337,16 +1327,14 @@ def score_cross_section(factor_df, weights):
 
 | 模块 | 方法与路径 | 说明 |
 | --- | --- | --- |
-| 认证 | `POST /api/auth/login` | 登录获取 token |
+| 认证 | `POST /api/auth/login` | 登录获取 token（M7+ 延后） |
 | 股票 | `GET /api/stocks` | 全市场列表，支持 ST / 行业 / 市值筛选 |
 | 股票 | `GET /api/stocks/{ts_code}/klines` | 日 / 周 / 月 K 线 |
-| 股票池 | `POST /api/pools` | 创建动态股票池 |
-| 股票池 | `POST /api/pools/{id}/rebuild` | 立即重建股票池 |
 | 自选股 | `GET /api/watchlist` | 自选股分组查询 |
 | 自选股 | `POST /api/watchlist` | 添加自选 |
 | 策略 | `GET /api/strategies` | 策略列表 |
 | 策略 | `POST /api/strategies` | 创建策略 |
-| 回测 | `POST /api/backtests` | 提交异步回测 |
+| 回测 | `POST /api/backtests` | 提交异步回测（目标筛选通过 params_snapshot.target 配置） |
 | 回测 | `GET /api/backtests/{id}` | 查询回测状态和结果 |
 | 信号 | `GET /api/signals` | 五档信号日志 |
 | 模拟交易 | `GET /api/sim/accounts` | 模拟账户列表 |
@@ -1356,17 +1344,23 @@ def score_cross_section(factor_df, weights):
 | 模拟交易 | `GET /api/sim/accounts/{id}/trades` | 成交 |
 | 模拟交易 | `GET /api/sim/accounts/{id}/nav` | 净值曲线 |
 | 因子 | `GET /api/factors` | 因子定义 |
-| 因子 | `GET /api/factors/rank` | 打分排行榜 |
+| 因子 | `GET /api/factors/rank` | 打分排行榜（支持 scope_type=all / watchlist_group） |
 | 系统 | `GET /api/system/tasks` | 任务运行状态 |
+| 实时行情 | `GET /api/realtime/snapshot` | 东方财富 HTTP 快照 |
+| 数据源 | `GET /api/sources` | 数据源配置 |
+| 数据 | `POST /api/data/sync` | 手动触发数据同步 |
+| 任务 | `POST /api/tasks/factors/compute` | 触发因子计算 |
+| 任务 | `POST /api/tasks/factors/analyze` | 触发 IC/IR 分析 |
+| 偏好 | `GET /api/preferences` | 用户偏好 |
 | 系统 | `GET /api/system/alerts` | 告警列表 |
 
 ### 9.2 WebSocket
 
-| 路径 | 用途 | 消息 |
-| --- | --- | --- |
-| `/ws/realtime` | 实时行情订阅 | subscribe / unsubscribe / tick |
-| `/ws/tasks` | 回测、数据任务状态通知 | task_status |
-| `/ws/signals` | 策略信号推送 | signal_created |
+| 路径 | 用途 | 消息 | 状态 |
+| --- | --- | --- | --- |
+| `/ws/realtime` | 实时行情订阅 | subscribe / unsubscribe / tick | ✅ M6a 已实现 |
+| `/ws/tasks` | 回测、数据任务状态通知 | task_status | M6b 待实现 |
+| `/ws/signals` | 策略信号推送 | signal_created | M6b 待实现 |
 
 订阅示例：
 
@@ -1399,14 +1393,18 @@ def score_cross_section(factor_df, weights):
 | 路由 | 页面 | 核心能力 |
 | --- | --- | --- |
 | `/` | Dashboard | 大盘概览、自选股涨跌、今日信号、模拟账户净值 |
-| `/market` | 股票池 / 市场 | 全市场列表、ST / 退市标识、动态筛选、股票详情 |
+| `/market` | 市场 | 全市场列表、ST / 退市标识、筛选、股票详情 |
 | `/watchlist` | 自选股 | 分组管理、实时行情表、批量移动 |
 | `/strategy` | 策略中心 | 策略列表、Monaco 编辑器、参数面板、回测入口 |
+| `/backtests` | 回测列表 | 回测历史、状态、绩效概览 |
 | `/backtests/:id` | 回测详情 | 绩效指标、净值曲线、回撤、交易记录、信号叠加 |
+| `/backtests/compare` | 回测对比 | 多回测结果对比 |
 | `/signals` | 信号中心 | 五档信号日志、筛选、统计、快照详情 |
 | `/simulation` | 模拟交易 | 账户、持仓、委托、成交、流水、净值 |
 | `/factor` | 因子选股 | 因子库、IC/IR 图表、排行榜、权重配置 |
-| `/settings` | 系统设置 | 数据状态、任务监控、告警、用户与账户 |
+| `/status` | 任务监控 | Celery 任务状态、失败原因、数据更新状态 |
+| `/preferences` | 偏好设置 | 用户偏好、数据源配置、费率配置 |
+| `/sources` | 数据源 | 数据源配置（同 PreferencesPage） |
 
 ### 10.2 核心组件
 
@@ -1418,7 +1416,7 @@ def score_cross_section(factor_df, weights):
 | `WatchlistBoard` | WebSocket Hook | 实时价格、涨跌幅、分组 |
 | `BacktestReport` | Charts + Table | 绩效卡片、净值、回撤、交易明细 |
 | `SimAccountPanel` | shadcn Tabs | 持仓 / 委托 / 成交 / 流水 / 净值 |
-| `FactorRankTable` | Table + 权重控件 | 多因子分解、排行、导入股票池 |
+| `FactorRankTable` | Table + 权重控件 | 多因子分解、排行、导出到自选股 |
 | `TaskMonitor` | Status Badge + Log Drawer | Celery 任务状态、失败原因 |
 
 ### 10.3 Monaco Editor MyTT 提示
@@ -1472,7 +1470,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: leek-redis
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-leek_redis_dev}
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-leek_redis_dev}  # 本地开发可不设密码，生产部署必须设置
     volumes:
       - redisdata:/data
     ports:
@@ -1541,22 +1539,24 @@ services:
       - celery_worker
     restart: unless-stopped
 
-  realtime_ws:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    container_name: leek-realtime-ws
-    command: python -m app.realtime.eastmoney_ws
-    environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
-      REALTIME_PROVIDER: ${REALTIME_PROVIDER:-eastmoney}
-      ALLTICK_TOKEN: ${ALLTICK_TOKEN:-}
-    volumes:
-      - ./backend:/app
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+  # realtime_ws: 首版已合并到 backend 进程，通过 FastAPI WebSocket 端点提供。
+  # 若需独立部署实时行情解析服务，可取消以下注释。
+  # realtime_ws:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   container_name: leek-realtime-ws
+  #   command: python -m app.realtime.eastmoney_ws
+  #   environment:
+  #     REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
+  #     REALTIME_PROVIDER: ${REALTIME_PROVIDER:-eastmoney}
+  #     ALLTICK_TOKEN: ${ALLTICK_TOKEN:-}
+  #   volumes:
+  #     - ./backend:/app
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   restart: unless-stopped
 
   frontend:
     build:
@@ -1580,7 +1580,7 @@ volumes:
 ### 11.2 后端 Dockerfile
 
 ```dockerfile
-FROM python:3.11-slim
+FROM python:3.12-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -1688,12 +1688,13 @@ beat_schedule = {
 | --- | --- | --- | --- |
 | M0 基础环境 | Docker Compose、PostgreSQL、Redis、FastAPI、React 空壳 | 可一键启动，健康检查通过 | `docker compose up`，API `/health` |
 | M1 数据基座 | 股票列表、交易日历、日线 K 线全量和增量 | `stock_basic`、`daily_kline`、`trade_calendar` 有数据 | 随机股票 K 线与源数据比对 |
-| M2 股票池与自选股 | 动态筛选、自选分组、基础前端页面 | 市场筛选、自选分组、自选股 API、市场页 | 筛选 ST / 退市 / 行业条件 |
+| M2 自选股与策略 | 自选分组、策略 CRUD、基础前端页面 | 自选分组、自选股 API、市场页、策略管理 | 自选股分组管理 |
 | M3 策略与回测 | Monaco 编辑、MyTT 提示、Hikyuu 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
 | M4 信号与模拟交易 | 五档信号、模拟交易 6 表、T+1 / 涨跌停 / 费用 | 信号中心、模拟账户闭环 | 资金守恒和 T+1 单测 |
-| M5 多因子 | 因子定义、计算、IC/IR、排行榜 | 因子页、排行榜、股票池导入 | IC 计算样例验证 |
-| M6 实时行情 | 东方财富 WebSocket、Redis 广播、前端实时看板 | 自选股实时刷新、信号推送 | 断线重连测试 |
-| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、文档 | 系统设置页、任务监控、README | 全链路 smoke test |
+| M5 多因子 | 因子定义、计算、IC/IR、排行榜 | 因子页、排行榜 | IC 计算样例验证 |
+| M6a HTTP 快照实时 | 东方财富 HTTP 快照、Redis 广播、WebSocket 订阅、前端实时看板 | 自选股实时刷新 | ✅ 已通过验收 |
+| M6b WebSocket 流式 | 东方财富 WebSocket 流式推送、任务/信号 WebSocket 通道、断线重连 | 断线重连测试 | 待实现 |
+| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、认证系统、股票池、因子表达式引擎、周/月线物化视图、文档 | 系统设置页、任务监控、README | 全链路 smoke test |
 
 ---
 
@@ -1755,7 +1756,7 @@ beat_schedule = {
 | Baostock | K 线备源、财务三表、估值 | 数据层 Tier2，基本面主源 |
 | AkShare | 分钟 K 线、交易日历、全市场补充 | 数据层 Tier3 兜底 |
 | Qlib | 因子表达式和因子评估范式 | 轻量复刻表达式与 IC/IR 流程，不引入完整平台 |
-| 东方财富 WebSocket | 免费实时行情 | 独立 `realtime_ws` 服务解析，Redis Pub/Sub 广播 |
+| 东方财富 WebSocket | 免费实时行情 | 首版使用 HTTP 快照轮询（M6a），WebSocket 流式推送为 M6b |
 | AllTick | 实时行情备用 | 配置 token 后作为东方财富失败时的替代 |
 | QuantDinger | 项目母版 | 裁剪非 A 股模块，保留 FastAPI / React / Celery / Compose 骨架 |
 | TradingView Lightweight Charts | K 线、净值曲线、信号叠加 | 前端图表组件 |

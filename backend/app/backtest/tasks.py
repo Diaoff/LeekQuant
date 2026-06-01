@@ -110,6 +110,44 @@ def _stock_scope_diagnostics(stock_codes: list[str]) -> dict[str, Any]:
     }
 
 
+async def _factor_scores_by_date(
+    session: AsyncSession,
+    *,
+    start_date: date,
+    end_date: date,
+    stock_codes: list[str],
+) -> dict[date, dict[str, dict[str, Any]]]:
+    if not stock_codes:
+        return {}
+    result = await session.execute(
+        text(
+            """
+            SELECT trade_date, ts_code, total_score, rank
+            FROM scoring_rank
+            WHERE scope_type = 'all'
+              AND scope_value IS NULL
+              AND trade_date BETWEEN :start_date AND :end_date
+              AND ts_code = ANY(CAST(:stock_codes AS VARCHAR[]))
+            """
+        ),
+        {
+            "start_date": start_date,
+            "end_date": end_date,
+            "stock_codes": stock_codes,
+        },
+    )
+    scores: dict[date, dict[str, dict[str, Any]]] = {}
+    for row in result.mappings().all():
+        trade_date = row["trade_date"]
+        if not isinstance(trade_date, date):
+            trade_date = date.fromisoformat(str(trade_date))
+        scores.setdefault(trade_date, {})[row["ts_code"]] = {
+            "total_score": row["total_score"],
+            "rank": row["rank"],
+        }
+    return scores
+
+
 def _normalize_market_targets(value: Any) -> list[str]:
     raw_values = value if isinstance(value, list) else [value]
     selected = {
@@ -341,6 +379,12 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
 
             global_fee_cfg = await get_trading_fee_config(session, bt_row["user_id"])
             fee_cfg = _merge_fee_config(global_fee_cfg, strategy_config.get("fee_config"))
+            factor_scores = await _factor_scores_by_date(
+                session,
+                start_date=bt_row["start_date"],
+                end_date=bt_row["end_date"],
+                stock_codes=list(all_klines.keys()),
+            )
 
             risk_cfg = strategy_config.get("risk_config", {})
             risk_controls_enabled = _has_risk_controls(risk_cfg)
@@ -358,6 +402,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0.0)),
                 trailing_activation_pct=float(risk_cfg.get("trailing_activation_pct", 0.0)),
                 time_stop_days=int(risk_cfg.get("time_stop_days", 0)),
+                factor_scores_by_date=factor_scores,
             )
 
             try:

@@ -9,7 +9,8 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
-CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-1}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-4}"
+REALTIME_RISK_GUARD_INTERVAL="${REALTIME_RISK_GUARD_INTERVAL:-15}"
 
 WITH_CELERY=0
 SKIP_BACKEND=0
@@ -30,7 +31,8 @@ Environment:
   BACKEND_PORT       Backend port, default 8000.
   FRONTEND_HOST      Frontend bind host, default 127.0.0.1.
   FRONTEND_PORT      Frontend port, default 5173.
-  CELERY_CONCURRENCY Celery worker concurrency, default 1.
+  CELERY_CONCURRENCY Celery worker concurrency, default 4.
+  REALTIME_RISK_GUARD_INTERVAL Realtime risk polling interval seconds, default 15.
 EOF
 }
 
@@ -72,7 +74,8 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
-CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-1}"
+CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-4}"
+REALTIME_RISK_GUARD_INTERVAL="${REALTIME_RISK_GUARD_INTERVAL:-15}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
 
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
@@ -251,7 +254,7 @@ start_celery() {
   echo "Starting celery worker with concurrency=$CELERY_CONCURRENCY"
   (
     cd "$ROOT_DIR/backend"
-    start_detached "$LOG_DIR/celery-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$CELERY_CONCURRENCY" \
+    start_detached "$LOG_DIR/celery-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$CELERY_CONCURRENCY" -Q default,data,backtest,factor,trading \
       > "$PID_DIR/celery-worker.pid"
   )
 
@@ -260,6 +263,13 @@ start_celery() {
     cd "$ROOT_DIR/backend"
     start_detached "$LOG_DIR/celery-beat.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app beat --loglevel=INFO \
       > "$PID_DIR/celery-beat.pid"
+  )
+
+  echo "Starting realtime risk guard with interval=${REALTIME_RISK_GUARD_INTERVAL}s"
+  (
+    cd "$ROOT_DIR/backend"
+    start_detached "$LOG_DIR/realtime-risk-guard.log" "$PYTHON_BIN" -m app.realtime.risk_guard --mode snapshot --refresh-interval "$REALTIME_RISK_GUARD_INTERVAL" \
+      > "$PID_DIR/realtime-risk-guard.pid"
   )
 }
 
@@ -276,6 +286,7 @@ fi
 if [[ "$WITH_CELERY" -eq 1 ]]; then
   kill_pid_file celery-worker
   kill_pid_file celery-beat
+  kill_pid_file realtime-risk-guard
   kill_celery_processes worker " worker"
   kill_celery_processes beat " beat"
 fi

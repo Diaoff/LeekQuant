@@ -34,6 +34,16 @@ export function formatDateTime(value: string | null): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
 }
 
+export function formatDuration(valueMs: number | null | undefined): string {
+  if (valueMs === null || valueMs === undefined) return '进行中'
+  const totalSeconds = Math.max(0, Math.floor(valueMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
+}
+
 export function formatMarketCap(value: string | null): string {
   if (!value) return '暂无'
   const numeric = Number(value)

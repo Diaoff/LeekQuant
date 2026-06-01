@@ -96,6 +96,20 @@ class BacktestConfig:
 
     execution_timeframe: str = "1D"
     signal_timeframe: str = "1D"
+    factor_scores_by_date: dict[date, dict[str, dict[str, Any]]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _SignalCandidate:
+    ts_code: str
+    bar: KBar
+    action: SignalOutput
+    signal: dict[str, Any] | None
+    exit_reason: str | None = None
+    buy_priority_score: Decimal = Decimal("0")
+    buy_priority_source: str = "default"
+    factor_score: Decimal | None = None
+    factor_rank: int | None = None
 
 
 class BacktestContext:
@@ -208,6 +222,7 @@ class BacktestRunner:
                 "cash": float(self.cash),
             })
 
+            candidates: list[_SignalCandidate] = []
             for ts_code in self.config.stock_pool:
                 klines = all_klines.get(ts_code, [])
                 window = [k for k in klines if k.trade_date <= td][-lookback:]
@@ -229,7 +244,13 @@ class BacktestRunner:
                 exit_reason = self._check_exit_conditions(ts_code, price_path[0], bar)
                 if exit_reason:
                     exec_action = SignalOutput(action="SELL_ALL", target_position=0.0)
-                    self._execute_action(exec_action, ts_code, bar, total_asset, signal=None, exit_reason=exit_reason)
+                    candidates.append(_SignalCandidate(
+                        ts_code=ts_code,
+                        bar=bar,
+                        action=exec_action,
+                        signal=None,
+                        exit_reason=exit_reason,
+                    ))
                     continue
 
                 ctx = BacktestContext(window, self.positions, total_asset)
@@ -256,16 +277,104 @@ class BacktestRunner:
                     })
                     continue
 
-                self._execute_action(action_info, ts_code, bar, total_asset, signal)
-                self.signals.append({
-                    "ts_code": ts_code,
-                    "trade_date": td.isoformat(),
-                    "signal_type": signal.get("signal_type"),
-                    "action": action_info.action,
-                    "target_position": action_info.target_position,
-                })
+                candidates.append(self._build_signal_candidate(ts_code, bar, action_info, signal, td))
+
+            for candidate in sorted(candidates, key=self._candidate_sort_key):
+                self._execute_action(
+                    candidate.action,
+                    candidate.ts_code,
+                    candidate.bar,
+                    total_asset,
+                    candidate.signal,
+                    exit_reason=candidate.exit_reason,
+                )
+                self.signals.append(self._candidate_signal_record(candidate))
 
         return self._compute_results()
+
+    def _build_signal_candidate(
+        self,
+        ts_code: str,
+        bar: KBar,
+        action: SignalOutput,
+        signal: dict[str, Any],
+        td: date,
+    ) -> _SignalCandidate:
+        priority_score = Decimal("0")
+        priority_source = "default"
+        factor_score: Decimal | None = None
+        factor_rank: int | None = None
+
+        if signal.get("signal_type") in ("买入", "增持"):
+            factor = self.config.factor_scores_by_date.get(td, {}).get(ts_code)
+            if factor is not None:
+                factor_score = self._decimal_or_none(factor.get("total_score"))
+                if factor.get("rank") is not None:
+                    factor_rank = int(factor["rank"])
+
+            confidence = self._decimal_or_none(signal.get("confidence"))
+            if confidence is not None:
+                priority_score = confidence
+                priority_source = "confidence"
+            elif factor_score is not None:
+                priority_score = factor_score
+                priority_source = "factor_score"
+
+        return _SignalCandidate(
+            ts_code=ts_code,
+            bar=bar,
+            action=action,
+            signal=signal,
+            buy_priority_score=priority_score,
+            buy_priority_source=priority_source,
+            factor_score=factor_score,
+            factor_rank=factor_rank,
+        )
+
+    @staticmethod
+    def _decimal_or_none(value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        return Decimal(str(value))
+
+    @staticmethod
+    def _candidate_sort_key(candidate: _SignalCandidate) -> tuple[int, int, Decimal, Decimal, str]:
+        signal_type = candidate.signal.get("signal_type") if candidate.signal else candidate.exit_reason
+        if candidate.exit_reason or signal_type in ("卖出", "减仓"):
+            group = 0
+        elif signal_type in ("买入", "增持"):
+            group = 1
+        else:
+            group = 2
+        if candidate.exit_reason:
+            source_order = 0
+        elif group == 0:
+            source_order = 1
+        else:
+            source_order = {"confidence": 0, "factor_score": 1}.get(candidate.buy_priority_source, 2)
+        target_position = Decimal(str(candidate.action.target_position or 0))
+        return group, source_order, -candidate.buy_priority_score, -target_position, candidate.ts_code
+
+    @staticmethod
+    def _candidate_signal_record(candidate: _SignalCandidate) -> dict[str, Any]:
+        signal = candidate.signal or {}
+        record = {
+            "ts_code": candidate.ts_code,
+            "trade_date": candidate.bar.trade_date.isoformat(),
+            "signal_type": signal.get("signal_type") or candidate.exit_reason,
+            "action": candidate.action.action,
+            "target_position": candidate.action.target_position,
+        }
+        if candidate.exit_reason:
+            record["exit_reason"] = candidate.exit_reason
+        if signal.get("signal_type") in ("买入", "增持"):
+            record.update({
+                "buy_priority_score": str(candidate.buy_priority_score),
+                "buy_priority_source": candidate.buy_priority_source,
+                "factor_score": str(candidate.factor_score) if candidate.factor_score is not None else None,
+                "factor_rank": candidate.factor_rank,
+            })
+        return record
 
     def _get_trading_dates(self, all_klines: dict[str, list[KBar]]) -> list[date]:
         dates: set[date] = set()

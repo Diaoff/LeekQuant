@@ -5,6 +5,7 @@ from datetime import timedelta
 from celery import Celery
 from celery.schedules import crontab
 from celery.signals import worker_ready
+from kombu import Queue
 
 from app.core.config import get_settings
 from app.data.repository import mark_stale_running_task_runs
@@ -32,6 +33,21 @@ celery_app.conf.update(
     accept_content=["json"],
     worker_prefetch_multiplier=1,
     timezone="Asia/Shanghai",
+    task_default_queue="default",
+    task_queues=(
+        Queue("default"),
+        Queue("data"),
+        Queue("backtest"),
+        Queue("factor"),
+        Queue("trading"),
+    ),
+    task_routes={
+        "app.tasks.data_tasks.*": {"queue": "data"},
+        "app.tasks.run_backtest": {"queue": "backtest"},
+        "app.tasks.factor_tasks.*": {"queue": "factor"},
+        "app.tasks.trading_tasks.*": {"queue": "trading"},
+        "app.tasks.signal_tasks.*": {"queue": "trading"},
+    },
     beat_schedule={
         "update-stock-basic-weekly": {
             "task": "app.tasks.data_tasks.update_stock_basic",

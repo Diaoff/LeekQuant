@@ -85,7 +85,7 @@ services:
       DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
-    command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "--loglevel=INFO"]
+    command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "default,data,backtest,factor,trading"]
     networks:
       - leek-quant-network
 
@@ -110,6 +110,29 @@ services:
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["celery", "-A", "app.tasks.celery_app:celery_app", "beat", "--loglevel=INFO"]
+    networks:
+      - leek-quant-network
+
+  realtime_risk_guard:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        BUILD_REGION: ${BUILD_REGION:-cn}
+    container_name: leek-quant-realtime-risk-guard
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      TZ: ${TZ:-Asia/Shanghai}
+    command: ["python", "-m", "app.realtime.risk_guard", "--mode", "${REALTIME_RISK_GUARD_MODE:-snapshot}", "--refresh-interval", "${REALTIME_RISK_GUARD_INTERVAL:-15}"]
     networks:
       - leek-quant-network
 

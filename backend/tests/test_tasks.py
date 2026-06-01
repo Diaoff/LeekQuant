@@ -1,12 +1,12 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 from sqlalchemy import text
 
 from app.tasks.celery_app import celery_app
 from app.tasks.tracking import _run_tracked
-from app.tasks.trading_tasks import _snapshot_nav_daily
+from app.tasks.trading_tasks import _is_realtime_trading_time, _is_open_trade_day, _snapshot_nav_daily
 
 
 def test_celery_app_registers_data_tasks() -> None:
@@ -510,3 +510,25 @@ def test_snapshot_nav_daily_treats_missing_calendar_as_non_trading_day() -> None
 
     assert result["skipped"] is True
     assert result["reason"] == "non-trading day"
+
+
+def test_realtime_trading_time_only_allows_a_share_session() -> None:
+    assert _is_realtime_trading_time(datetime(2026, 5, 21, 9, 30)) is True
+    assert _is_realtime_trading_time(datetime(2026, 5, 21, 11, 45)) is False
+    assert _is_realtime_trading_time(datetime(2026, 5, 21, 14, 59)) is True
+    assert _is_realtime_trading_time(datetime(2026, 5, 21, 15, 30)) is False
+
+
+def test_open_trade_day_helper_treats_missing_calendar_as_closed() -> None:
+    class FakeResult:
+        def mappings(self):
+            return self
+
+        def one_or_none(self):
+            return None
+
+    class FakeSession:
+        async def execute(self, statement, params=None):
+            return FakeResult()
+
+    assert asyncio.run(_is_open_trade_day(FakeSession(), date(2026, 5, 23))) is False

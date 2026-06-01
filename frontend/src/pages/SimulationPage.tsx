@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, Banknote, BriefcaseBusiness, LineChart, Loader2, Play, Plus, RefreshCw, X, GitBranch } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, Banknote, BriefcaseBusiness, LineChart, Loader2, Plus, RefreshCw, Trash2, X, GitBranch, ShieldCheck } from 'lucide-react'
 import { ColorType, LineSeries, createChart, type IChartApi, type UTCTimestamp } from 'lightweight-charts'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
@@ -11,7 +11,13 @@ interface Account {
   initial_cash: string
   available_cash: string
   frozen_cash: string
+  position_value: string
+  unrealized_pnl: string
+  today_pnl: string
+  today_pnl_rate: string
   total_asset: string
+  valuation_source: string
+  valuation_error: string | null
   status: string
   config: Record<string, unknown> | null
   updated_at: string
@@ -20,6 +26,7 @@ interface Account {
 interface Position {
   id: number
   ts_code: string
+  stock_name: string | null
   shares: number
   available_shares: number
   frozen_shares: number
@@ -29,6 +36,9 @@ interface Position {
   unrealized_pnl: string
   profit_rate: string
 }
+
+type PositionSortKey = 'unrealized_pnl' | 'profit_rate'
+type SortDirection = 'asc' | 'desc'
 
 interface Order {
   id: number
@@ -74,6 +84,17 @@ interface NavPoint {
   cumulative_nav: string
 }
 
+interface RiskGuardStatus {
+  status: 'running' | 'stale' | 'missing'
+  last_seen_at: string | null
+  seconds_since_seen: number | null
+  loaded_positions: number
+  tracked_symbols: number
+  last_error: string | null
+  last_trigger: Record<string, unknown> | null
+  last_blocked_reason: string | null
+}
+
 function money(value: string | number | null | undefined) {
   return `¥${formatNumber(value, 2)}`
 }
@@ -83,6 +104,80 @@ function cnMarketTone(value: string | number | null | undefined) {
   if (n > 0) return 'text-red-600'
   if (n < 0) return 'text-emerald-600'
   return 'text-muted'
+}
+
+function signedMoney(value: string | number | null | undefined) {
+  const n = Number(value)
+  const sign = n > 0 ? '+' : ''
+  return `${sign}${money(value)}`
+}
+
+function formatPercentFromRatio(value: unknown) {
+  if (value === null || value === undefined || value === '') return ''
+  return formatNumber(Number(value) * 100, 4)
+}
+
+function signedPercentFromRatio(value: unknown, digits = 2) {
+  if (value === null || value === undefined || value === '') return '暂无'
+  const n = Number(value)
+  if (!Number.isFinite(n)) return '暂无'
+  const sign = n > 0 ? '+' : ''
+  return `${sign}${formatNumber(n * 100, digits)}%`
+}
+
+function formatSeconds(value: number | null | undefined) {
+  if (value === null || value === undefined) return '暂无'
+  if (value < 60) return `${value} 秒前`
+  return `${Math.floor(value / 60)} 分钟前`
+}
+
+function riskGuardLabel(status: RiskGuardStatus['status']) {
+  if (status === 'running') return '运行中'
+  if (status === 'stale') return '已过期'
+  return '未发现'
+}
+
+function RiskGuardSection({
+  status,
+  takeProfitBreached,
+}: {
+  status: RiskGuardStatus | null
+  takeProfitBreached: boolean
+}) {
+  const tone = status?.status === 'running'
+    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+    : 'border-amber-200 bg-amber-50 text-amber-800'
+  const message = !status
+    ? '正在读取后台守护状态'
+    : status.status === 'running'
+      ? status.last_blocked_reason
+        ? `最近阻断: ${status.last_blocked_reason}`
+        : status.last_trigger
+          ? `最近触发: ${String(status.last_trigger.ts_code ?? '')} ${String(status.last_trigger.reason ?? '')}`
+          : '后台守护正在轮询实时行情'
+      : takeProfitBreached
+        ? '持仓已达到止盈线，但后台守护未运行或未及时轮询'
+        : '后台守护未运行或心跳过期'
+
+  return (
+    <section className={`rounded-lg border p-4 text-sm ${tone}`}>
+      <div className="flex flex-wrap items-center gap-3">
+        <ShieldCheck className="h-4 w-4 shrink-0" />
+        <span className="font-medium">实时风控守护</span>
+        <span className="rounded-md border border-current/20 px-2 py-0.5 text-xs">{status ? riskGuardLabel(status.status) : '读取中'}</span>
+        {status?.last_seen_at ? <span className="text-xs opacity-80">最近心跳 {formatSeconds(status.seconds_since_seen)}</span> : null}
+      </div>
+      <div className="mt-2">{message}</div>
+      {status ? (
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs opacity-80">
+          <span>持仓 {formatNumber(status.loaded_positions)}</span>
+          <span>股票 {formatNumber(status.tracked_symbols)}</span>
+          {status.last_error ? <span>错误: {status.last_error}</span> : null}
+          {status.last_seen_at ? <span>{formatDateTime(status.last_seen_at)}</span> : null}
+        </div>
+      ) : null}
+    </section>
+  )
 }
 
 function NavChart({ points }: { points: NavPoint[] }) {
@@ -143,12 +238,6 @@ function NavChart({ points }: { points: NavPoint[] }) {
   )
 }
 
-const matchModeOptions = [
-  { value: 'close', label: '收盘价' },
-  { value: 'open', label: '开盘价' },
-  { value: 'limit', label: '限价' },
-] as const
-
 function RiskConfigSection({
   account,
   patchAccount,
@@ -161,10 +250,10 @@ function RiskConfigSection({
   const riskConfig = (account.config as Record<string, unknown> | null)?.['risk_config'] as Record<string, unknown> | undefined ?? {}
   const [editing, setEditing] = React.useState(false)
   const [form, setForm] = React.useState({
-    stop_loss_pct: String(riskConfig.stop_loss_pct ?? ''),
-    take_profit_pct: String(riskConfig.take_profit_pct ?? ''),
-    trailing_stop_pct: String(riskConfig.trailing_stop_pct ?? ''),
-    trailing_activation_pct: String(riskConfig.trailing_activation_pct ?? ''),
+    stop_loss_pct: formatPercentFromRatio(riskConfig.stop_loss_pct),
+    take_profit_pct: formatPercentFromRatio(riskConfig.take_profit_pct),
+    trailing_stop_pct: formatPercentFromRatio(riskConfig.trailing_stop_pct),
+    trailing_activation_pct: formatPercentFromRatio(riskConfig.trailing_activation_pct),
     time_stop_days: String(riskConfig.time_stop_days ?? ''),
   })
 
@@ -189,10 +278,10 @@ function RiskConfigSection({
             type="button"
             onClick={() => {
               setForm({
-                stop_loss_pct: riskConfig.stop_loss_pct != null ? String(Number(riskConfig.stop_loss_pct) * 100) : '',
-                take_profit_pct: riskConfig.take_profit_pct != null ? String(Number(riskConfig.take_profit_pct) * 100) : '',
-                trailing_stop_pct: riskConfig.trailing_stop_pct != null ? String(Number(riskConfig.trailing_stop_pct) * 100) : '',
-                trailing_activation_pct: riskConfig.trailing_activation_pct != null ? String(Number(riskConfig.trailing_activation_pct) * 100) : '',
+                stop_loss_pct: formatPercentFromRatio(riskConfig.stop_loss_pct),
+                take_profit_pct: formatPercentFromRatio(riskConfig.take_profit_pct),
+                trailing_stop_pct: formatPercentFromRatio(riskConfig.trailing_stop_pct),
+                trailing_activation_pct: formatPercentFromRatio(riskConfig.trailing_activation_pct),
                 time_stop_days: riskConfig.time_stop_days != null ? String(riskConfig.time_stop_days) : '',
               })
               setEditing(true)
@@ -247,10 +336,10 @@ function RiskConfigSection({
         </div>
       ) : (
         <div className="mt-2 grid grid-cols-5 gap-2 text-xs text-muted">
-          <div>止损: <span className="text-ink">{riskConfig.stop_loss_pct != null ? `${Number(riskConfig.stop_loss_pct) * 100}%` : '-'}</span></div>
-          <div>止盈: <span className="text-ink">{riskConfig.take_profit_pct != null ? `${Number(riskConfig.take_profit_pct) * 100}%` : '-'}</span></div>
-          <div>移动回撤: <span className="text-ink">{riskConfig.trailing_stop_pct != null ? `${Number(riskConfig.trailing_stop_pct) * 100}%` : '-'}</span></div>
-          <div>移动激活: <span className="text-ink">{riskConfig.trailing_activation_pct != null ? `${Number(riskConfig.trailing_activation_pct) * 100}%` : '-'}</span></div>
+          <div>止损: <span className="text-ink">{riskConfig.stop_loss_pct != null ? `${formatPercentFromRatio(riskConfig.stop_loss_pct)}%` : '-'}</span></div>
+          <div>止盈: <span className="text-ink">{riskConfig.take_profit_pct != null ? `${formatPercentFromRatio(riskConfig.take_profit_pct)}%` : '-'}</span></div>
+          <div>移动回撤: <span className="text-ink">{riskConfig.trailing_stop_pct != null ? `${formatPercentFromRatio(riskConfig.trailing_stop_pct)}%` : '-'}</span></div>
+          <div>移动激活: <span className="text-ink">{riskConfig.trailing_activation_pct != null ? `${formatPercentFromRatio(riskConfig.trailing_activation_pct)}%` : '-'}</span></div>
           <div>时间止损: <span className="text-ink">{riskConfig.time_stop_days != null ? `${riskConfig.time_stop_days}天` : '-'}</span></div>
         </div>
       )}
@@ -266,17 +355,45 @@ export default function SimulationPage() {
   const [trades, setTrades] = React.useState<Trade[]>([])
   const [cashFlow, setCashFlow] = React.useState<CashFlow[]>([])
   const [nav, setNav] = React.useState<NavPoint[]>([])
+  const [riskGuardStatus, setRiskGuardStatus] = React.useState<RiskGuardStatus | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [detailLoading, setDetailLoading] = React.useState(false)
   const [saving, setSaving] = React.useState(false)
+  const [deletingId, setDeletingId] = React.useState<number | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [form, setForm] = React.useState({ name: '', initial_cash: '100000', strategy_id: '' })
   const [strategies, setStrategies] = React.useState<{ id: number; name: string }[]>([])
   const [editingStrategy, setEditingStrategy] = React.useState<{ id: number; selected: string } | null>(null)
-  const [matchModes, setMatchModes] = React.useState<Record<number, 'close' | 'open' | 'limit'>>({})
+  const [positionSort, setPositionSort] = React.useState<{ key: PositionSortKey; direction: SortDirection } | null>(null)
 
   const selected = accounts.find((account) => account.id === selectedId) ?? null
+  const selectedRiskConfig = (selected?.config as Record<string, unknown> | null)?.['risk_config'] as Record<string, unknown> | undefined ?? {}
+  const takeProfitPct = Number(selectedRiskConfig.take_profit_pct ?? 0)
+  const takeProfitBreached = takeProfitPct > 0 && positions.some((position) => Number(position.profit_rate) >= takeProfitPct)
+  const sortedPositions = React.useMemo(() => {
+    if (!positionSort) return positions
+    const direction = positionSort.direction === 'desc' ? -1 : 1
+    return [...positions].sort((left, right) => {
+      const leftValue = Number(left[positionSort.key])
+      const rightValue = Number(right[positionSort.key])
+      const normalizedLeft = Number.isFinite(leftValue) ? leftValue : Number.NEGATIVE_INFINITY
+      const normalizedRight = Number.isFinite(rightValue) ? rightValue : Number.NEGATIVE_INFINITY
+      return (normalizedLeft - normalizedRight) * direction
+    })
+  }, [positions, positionSort])
+  const togglePositionSort = (key: PositionSortKey) => {
+    setPositionSort((current) => {
+      if (!current || current.key !== key) return { key, direction: 'desc' }
+      return { key, direction: current.direction === 'desc' ? 'asc' : 'desc' }
+    })
+  }
+  const positionSortIcon = (key: PositionSortKey) => {
+    if (positionSort?.key !== key) return <ArrowDown className="h-3.5 w-3.5 opacity-30" aria-hidden="true" />
+    return positionSort.direction === 'desc'
+      ? <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+      : <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+  }
 
   const loadAccounts = React.useCallback(async () => {
     setLoading(true)
@@ -315,6 +432,23 @@ export default function SimulationPage() {
     }
   }, [])
 
+  const loadRiskGuardStatus = React.useCallback(async () => {
+    try {
+      setRiskGuardStatus(await fetchJson<RiskGuardStatus>('/api/realtime/risk-guard/status'))
+    } catch {
+      setRiskGuardStatus({
+        status: 'missing',
+        last_seen_at: null,
+        seconds_since_seen: null,
+        loaded_positions: 0,
+        tracked_symbols: 0,
+        last_error: '状态接口不可用',
+        last_trigger: null,
+        last_blocked_reason: null,
+      })
+    }
+  }, [])
+
   const loadStrategies = React.useCallback(async () => {
     try {
       const data = await fetchJson<{ id: number; name: string; status: string }[]>('/api/strategies')
@@ -325,6 +459,7 @@ export default function SimulationPage() {
   React.useEffect(() => {
     void loadAccounts()
     void loadStrategies()
+    void loadRiskGuardStatus()
   }, [loadAccounts, loadStrategies])
 
   React.useEffect(() => {
@@ -368,20 +503,31 @@ export default function SimulationPage() {
     }
   }
 
-  const matchOrder = async (order: Order) => {
+  const deleteAccount = async (account: Account) => {
+    if (!window.confirm(`删除账户「${account.name}」？该账户的持仓、委托、成交、资金流水和净值记录会一并删除。`)) return
+    setDeletingId(account.id)
     setError(null)
-    const matchMode = matchModes[order.id] ?? 'close'
     try {
-      await fetchJson(`/api/sim/orders/${order.id}/match`, {
-        method: 'POST',
-        body: JSON.stringify({ match_mode: matchMode }),
+      await fetchJson(`/api/sim/accounts/${account.id}`, { method: 'DELETE' })
+      setAccounts((prev) => {
+        const next = prev.filter((item) => item.id !== account.id)
+        if (selectedId === account.id) {
+          setSelectedId(next[0]?.id ?? null)
+          if (next.length === 0) {
+            setPositions([])
+            setOrders([])
+            setTrades([])
+            setCashFlow([])
+            setNav([])
+          }
+        }
+        return next
       })
-      const label = matchModeOptions.find((option) => option.value === matchMode)?.label ?? '收盘价'
-      setNotice(`委托 ${order.id} 已按${label}撮合`)
-      if (selectedId) await loadDetail(selectedId)
-      await loadAccounts()
+      setNotice('账户已删除')
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setDeletingId(null)
     }
   }
 
@@ -406,7 +552,7 @@ export default function SimulationPage() {
         </div>
         <button
           type="button"
-          onClick={() => { void loadAccounts(); if (selectedId) void loadDetail(selectedId) }}
+          onClick={() => { void loadAccounts(); void loadRiskGuardStatus(); if (selectedId) void loadDetail(selectedId) }}
           className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-panel px-3 text-sm text-ink hover:bg-rowHover"
         >
           <RefreshCw className="h-4 w-4" />
@@ -475,18 +621,32 @@ export default function SimulationPage() {
             ) : (
               <div className="divide-y divide-line">
                 {accounts.map((account) => (
-                  <button
+                  <div
                     key={account.id}
-                    type="button"
-                    onClick={() => setSelectedId(account.id)}
-                    className={`block w-full px-4 py-3 text-left hover:bg-rowHover ${selectedId === account.id ? 'bg-rowAlt' : ''}`}
+                    className={`group flex items-start gap-2 px-4 py-3 hover:bg-rowHover ${selectedId === account.id ? 'bg-rowAlt' : ''}`}
                   >
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="font-medium text-ink">{account.name}</span>
-                      <span className="rounded-md bg-surface px-2 py-1 text-xs text-muted">{account.status}</span>
-                    </div>
-                    <div className="mt-2 text-sm text-muted">{money(account.total_asset)}</div>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedId(account.id)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="truncate font-medium text-ink">{account.name}</span>
+                        <span className="rounded-md bg-surface px-2 py-1 text-xs text-muted">{account.status}</span>
+                      </div>
+                      <div className="mt-2 text-sm text-muted">{money(account.total_asset)}</div>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void deleteAccount(account)}
+                      disabled={deletingId === account.id}
+                      className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-transparent text-muted opacity-0 hover:border-red-200 hover:bg-red-50 hover:text-red-700 group-hover:opacity-100 focus:opacity-100 disabled:opacity-50"
+                      title="删除账户"
+                      aria-label={`删除账户 ${account.name}`}
+                    >
+                      {deletingId === account.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                    </button>
+                  </div>
                 ))}
               </div>
             )}
@@ -496,18 +656,36 @@ export default function SimulationPage() {
         <div className="space-y-4">
           {selected ? (
             <>
-              <section className="grid gap-4 md:grid-cols-4">
-                {[
-                  { label: '总资产', value: money(selected.total_asset), icon: <Banknote className="h-4 w-4" /> },
-                  { label: '可用资金', value: money(selected.available_cash), icon: <BriefcaseBusiness className="h-4 w-4" /> },
-                  { label: '冻结资金', value: money(selected.frozen_cash), icon: <X className="h-4 w-4" /> },
-                  { label: '初始资金', value: money(selected.initial_cash), icon: <LineChart className="h-4 w-4" /> },
-                ].map((item) => (
-                  <div key={item.label} className="rounded-lg border border-line bg-panel p-4">
-                    <div className="flex items-center gap-2 text-xs text-muted">{item.icon}{item.label}</div>
-                    <div className="mt-2 text-lg font-semibold text-ink">{item.value}</div>
+              <section className="rounded-lg border border-line bg-panel p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-medium text-ink">账户资金</div>
+                  {selected.valuation_source === 'realtime' ? (
+                    <span className="rounded-md border border-red-100 bg-red-50 px-2 py-1 text-xs font-medium text-red-700">实时估值</span>
+                  ) : (
+                    <span className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700">行情暂不可用，使用最近估值</span>
+                  )}
+                </div>
+                {selected.valuation_error ? (
+                  <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    <AlertTriangle className="h-4 w-4 shrink-0" />
+                    <span>{selected.valuation_error}</span>
                   </div>
-                ))}
+                ) : null}
+                <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  {[
+                    { label: '总资产', value: money(selected.total_asset), subValue: null, icon: <Banknote className="h-4 w-4" />, tone: 'text-ink' },
+                    { label: '持仓市值', value: money(selected.position_value), subValue: null, icon: <LineChart className="h-4 w-4" />, tone: 'text-ink' },
+                    { label: '可用资金', value: money(selected.available_cash), subValue: null, icon: <BriefcaseBusiness className="h-4 w-4" />, tone: 'text-ink' },
+                    { label: '浮动盈亏', value: signedMoney(selected.unrealized_pnl), subValue: null, icon: <LineChart className="h-4 w-4" />, tone: cnMarketTone(selected.unrealized_pnl) },
+                    { label: '今日盈亏', value: signedMoney(selected.today_pnl), subValue: signedPercentFromRatio(selected.today_pnl_rate), icon: <LineChart className="h-4 w-4" />, tone: cnMarketTone(selected.today_pnl) },
+                  ].map((item) => (
+                    <div key={item.label} className="min-h-[92px] rounded-md border border-line bg-surface px-3 py-3">
+                      <div className="flex items-center gap-2 text-xs text-muted">{item.icon}{item.label}</div>
+                      <div className={`mt-2 font-mono text-base font-semibold tabular-nums ${item.tone}`}>{item.value}</div>
+                      {item.subValue ? <div className={`mt-1 font-mono text-xs tabular-nums ${item.tone}`}>{item.subValue}</div> : null}
+                    </div>
+                  ))}
+                </div>
               </section>
 
               <section className="rounded-lg border border-line bg-panel p-4">
@@ -561,38 +739,68 @@ export default function SimulationPage() {
 
               <RiskConfigSection account={selected} patchAccount={patchAccount} saving={saving} />
 
-              <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-                <DataTable title="持仓" loading={detailLoading} empty="暂无持仓">
-                  <table className="min-w-[760px] w-full text-left text-sm">
-                    <thead className="bg-tableHead text-xs text-muted">
-                      <tr>
-                        <th className="px-4 py-3">股票</th>
-                        <th className="px-4 py-3">持仓</th>
-                        <th className="px-4 py-3">可卖</th>
-                        <th className="px-4 py-3">成本</th>
-                        <th className="px-4 py-3">市值</th>
-                        <th className="px-4 py-3">收益率</th>
+              <RiskGuardSection status={riskGuardStatus} takeProfitBreached={takeProfitBreached} />
+
+              <DataTable title="持仓" loading={detailLoading} empty="暂无持仓">
+                <table className="min-w-[860px] w-full text-left text-sm">
+                  <thead className="bg-tableHead text-xs text-muted">
+                    <tr>
+                      <th className="px-4 py-3">股票</th>
+                      <th className="px-4 py-3">持仓 / 可卖</th>
+                      <th className="px-4 py-3">成本 / 现价</th>
+                      <th className="px-4 py-3">市值</th>
+                      <th className="px-4 py-3">
+                        <button
+                          type="button"
+                          onClick={() => togglePositionSort('unrealized_pnl')}
+                          className="inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-left font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
+                          aria-label={`按收益金额${positionSort?.key === 'unrealized_pnl' && positionSort.direction === 'desc' ? '升序' : '降序'}排序`}
+                        >
+                          收益金额
+                          {positionSortIcon('unrealized_pnl')}
+                        </button>
+                      </th>
+                      <th className="px-4 py-3">
+                        <button
+                          type="button"
+                          onClick={() => togglePositionSort('profit_rate')}
+                          className="inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-left font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
+                          aria-label={`按收益率${positionSort?.key === 'profit_rate' && positionSort.direction === 'desc' ? '升序' : '降序'}排序`}
+                        >
+                          收益率
+                          {positionSortIcon('profit_rate')}
+                        </button>
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedPositions.map((position) => (
+                      <tr key={position.id} className="border-t border-line">
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-ink">{position.stock_name || position.ts_code}</div>
+                          <div className="mt-0.5 font-mono text-xs text-muted">{position.ts_code}</div>
+                        </td>
+                        <td className="px-4 py-3 font-mono tabular-nums">
+                          <div>{formatNumber(position.shares)}</div>
+                          <div className="mt-0.5 text-xs text-muted">{formatNumber(position.available_shares)}</div>
+                        </td>
+                        <td className="px-4 py-3 font-mono tabular-nums">
+                          <div>{money(position.avg_cost)}</div>
+                          <div className="mt-0.5 text-xs text-muted">{money(position.current_price)}</div>
+                        </td>
+                        <td className="px-4 py-3 font-mono tabular-nums">{money(position.market_value)}</td>
+                        <td className={`px-4 py-3 font-mono tabular-nums ${cnMarketTone(position.unrealized_pnl)}`}>{signedMoney(position.unrealized_pnl)}</td>
+                        <td className={`px-4 py-3 font-mono tabular-nums ${cnMarketTone(position.profit_rate)}`}>{formatNumber(Number(position.profit_rate) * 100, 2)}%</td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {positions.map((position) => (
-                        <tr key={position.id} className="border-t border-line">
-                          <td className="px-4 py-3 font-medium">{position.ts_code}</td>
-                          <td className="px-4 py-3">{formatNumber(position.shares)}</td>
-                          <td className="px-4 py-3">{formatNumber(position.available_shares)}</td>
-                          <td className="px-4 py-3">{money(position.avg_cost)}</td>
-                          <td className="px-4 py-3">{money(position.market_value)}</td>
-                          <td className={`px-4 py-3 ${cnMarketTone(position.profit_rate)}`}>{formatNumber(Number(position.profit_rate) * 100, 2)}%</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </DataTable>
-                <div className="rounded-lg border border-line bg-panel p-4">
-                  <div className="mb-2 text-sm font-medium text-ink">NAV</div>
-                  <NavChart points={nav} />
-                  <div className="mt-2 text-xs text-muted">最近 {nav.length} 个快照</div>
-                </div>
+                    ))}
+                  </tbody>
+                </table>
+              </DataTable>
+
+              <section className="rounded-lg border border-line bg-panel p-4">
+                <div className="mb-2 text-sm font-medium text-ink">NAV</div>
+                <NavChart points={nav} />
+                <div className="mt-2 text-xs text-muted">最近 {nav.length} 个快照</div>
               </section>
 
               <DataTable title="委托" loading={detailLoading} empty="暂无委托">
@@ -620,19 +828,6 @@ export default function SimulationPage() {
                         <td className="px-4 py-3">
                           {order.status === '待成交' ? (
                             <div className="flex items-center gap-2">
-                              <select
-                                value={matchModes[order.id] ?? 'close'}
-                                onChange={(event) => setMatchModes((prev) => ({ ...prev, [order.id]: event.target.value as 'close' | 'open' | 'limit' }))}
-                                className="h-8 rounded-md border border-line bg-surface px-2 text-xs text-ink outline-none"
-                                title="撮合模式"
-                              >
-                                {matchModeOptions.map((option) => (
-                                  <option key={option.value} value={option.value}>{option.label}</option>
-                                ))}
-                              </select>
-                              <button type="button" onClick={() => void matchOrder(order)} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-line hover:bg-rowHover" title="撮合">
-                                <Play className="h-4 w-4" />
-                              </button>
                               <button type="button" onClick={() => void cancelOrder(order)} className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-line hover:bg-rowHover" title="撤单">
                                 <X className="h-4 w-4" />
                               </button>
