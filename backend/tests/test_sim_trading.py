@@ -637,16 +637,19 @@ async def test_match_blocks_limit_up_buy():
             FakeResult([order_row(user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(is_limit_up=True)]),
+            FakeResult([]),
         ]
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "涨停不可买入"
-    assert len(session.statements) == 3
-    assert session.commits == 0
+    assert result["status"] == "待成交"
+    assert result["matched"] is False
+    assert result["reason"] == "涨停不可买入"
+    assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert "UPDATE sim_orders" in session.statements[3]
+    assert session.params[3]["reason"] == "涨停不可买入"
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio
@@ -665,16 +668,18 @@ async def test_match_blocks_computed_limit_up_buy_by_market(market, ts_code, pre
             FakeResult([order_row(ts_code=ts_code, user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(ts_code=ts_code, market=market, pre_close=pre_close, close=close)]),
+            FakeResult([]),
         ]
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "涨停不可买入"
-    assert len(session.statements) == 3
-    assert session.commits == 0
+    assert result["status"] == "待成交"
+    assert result["matched"] is False
+    assert result["reason"] == "涨停不可买入"
+    assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert session.params[3]["reason"] == "涨停不可买入"
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio
@@ -684,16 +689,18 @@ async def test_match_blocks_computed_st_limit_up_buy():
             FakeResult([order_row(user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(pre_close=Decimal("10.0000"), close=Decimal("10.5000"), is_st=True)]),
+            FakeResult([]),
         ]
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "涨停不可买入"
-    assert len(session.statements) == 3
-    assert session.commits == 0
+    assert result["status"] == "待成交"
+    assert result["matched"] is False
+    assert result["reason"] == "涨停不可买入"
+    assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert session.params[3]["reason"] == "涨停不可买入"
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio
@@ -712,16 +719,18 @@ async def test_match_blocks_computed_limit_down_sell_by_market(market, ts_code, 
             FakeResult([order_row(direction="卖出", ts_code=ts_code, volume=600, frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(ts_code=ts_code, market=market, pre_close=pre_close, close=close)]),
+            FakeResult([]),
         ]
     )
 
-    with pytest.raises(HTTPException) as exc:
-        await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert exc.value.status_code == 409
-    assert exc.value.detail == "跌停不可卖出"
-    assert len(session.statements) == 3
-    assert session.commits == 0
+    assert result["status"] == "待成交"
+    assert result["matched"] is False
+    assert result["reason"] == "跌停不可卖出"
+    assert result["order"]["reject_reason"] == "跌停不可卖出"
+    assert session.params[3]["reason"] == "跌停不可卖出"
+    assert session.commits == 1
 
 
 @pytest.mark.asyncio

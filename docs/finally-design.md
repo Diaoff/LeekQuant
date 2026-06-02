@@ -591,7 +591,7 @@ CREATE TABLE sim_orders (
     filled_volume     INTEGER NOT NULL DEFAULT 0,
     frozen_amount     NUMERIC(20,4) NOT NULL DEFAULT 0,
     status            VARCHAR(20) NOT NULL DEFAULT '待成交',
-    reject_reason     TEXT,
+    reject_reason     TEXT,  -- 最近一次撮合未成交原因，保留待成交时也会写入
     submit_time       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     update_time       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     cancel_time       TIMESTAMPTZ,
@@ -1069,7 +1069,7 @@ def map_signal_to_action(signal_type: str, current_ratio: float, target_ratio: f
 5. 跌停：卖出信号可生成委托，但撮合可能不成交。
 6. ST：涨跌幅限制按 5% 校验。
 
-所有被规则过滤的信号仍写入 `signal_log`，`action = 'BLOCKED'`，`snapshot` 记录原因，便于复盘。
+下单前被规则过滤的信号仍写入 `signal_log`，`action = 'BLOCKED'`，`snapshot` 记录原因，便于复盘。涨停买入、跌停卖出不在下单前写 `BLOCKED`：信号和委托照常生成，撮合阶段不成交，`sim_orders.status` 保持 `待成交`，`reject_reason` 记录最近一次撮合阻断原因。
 
 ---
 
@@ -1080,8 +1080,9 @@ def map_signal_to_action(signal_type: str, current_ratio: float, target_ratio: f
 ```mermaid
 flowchart LR
     Signal["signal_log<br/>五档信号"] --> Order["sim_orders<br/>委托"]
-    Order --> Rule["规则校验<br/>交易日/T+1/涨跌停/停牌/资金"]
+    Order --> Rule["下单前规则校验<br/>交易日/T+1/停牌/资金"]
     Rule --> Match["撮合引擎<br/>市价/限价/最新价/收盘价"]
+    Match --> Pending["sim_orders<br/>待成交/reject_reason"]
     Match --> Trade["sim_trades<br/>成交"]
     Trade --> Position["sim_positions<br/>持仓更新"]
     Trade --> Cash["sim_cash_flow<br/>资金流水"]

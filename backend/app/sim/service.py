@@ -1046,7 +1046,28 @@ async def match_order(
             is_limit_down=is_limit_down,
         )
         if action == "BLOCKED":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=reason)
+            await session.execute(
+                text(
+                    """
+                    UPDATE sim_orders
+                    SET reject_reason = :reason,
+                        update_time = NOW()
+                    WHERE id = :order_id
+                    """
+                ),
+                {"order_id": order_id, "reason": reason},
+            )
+            if auto_commit:
+                await session.commit()
+            pending_order = dict(order)
+            pending_order["reject_reason"] = reason
+            return {
+                "order": _serialize_row(pending_order),
+                "status": "待成交",
+                "matched": False,
+                "reason": reason,
+                "match_mode_used": match_mode,
+            }
         price = _resolve_match_price(order, kline, match_mode)
 
     account_id = int(order["account_id"])
@@ -1238,7 +1259,7 @@ async def match_order(
     await refresh_account_assets(session, account_id=account_id)
     if auto_commit:
         await session.commit()
-    return {"trade": _serialize_row(trade), "status": "全部成交", "match_mode_used": match_mode_used}
+    return {"trade": _serialize_row(trade), "status": "全部成交", "matched": True, "match_mode_used": match_mode_used}
 
 
 async def cancel_order(session: AsyncSession, *, user_id: int, order_id: int) -> dict[str, Any]:

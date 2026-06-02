@@ -110,20 +110,24 @@ async def _match_pending_orders(session, run_date: date, match_mode: str = "clos
     )
     rows = [dict(row) for row in result.mappings().all()]
     matched = 0
+    pending = 0
     failed: list[dict[str, Any]] = []
     for row in rows:
         try:
-            await match_order(
+            match_result = await match_order(
                 session,
                 user_id=int(row["user_id"]),
                 order_id=int(row["id"]),
                 trade_date=run_date,
                 match_mode=match_mode,
             )
-            matched += 1
+            if match_result.get("matched", match_result.get("status") == "全部成交"):
+                matched += 1
+            else:
+                pending += 1
         except Exception as exc:
             failed.append({"order_id": row["id"], "error": str(exc)})
-    return {"trade_date": run_date.isoformat(), "match_mode": match_mode, "matched": matched, "failed": failed}
+    return {"trade_date": run_date.isoformat(), "match_mode": match_mode, "matched": matched, "pending": pending, "failed": failed}
 
 
 @celery_app.task(name="app.tasks.trading_tasks.realtime_risk_guard", bind=True)
