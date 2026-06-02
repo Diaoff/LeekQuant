@@ -444,7 +444,24 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     results["performance"]["engine"] = engine
                     results["performance"]["filters"] = filters
                     results["performance"]["risk_config"] = results.get("execution_assumptions", {})
+                    if results.get("strategy_errors"):
+                        results["performance"]["strategy_errors"] = results["strategy_errors"]
                     results["performance"].update(_stock_scope_diagnostics(list(all_klines.keys())))
+
+                if results.get("strategy_errors") and not results.get("trade_records") and not results.get("signal_log"):
+                    first_error = results["strategy_errors"][0]
+                    err_msg = (
+                        f"{first_error.get('error_type') or 'StrategyExecutionError'}: "
+                        f"{first_error.get('error_message') or 'strategy produced no valid signal'}"
+                    )
+                    await session.execute(
+                        text(
+                            "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
+                        ),
+                        {"err": err_msg, "id": backtest_id},
+                    )
+                    await session.commit()
+                    return {"error": err_msg, "strategy_errors": results["strategy_errors"]}
             except Exception as exc:
                 import traceback
                 err_msg = f"{exc.__class__.__name__}: {exc}\n{traceback.format_exc()}"

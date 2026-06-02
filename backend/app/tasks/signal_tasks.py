@@ -10,9 +10,9 @@ from typing import Any
 from sqlalchemy import text
 
 from app.backtest.adapter import BacktestContext, KBar
+from app.backtest.strategy_runtime import StrategyExecutionResult, execute_strategy
 from app.data.stock_scope import supported_stock_sql_condition
 from app.data.providers import DataProviderError
-from app.libs import MyTT
 from app.preferences.service import get_full_kline_sync_concurrency
 from app.realtime.models import RealtimeTick
 from app.realtime.providers import EastMoneyRealtimeProvider
@@ -29,6 +29,12 @@ A_SHARE_INTRADAY_WINDOWS = (
     (time(9, 25), time(11, 30)),
     (time(13, 0), time(15, 0)),
 )
+
+
+class StrategySignalExecutionError(RuntimeError):
+    def __init__(self, result: StrategyExecutionResult):
+        super().__init__(result.error_summary())
+        self.result = result
 
 
 def _dec(value: Any, default: str = "0") -> Decimal:
@@ -55,17 +61,8 @@ def _parse_kbar(row: dict[str, Any]) -> KBar:
     )
 
 
-def _exec_strategy(source_code: str, ctx: BacktestContext) -> dict[str, Any] | None:
-    sandbox: dict[str, Any] = {"ctx": ctx}
-    for name in dir(MyTT):
-        if not name.startswith("_"):
-            sandbox[name] = getattr(MyTT, name)
-    exec(source_code, sandbox)
-    func = sandbox.get("generate_signal")
-    if func is None:
-        return None
-    result = func(ctx)
-    return result if isinstance(result, dict) else None
+def _exec_strategy(source_code: str, ctx: BacktestContext) -> StrategyExecutionResult:
+    return execute_strategy(source_code, ctx)
 
 
 def _is_intraday_trading_time(now: datetime | None = None) -> bool:
@@ -434,7 +431,10 @@ async def _evaluate_strategy_signals(
         async with semaphore:
             current_price = quotes.get(ts_code)
             ctx = BacktestContext(klines, {}, Decimal("0"), current_price=current_price)
-            signal = await asyncio.to_thread(_exec_strategy, strategy["source_code"], ctx)
+            signal_result = await asyncio.to_thread(_exec_strategy, strategy["source_code"], ctx)
+            if not signal_result.ok:
+                raise StrategySignalExecutionError(signal_result)
+            signal = signal_result.signal
             if not signal:
                 return None
             request, current_position = _build_signal_request(
@@ -454,7 +454,14 @@ async def _evaluate_strategy_signals(
     errors: list[dict[str, Any]] = []
     task_codes = [ts_code for ts_code in stock_codes if ts_code in klines_batch]
     for ts_code, result in zip(task_codes, results, strict=False):
-        if isinstance(result, Exception):
+        if isinstance(result, StrategySignalExecutionError):
+            errors.append({
+                "strategy_id": strategy_id,
+                "ts_code": ts_code,
+                "error": str(result),
+                **result.result.to_error_dict(),
+            })
+        elif isinstance(result, Exception):
             errors.append({"strategy_id": strategy_id, "ts_code": ts_code, "error": str(result)})
         elif result is not None:
             evaluated.append(result)
@@ -726,7 +733,17 @@ async def generate_intraday_position_signals_for_date(
             current_position = (market_value / total_asset) if total_asset > 0 else Decimal("0")
             ctx = BacktestContext(klines, {}, total_asset, current_price=tick.price)
             ctx.current_position = float(current_position)
-            signal = await asyncio.to_thread(_exec_strategy, str(account["source_code"]), ctx)
+            signal_result = await asyncio.to_thread(_exec_strategy, str(account["source_code"]), ctx)
+            if not signal_result.ok:
+                stats["errors"].append({
+                    "account_id": account_id,
+                    "strategy_id": int(account["strategy_id"]),
+                    "ts_code": ts_code,
+                    "error": signal_result.error_summary(),
+                    **signal_result.to_error_dict(),
+                })
+                continue
+            signal = signal_result.signal
             if not signal:
                 continue
             signal_type = str(signal.get("signal_type") or "观望")

@@ -16,7 +16,7 @@ from typing import Any
 
 from app.backtest.cost import AShareCostCalculator, CostResult, FeeConfig
 from app.backtest.signals import SignalInput, SignalOutput, apply_cn_rules, map_signal_to_action
-from app.libs import MyTT
+from app.backtest.strategy_runtime import StrategyExecutionResult, execute_strategy
 
 
 @dataclass(slots=True)
@@ -168,6 +168,7 @@ class BacktestRunner:
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[dict[str, Any]] = []
         self.signals: list[dict[str, Any]] = []
+        self.strategy_errors: list[dict[str, Any]] = []
         self._entry_dates: dict[str, date] = {}
         self._entry_prices: dict[str, Decimal] = {}
         self._highest_since_entry: dict[str, Decimal] = {}
@@ -254,7 +255,16 @@ class BacktestRunner:
                     continue
 
                 ctx = BacktestContext(window, self.positions, total_asset)
-                signal = self._exec_strategy(ctx, total_asset)
+                signal_result = self._exec_strategy(ctx, total_asset)
+                if not signal_result.ok:
+                    self.strategy_errors.append({
+                        "strategy_id": self.config.strategy_id,
+                        "ts_code": ts_code,
+                        "trade_date": td.isoformat(),
+                        **signal_result.to_error_dict(),
+                    })
+                    continue
+                signal = signal_result.signal
                 if signal is None:
                     continue
 
@@ -399,27 +409,12 @@ class BacktestRunner:
                 position_value += price * pos.shares
         return self.cash + position_value
 
-    def _exec_strategy(self, ctx: BacktestContext, total_asset: Decimal) -> dict[str, Any] | None:
-        sandbox: dict[str, Any] = {"ctx": ctx}
-        for name in dir(MyTT):
-            if not name.startswith("_"):
-                sandbox[name] = getattr(MyTT, name)
-
+    def _exec_strategy(self, ctx: BacktestContext, total_asset: Decimal) -> StrategyExecutionResult:
         try:
-            exec(self.config.source_code, sandbox)
-            func = sandbox.get("generate_signal")
-            if func is None:
-                return None
-            try:
-                ctx.current_position = self._position_ratio(total_asset)
-            except AttributeError:
-                pass
-            result = func(ctx)
-            if not isinstance(result, dict):
-                return None
-            return result
-        except Exception:
-            return None
+            ctx.current_position = self._position_ratio(total_asset)
+        except AttributeError:
+            pass
+        return execute_strategy(self.config.source_code, ctx)
 
     def _position_ratio(self, total_asset: Decimal) -> float:
         if total_asset <= 0:
@@ -703,6 +698,7 @@ class BacktestRunner:
                 "max_drawdown_pct": round(max_dd * 100, 4),
                 "annual_vol_pct": round(annual_vol * 100, 4),
                 "win_rate_pct": round(win_rate * 100, 4),
+                "strategy_error_count": len(self.strategy_errors),
             },
             "trade_records": [
                 {
@@ -730,6 +726,8 @@ class BacktestRunner:
                 for t in self.trades
             ],
             "equity_curve": self.equity_curve,
+            "signal_log": self.signals,
+            "strategy_errors": self.strategy_errors,
             "execution_assumptions": {
                 "execution_timeframe": self.config.execution_timeframe,
                 "signal_timeframe": self.config.signal_timeframe,

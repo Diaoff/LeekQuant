@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from app.realtime.models import RealtimeTick
+from app.backtest.strategy_runtime import StrategyExecutionResult
 from app.tasks.signal_tasks import generate_all_signals_for_date, generate_intraday_position_signals_for_date
 
 
@@ -56,6 +57,30 @@ class ScriptedSession:
             async def __aenter__(self, *_a, **_kw): pass
             async def __aexit__(self, *_a, **_kw): pass
         return _Nested()
+
+
+@pytest.fixture(autouse=True)
+def patch_strategy_exec(monkeypatch):
+    from app.tasks import signal_tasks
+
+    def fake_exec_strategy(source_code, ctx):
+        sandbox = {"ctx": ctx}
+        try:
+            exec(source_code, sandbox)
+            func = sandbox.get("generate_signal")
+            if func is None:
+                return StrategyExecutionResult(ok=True, signal=None)
+            result = func(ctx)
+            return StrategyExecutionResult(ok=True, signal=result if isinstance(result, dict) else None)
+        except Exception as exc:
+            return StrategyExecutionResult(
+                ok=False,
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
+                traceback="test traceback",
+            )
+
+    monkeypatch.setattr(signal_tasks, "_exec_strategy", fake_exec_strategy)
 
 
 def kline_rows():
@@ -148,6 +173,8 @@ async def test_generate_all_signals_collects_strategy_errors_and_continues():
     assert result["signals_logged"] == 1
     assert result["error_count"] == 1
     assert result["errors"][0]["strategy_id"] == 3
+    assert result["errors"][0]["error_type"] == "RuntimeError"
+    assert result["errors"][0]["error_message"] == "boom"
     assert session.rollbacks == 0
 
 

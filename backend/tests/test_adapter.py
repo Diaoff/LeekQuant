@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.backtest import adapter as adapter_module
 from app.backtest.adapter import (
     BacktestConfig,
     BacktestContext,
@@ -20,6 +21,8 @@ from app.backtest.adapter import (
     Position,
     TradeRecord,
 )
+from app.backtest.strategy_runtime import StrategyExecutionResult
+from app.libs import MyTT
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +32,7 @@ def patch_backtest_context_position_setter(monkeypatch):
     The source code's _exec_strategy tries to set ctx.current_position but
     BacktestContext only defines a getter. This monkey-patch fixes that.
     """
+    original_current_position = BacktestContext.current_position
     _position_value = 0.0
 
     def getter(self):
@@ -38,10 +42,30 @@ def patch_backtest_context_position_setter(monkeypatch):
         nonlocal _position_value
         _position_value = value
 
+    def fake_execute_strategy(source_code, ctx, **_kwargs):
+        sandbox = {"ctx": ctx}
+        for name in dir(MyTT):
+            if not name.startswith("_"):
+                sandbox[name] = getattr(MyTT, name)
+        try:
+            exec(source_code, sandbox)
+            func = sandbox.get("generate_signal")
+            if func is None:
+                return StrategyExecutionResult(ok=True, signal=None)
+            result = func(ctx)
+            return StrategyExecutionResult(ok=True, signal=result if isinstance(result, dict) else None)
+        except Exception as exc:
+            return StrategyExecutionResult(
+                ok=False,
+                error_type=exc.__class__.__name__,
+                error_message=str(exc),
+                traceback="test traceback",
+            )
+
     BacktestContext.current_position = property(getter, setter)
+    monkeypatch.setattr(adapter_module, "execute_strategy", fake_execute_strategy)
     yield
-    # Reset to original (read-only) after test
-    BacktestContext.current_position = property(lambda self: 0.0)
+    BacktestContext.current_position = original_current_position
 
 
 def generate_klines(
@@ -452,7 +476,7 @@ def generate_signal(ctx):
         assert result["trade_count"] == 0
 
     def test_exception_in_strategy_returns_none(self):
-        """策略抛异常时返回None（静默吞掉）"""
+        """策略抛异常时不产生交易，并记录结构化错误"""
         error_strategy = '''
 def generate_signal(ctx):
     raise RuntimeError("strategy error")
@@ -464,6 +488,9 @@ def generate_signal(ctx):
         should_not_raise = lambda: runner.run({"000001.SZ": klines})
         result = should_not_raise()
         assert result["trade_count"] == 0
+        assert result["performance"]["strategy_error_count"] == 10
+        assert result["strategy_errors"][0]["error_type"] == "RuntimeError"
+        assert result["strategy_errors"][0]["error_message"] == "strategy error"
 
     def test_missing_generate_signal_returns_none(self):
         """缺少 generate_signal 函数时不产生交易"""
