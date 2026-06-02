@@ -1071,6 +1071,33 @@ def map_signal_to_action(signal_type: str, current_ratio: float, target_ratio: f
 
 下单前被规则过滤的信号仍写入 `signal_log`，`action = 'BLOCKED'`，`snapshot` 记录原因，便于复盘。涨停买入、跌停卖出不在下单前写 `BLOCKED`：信号和委托照常生成，撮合阶段不成交，`sim_orders.status` 保持 `待成交`，`reject_reason` 记录最近一次撮合阻断原因。
 
+### 6.5 盘中持仓调仓
+
+盘中持仓调仓用于模拟账户已有持仓的实时再平衡，不承担全市场扫描和盘中新开仓职责。任务入口为 `app.tasks.signal_tasks.generate_intraday_position_signals`，内部调用 `generate_intraday_position_signals_for_date()`。
+
+任务行为：
+
+1. 仅扫描 active 模拟账户中的已有持仓。
+2. 账户必须绑定 active 策略。
+3. 仅接受 `增持`、`减仓`、`卖出`、`观望`；`买入` 信号在盘中调仓中跳过，避免从空仓发起盘中新开仓。
+4. 同一账户同一股票已有待成交或部分成交委托时跳过，避免重复冻结资金或持仓。
+5. 无实时行情、无历史 K 线、已有待成交委托、信号不支持等情况写入任务返回的 `order_skip_reasons`。
+6. 策略异常写入任务返回的 `errors`，包含账户、策略和股票上下文。
+
+触发窗口：
+
+1. 只在交易日运行，交易日判断必须查询 `trade_calendar.is_open`。
+2. 只在 `09:25-11:30`、`13:00-15:00` 生效，窗口外直接返回 `skipped`。
+3. 首版不默认加入高频 Celery Beat；可通过 Celery task 手动触发或由内部运维入口触发。
+4. 若后续启用自动调度，建议 1-5 分钟频率，并保留交易窗口检查、待成交委托去重和任务结果审计。
+
+风控边界：
+
+1. 实时止盈/止损由 `realtime_risk_guard` 负责，优先级高于策略调仓。
+2. 盘中调仓复用模拟交易统一下单规则，包括 T+1、停牌、资金/持仓、100 股交易单位和涨跌停限制。
+3. 当日买入形成的持仓不可被盘中调仓卖出，卖出数量最多为 `available_shares`。
+4. 涨停买入、跌停卖出允许生成委托，但撮合阶段阻断或保持待成交，阻断原因写入订单结果或 `sim_orders.reject_reason`。
+
 ---
 
 ## 7. 模拟交易引擎工作流
@@ -1129,6 +1156,21 @@ volume = min(position.available_shares, raw_shares // 100 * 100)
 | 限价撮合 | 用户指定价格 | 买入价 >= 卖一或当日 low <= price；卖出价 <= 买一或当日 high >= price |
 
 首版可实现“收盘价撮合”和“最新价撮合”，订单簿五档深度作为增强项。
+
+### 7.2.1 盘中调仓撮合
+
+盘中持仓调仓通过 `generate_order_from_signal(..., auto_match=True, auto_match_mode="limit")` 生成委托并立即尝试限价撮合。该路径不改变模拟交易的统一账户闭环，成交后仍写入 `sim_orders`、`sim_trades`、`sim_positions`、`sim_cash_flow`，并由日终净值任务刷新 `sim_daily_nav`。
+
+盘中委托价格取实时盘口一档：
+
+| 信号 | 委托方向 | 价格来源 |
+| --- | --- | --- |
+| 增持 | 买入 | `ask1`，缺失时回退最新价 |
+| 减仓 | 卖出部分 | `bid1`，缺失时回退最新价 |
+| 卖出 | 清仓 | `bid1`，缺失时回退最新价 |
+| 观望 | 不下单 | 不适用 |
+
+撮合仍执行 A 股规则：T+1 未解锁持仓不能卖出，停牌不能成交，买入数量按 100 股取整，资金不足不下单，涨跌停在撮合阶段阻断或保持待成交。
 
 ### 7.3 费用模型
 
@@ -1601,47 +1643,45 @@ from celery.schedules import crontab
 
 beat_schedule = {
     "update-stock-basic-weekly": {
-        "task": "app.tasks.data.update_stock_basic",
+        "task": "app.tasks.data_tasks.update_stock_basic",
         "schedule": crontab(day_of_week="saturday", hour=3, minute=0),
     },
     "update-trade-calendar-weekly": {
-        "task": "app.tasks.data.update_trade_calendar",
+        "task": "app.tasks.data_tasks.update_trade_calendar",
         "schedule": crontab(day_of_week="sunday", hour=2, minute=0),
     },
     "incremental-kline-daily": {
-        "task": "app.tasks.data.incremental_kline_update",
-        "schedule": crontab(hour=18, minute=0),
-    },
-    "update-fundamentals-daily": {
-        "task": "app.tasks.data.update_fundamentals",
-        "schedule": crontab(hour=19, minute=30),
-    },
-    "generate-signals-daily": {
-        "task": "app.tasks.signals.generate_all_signals",
+        "task": "app.tasks.data_tasks.incremental_kline_update",
         "schedule": crontab(hour=17, minute=0),
     },
+    "generate-signals-daily": {
+        "task": "app.tasks.signal_tasks.generate_all_signals",
+        "schedule": crontab(hour=12, minute=0),
+    },
     "compute-factors-daily": {
-        "task": "app.tasks.factor.compute_daily_factors",
+        "task": "app.tasks.factor_tasks.compute_daily_factors",
         "schedule": crontab(hour=17, minute=30),
     },
-    "unlock-t1-positions": {
-        "task": "app.tasks.trading.unlock_t1_positions",
+    "update-fundamentals-daily": {
+        "task": "app.tasks.data_tasks.sync_fundamentals",
+        "schedule": crontab(hour=19, minute=30),
+    },
+    "unlock-t1-positions-daily": {
+        "task": "app.tasks.trading_tasks.unlock_t1_daily",
         "schedule": crontab(hour=9, minute=25),
     },
-    "match-orders-intraday": {
-        "task": "app.tasks.trading.match_orders",
-        "schedule": crontab(hour="9,10,11,13,14", minute="*/5"),
+    "match-pending-orders-daily": {
+        "task": "app.tasks.trading_tasks.match_pending_orders",
+        "schedule": crontab(hour=17, minute=5),
     },
-    "generate-daily-nav": {
-        "task": "app.tasks.trading.generate_daily_nav",
+    "snapshot-sim-nav-daily": {
+        "task": "app.tasks.trading_tasks.snapshot_nav_daily",
         "schedule": crontab(hour=15, minute=30),
-    },
-    "weekly-scoring-rank": {
-        "task": "app.tasks.factor.generate_scoring_rank",
-        "schedule": crontab(day_of_week="friday", hour=16, minute=0),
     },
 }
 ```
+
+`app.tasks.signal_tasks.generate_intraday_position_signals` 已注册到 Celery，并路由到 `trading` 队列。首版不放入默认 `beat_schedule`，避免自动高频触发行情拉取和盘中撮合；需要时由运维手动触发或在启用去重、窗口检查和任务审计后加入低频盘中调度。
 
 任务内部必须先查 `trade_calendar`，非交易日直接跳过，不能仅靠 crontab 判断。
 
