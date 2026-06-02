@@ -13,6 +13,32 @@ from typing import Any
 
 from app.core.config import get_settings
 
+SAFE_BUILTINS: dict[str, Any] = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "bool": bool,
+    "dict": dict,
+    "enumerate": enumerate,
+    "float": float,
+    "int": int,
+    "len": len,
+    "list": list,
+    "max": max,
+    "min": min,
+    "pow": pow,
+    "range": range,
+    "round": round,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "zip": zip,
+    "Exception": Exception,
+    "RuntimeError": RuntimeError,
+    "ValueError": ValueError,
+}
+
 
 class StrategyExecutionError(RuntimeError):
     """Base error for strategy runtime failures."""
@@ -134,7 +160,7 @@ def _execute_strategy_inline(
     try:
         from app.libs import MyTT
 
-        sandbox: dict[str, Any] = {"ctx": ctx}
+        sandbox: dict[str, Any] = {"__builtins__": SAFE_BUILTINS, "ctx": ctx}
         for name in dir(MyTT):
             if not name.startswith("_"):
                 sandbox[name] = getattr(MyTT, name)

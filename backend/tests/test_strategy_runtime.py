@@ -1,6 +1,8 @@
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
 from app.backtest.adapter import BacktestContext
 from app.backtest.strategy_runtime import execute_strategy
 from tests.conftest import sample_kbar
@@ -78,3 +80,35 @@ def test_execute_strategy_allow_inline_runs_without_child_process(monkeypatch) -
 
     assert result.ok is True
     assert result.signal == {"signal_type": "观望"}
+
+
+@pytest.mark.parametrize(
+    "source_code",
+    [
+        "def generate_signal(ctx):\n    open('/etc/hosts').read()\n    return {'signal_type': '观望'}",
+        "import os\n\ndef generate_signal(ctx):\n    return {'signal_type': '观望'}",
+        "def generate_signal(ctx):\n    __import__('os')\n    return {'signal_type': '观望'}",
+        "def generate_signal(ctx):\n    eval('1 + 1')\n    return {'signal_type': '观望'}",
+        "def generate_signal(ctx):\n    compile('1 + 1', '<strategy>', 'eval')\n    return {'signal_type': '观望'}",
+    ],
+)
+def test_execute_strategy_rejects_dangerous_builtins(source_code) -> None:
+    result = execute_strategy(source_code, _ctx(), timeout_seconds=2)
+
+    assert result.ok is False
+    assert result.error_type in {"NameError", "ImportError"}
+    assert result.signal is None
+    assert result.timed_out is False
+
+
+def test_execute_strategy_allows_safe_builtins() -> None:
+    result = execute_strategy(
+        "def generate_signal(ctx):\n"
+        "    score = sum(range(4)) + max([1, 2, 3]) + len(list(zip([1], [2])))\n"
+        "    return {'signal_type': '买入' if score == 10 else '观望'}",
+        _ctx(),
+        timeout_seconds=2,
+    )
+
+    assert result.ok is True
+    assert result.signal == {"signal_type": "买入"}

@@ -62,7 +62,7 @@ def _parse_kbar(row: dict[str, Any]) -> KBar:
 
 
 def _exec_strategy(source_code: str, ctx: BacktestContext) -> StrategyExecutionResult:
-    return execute_strategy(source_code, ctx, allow_inline=True)
+    return execute_strategy(source_code, ctx)
 
 
 def _is_intraday_trading_time(now: datetime | None = None) -> bool:
