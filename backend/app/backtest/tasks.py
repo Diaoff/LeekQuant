@@ -387,7 +387,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             )
 
             risk_cfg = strategy_config.get("risk_config", {})
-            risk_controls_enabled = _has_risk_controls(risk_cfg)
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -406,39 +405,10 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             )
 
             try:
-                # Engine selection: Hikyuu preferred, Python fallback
-                use_hikyuu = False
-                try:
-                    from app.backtest.hikyuu_adapter import HikyuuBacktestAdapter, HIKYUU_AVAILABLE
-                    if HIKYUU_AVAILABLE and not risk_controls_enabled:
-                        adapter = HikyuuBacktestAdapter(session)
-                        hikyuu_config = {
-                            "strategy_id": bt_row["strategy_id"],
-                            "source_code": bt_row["source_code"],
-                            "stock_pool": list(all_klines.keys()),
-                            "start_date": bt_row["start_date"],
-                            "end_date": bt_row["end_date"],
-                            "initial_cash": Decimal(str(bt_row["initial_cash"])),
-                            "fee_config": fee_cfg,
-                            "benchmark_code": bt_row.get("benchmark_code"),
-                        }
-                        results = adapter.run(hikyuu_config)
-                        use_hikyuu = True
-                except ImportError as e:
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "Hikyuu not available (%s), falling back to Python engine for backtest %s",
-                        e, backtest_id,
-                    )
-                    use_hikyuu = False
+                runner = BacktestRunner(config)
+                results = runner.run(all_klines)
 
-                if not use_hikyuu:
-                    # Fallback to Python-native BacktestRunner
-                    runner = BacktestRunner(config)
-                    results = runner.run(all_klines)
-
-                # Tag result with engine identifier
-                engine = "hikyuu" if use_hikyuu else "python"
+                engine = "python_native"
                 results["engine"] = engine
                 if "performance" in results and isinstance(results["performance"], dict):
                     results["performance"]["engine"] = engine

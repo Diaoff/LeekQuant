@@ -4,7 +4,6 @@ Reads K-line data from PostgreSQL, executes user strategy code with MyTT
 injected, and simulates daily trading using candle-path price inference.
 
 Supports stop-loss, take-profit, trailing stop, and time-based stop.
-Hikyuu C++ kernel integration is a future enhancement.
 """
 from __future__ import annotations
 

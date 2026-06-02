@@ -33,8 +33,8 @@
 - 内置 **MyTT 指标库**（28个函数）：MA、EMA、MACD、RSI、BOLL、KDJ 等
 - 通达信/同花顺兼容语法，降低学习成本
 
-### ⚡ 高性能回测引擎
-- **Hikyuu C++ 内核**驱动，支持大规模历史回测
+### ⚡ Python-native 回测引擎
+- **BacktestRunner** 驱动，回测口径与平台信号/模拟交易保持一致
 - 完整 **A股交易规则**：T+1、涨跌停、停牌处理
 - **精确费用模型**：佣金万2.5+最低5元、印花税0.05%、过户费0.001%
 
@@ -97,7 +97,7 @@ docker compose up -d   # 7个服务一键启动
 ### 计算引擎
 | 引擎 | 用途 |
 |------|------|
-| Hikyuu (C++) | A股高性能回测内核 |
+| Python-native BacktestRunner | A股规则回测、五档信号与风控执行 |
 | MyTT | 通达信/同花顺兼容指标库（28个函数） |
 
 ### 数据源
@@ -170,7 +170,7 @@ leek-quant/
 │   │   │   ├── watchlist.py     # 自选股管理
 │   │   │   └── factors.py       # M5: 因子定义/值/排行榜/ICIR查询
 │   │   ├── backtest/            # M3: 回测引擎
-│   │   │   ├── adapter.py       # Hikyuu 适配层
+│   │   │   ├── adapter.py       # Python-native 回测引擎
 │   │   │   ├── cost.py          # A股费用计算
 │   │   │   └── signals.py       # 五档信号状态机
 │   │   ├── data/                # M1/M2: 数据层
@@ -214,7 +214,7 @@ leek-quant/
 | **M0 基础环境** | ✅ 完成 | Docker Compose + PostgreSQL + Redis + FastAPI 骨架 |
 | **M1 数据基座** | ✅ 完成 | 股票列表 + 日K线(年分区) + 交易日历 + 三层回退 |
 | **M2 股票池与自选股** | ✅ 完成 | 动态筛选(ST/退市/行业) + 分组管理 + 基础前端 |
-| **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Hikyuu异步回测 |
+| **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Python-native异步回测 |
 | **M4 信号与模拟交易** | 🚧 开发中 | 五档信号状态机 + 6表闭环 + T+1解锁 |
 | **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR/API/任务 + 前端因子页 MVP |
 | **M6 实时行情** | 📋 规划中 | 东方财富WebSocket + Redis广播 |
@@ -357,7 +357,7 @@ cd frontend && npm run typecheck && npm run build && npm run test:smoke
 - ✅ T+1解锁机制
 - ✅ 涨跌停校验逻辑
 - ✅ 模拟交易资金守恒
-- ✅ Hikyuu回测适配层
+- ✅ Python-native回测引擎
 - ✅ M5 因子四表迁移、幂等 seed、单日计算、DB 权重排名、Top N API、IC/IR upsert、Celery任务入口、前端因子页 MVP
 
 ---
@@ -421,7 +421,6 @@ copies or substantial portions of the Software.
 
 感谢以下开源项目和社区：
 
-- **[Hikyuu Team](https://github.com/fasiondog/hikyuu)** — C++高性能回测引擎，A股规则完美支持
 - **[MyTT 作者](https://github.com/chenggepc/MyTT)** — 通达信/同花顺兼容指标库，28个常用函数
 - **[QuantDinger](https://github.com/quantdigger/QuantDinger)** — 架构参考母版，FastAPI/React/Celery骨架
 - **[TradingView](https://www.tradingview.com/lightweight-charts/)** — Lightweight Charts 图表库
@@ -450,8 +449,8 @@ copies or substantial portions of the Software.
 └──────┬──────────────┬──────────────┬──────────────┬─────────┘
        │              │              │              │
 ┌──────▼──────┐ ┌────▼─────┐ ┌──────▼────┐ ┌──────▼──────┐
-│   AData     │ │  Hikyuu  │ │   MyTT    │ │ EastMoney   │
-│  Baostock   │ │ (C++内核)│ │ (指标库)   │ │ (WebSocket) │
+│   AData     │ │Backtest  │ │   MyTT    │ │ EastMoney   │
+│  Baostock   │ │ Runner   │ │ (指标库)   │ │ (WebSocket) │
 │  AkShare    │ │          │ │           │ │             │
 └──────┬──────┘ └────┬─────┘ └──────┬────┘ └──────┬───────┘
        │              │              │              │

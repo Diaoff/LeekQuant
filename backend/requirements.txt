@@ -13,4 +13,3 @@ celery[redis]==5.4.0
 adata==2.9.2
 baostock==0.8.9
 akshare==1.18.60
-hikyuu>=2.4.0

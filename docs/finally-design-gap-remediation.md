@@ -33,7 +33,7 @@
 | 优先级 | 问题 | 修复目标 |
 | --- | --- | --- |
 | P0 | 策略执行安全不足 | 策略执行隔离、超时、异常可观测，避免直接在 Worker 主进程无约束 `exec`。 |
-| P0 | Hikyuu 适配器 async 调用风险 | 明确 Hikyuu 与 Python-native 引擎职责，消除 async 流程内 `asyncio.run()` 风险。 |
+| P0 | Hikyuu 适配器 async 调用风险 | 已移除 Hikyuu 适配器，回测统一使用 Python-native 引擎，消除 async 流程内 `asyncio.run()` 风险。 |
 | P0 | 增量 K 线按全局最大日期推断 | 改为逐股票缺口检测，避免部分股票缺数据被全局日期掩盖。 |
 | P1 | 数据源失败与数据质量告警不足 | 失败、复权缺失、异常涨跌幅写入 `alert_events` 并可查询。 |
 | P1 | 涨跌停语义不一致 | 固定“下单/撮合/信号记录”语义，文档和代码保持一致。 |
@@ -112,50 +112,38 @@
 
 **现状**
 
-- 文档将 Hikyuu 作为回测核心适配层，见 `docs/finally-design.md:879-927`。
-- 当前任务优先尝试 Hikyuu，但风险控制启用时使用 Python-native 回测。代码见 `backend/app/backtest/tasks.py:408-426`。
-- `HikyuuBacktestAdapter._load_market_data()` 内部定义 async 函数后调用 `asyncio.run(_load())`，位置为 `backend/app/backtest/hikyuu_adapter.py:88-129`。该 adapter 在 Celery async 流程中同步调用，存在事件循环冲突风险。
+- 历史文档曾将 Hikyuu 作为回测核心适配层。
+- 当前代码已移除 `backend/app/backtest/hikyuu_adapter.py`，回测任务只调用 Python-native `BacktestRunner`。
+- 结果统一写入 `performance.engine = "python_native"`。
 
 **风险**
 
-- Hikyuu 可用时可能因嵌套事件循环失败。
-- 实际回测能力与文档宣称不一致，导致验收口径混乱。
-- Python-native 与 Hikyuu 两套结果口径可能不一致。
+- 历史 Hikyuu 适配器存在嵌套事件循环风险。
+- 两套回测口径并存会造成结果不可比。
 
 **修复方案**
 
-1. 明确引擎策略：
-   - v1 默认使用 Python-native `BacktestRunner`。
-   - Hikyuu 为可选增强引擎，仅在 `config.engine = "hikyuu"` 时启用。
-2. 将 Hikyuu adapter 的数据加载改成纯 async 接口：
-   - `async def run_async(self, config) -> dict`
-   - 或由调用方先加载 market data，再传入同步 `adapter.run_loaded(config, market_data)`。
-3. 不允许在已有 async 调用链内使用 `asyncio.run()`。
-4. 结果中写入引擎来源：
-   - `performance.engine = "python_native"` 或 `"hikyuu"`
-   - `params_snapshot.engine`
-5. 更新 `finally-design.md`：
-   - 标注 Python-native 为当前稳定回测引擎。
-   - Hikyuu 作为 M7+ 或可选增强路径。
+1. 移除 Hikyuu 依赖、适配器和专属测试。
+2. 回测任务统一使用 Python-native `BacktestRunner`。
+3. 结果中写入 `performance.engine = "python_native"`。
+4. 更新文档，明确 Hikyuu 不再是 v1 依赖或验收项。
 
 **代码改动范围**
 
 - `backend/app/backtest/tasks.py`
-- `backend/app/backtest/hikyuu_adapter.py`
 - `backend/app/backtest/adapter.py`
 - `docs/finally-design.md`
 
 **测试要求**
 
-- Hikyuu 未安装时回测正常落库，结果标记 `python_native`。
-- Hikyuu 安装但未显式选择时仍走默认引擎。
-- 显式选择 Hikyuu 时，不出现 `asyncio.run() cannot be called from a running event loop`。
-- 两种引擎失败时均写入 `backtest_results.error_message`。
+- 回测正常落库，结果标记 `python_native`。
+- 代码库不存在业务路径导入 `app.backtest.hikyuu_adapter`。
+- `requirements.txt` 不再依赖 `hikyuu`。
 
 **验收标准**
 
-- 回测任务不再依赖嵌套事件循环。
-- 文档、API 参数和结果字段明确说明当前使用的回测引擎。
+- 回测任务不再存在 Hikyuu 嵌套事件循环风险。
+- 文档和结果字段明确说明当前使用 Python-native 回测引擎。
 
 ---
 
@@ -530,7 +518,7 @@
 
 | 文档位置 | 更新内容 |
 | --- | --- |
-| `finally-design.md` 第 5 章 | 明确当前回测引擎默认策略、Hikyuu 可选状态、策略沙箱约束。 |
+| `finally-design.md` 第 5 章 | 明确当前 Python-native 回测引擎策略和策略沙箱约束。 |
 | `finally-design.md` 第 6 章 | 修正涨跌停和 `BLOCKED` 语义，新增盘中持仓调仓说明。 |
 | `finally-design.md` 第 7 章 | 补实时风控守护进程、盘中调仓与撮合关系。 |
 | `finally-design.md` 第 8 章 | 区分因子 MVP 与 M7+ 完整分析能力。 |
@@ -545,7 +533,7 @@
 ### Phase A：安全与数据完整性
 
 1. 策略执行沙箱。
-2. Hikyuu async 调用修正和引擎来源标记。
+2. 移除 Hikyuu 适配器并统一引擎来源标记。
 3. 逐股票 K 线缺口检测与修复。
 
 **完成判定**
@@ -591,7 +579,7 @@
 ./.venv/bin/pytest backend/tests/test_realtime.py backend/tests/test_realtime_integration.py -q
 ./.venv/bin/pytest backend/tests/test_factor_tasks.py backend/tests/test_factor_api.py backend/tests/test_m5_factors.py -q
 ./.venv/bin/pytest backend/tests/test_data_service.py backend/tests/test_data_fetcher.py backend/tests/test_data_normalizers.py backend/tests/test_data_providers.py -q
-./.venv/bin/pytest backend/tests/test_tasks.py backend/tests/test_backtest_risk_config.py backend/tests/test_hikyuu_adapter.py -q
+./.venv/bin/pytest backend/tests/test_tasks.py backend/tests/test_backtest_risk_config.py backend/tests/test_backtest_engine_selection.py -q
 ```
 
 如果涉及前端或 WebSocket：
@@ -614,7 +602,7 @@ docker compose config
 | 编号 | 优先级 | 事项 | 状态 | PR/提交 | 验收测试 |
 | --- | --- | --- | --- | --- | --- |
 | R-001 | P0 | 策略执行沙箱 | Pending |  |  |
-| R-002 | P0 | Hikyuu async 调用修正 | Pending |  |  |
+| R-002 | P0 | 移除 Hikyuu 适配器并统一回测引擎 | Done |  | `test_backtest_engine_selection.py` |
 | R-003 | P0 | 逐股票 K 线缺口修复 | Pending |  |  |
 | R-004 | P1 | alert_events 告警闭环 | Pending |  |  |
 | R-005 | P1 | 涨跌停语义统一 | Pending |  |  |
@@ -622,4 +610,3 @@ docker compose config
 | R-007 | P1 | API/Celery/Docker 文档同步 | Pending |  |  |
 | R-008 | P2 | 因子分析展示边界 | Pending |  |  |
 | R-009 | P2 | 生产部署安全文档 | Pending |  |  |
-

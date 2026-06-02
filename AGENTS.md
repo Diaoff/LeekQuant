@@ -23,7 +23,7 @@ Pre-implementation. No source code, no manifests, no build config at root level.
 | DB | **PostgreSQL 15+** (single unified store — not DuckDB+Parquet+SQLite) |
 | Queue | Celery + Redis |
 | Real-time | Redis Pub/Sub → FastAPI WebSocket |
-| Backtest | Hikyuu (C++ kernel, Python bindings, A-share rules built-in) |
+| Backtest | Python-native BacktestRunner (A-share rules implemented in platform code) |
 | Indicators | MyTT (Tongdaxin/Tonghuashun compatible, single-file zero-dep) |
 | Historical data | AData (Tier 1) → Baostock (Tier 2) → AkShare (Tier 3) fallback |
 | Real-time data | EastMoney WebSocket (self-built parser) |
@@ -56,7 +56,7 @@ All 9 design docs are in `docs/`. The two most comprehensive:
 | M0 | Skeleton: Docker Compose, PostgreSQL, Redis, FastAPI, React shell | ✅ Done |
 | M1 | Infra: PostgreSQL, data sources, K-line incremental pull | ✅ Done |
 | M2 | Watchlists, strategy CRUD, Monaco Editor | ✅ Done |
-| M3 | Strategy & backtest: Hikyuu async backtest, trade records | ✅ Done |
+| M3 | Strategy & backtest: Python-native async backtest, trade records | ✅ Done |
 | M4 | 5-level signals, full sim trading engine (6 tables) | ✅ Done |
 | M5 | Multi-factor scoring, IC/IR analysis | ✅ Done |
 | M6a | HTTP snapshot realtime: EastMoney HTTP, Redis Pub/Sub, WebSocket subscribe, frontend | ✅ Done |
@@ -103,4 +103,4 @@ None configured yet. When adding tooling, follow QuantDinger conventions (see `t
 - All data sources are free Chinese financial data APIs
 - EastMoney WebSocket requires a self-built parser (no off-the-shelf library)
 - Trading calendar must account for Chinese holidays (queried from DB, not hardcoded)
-- Hikyuu has native A-share trading rules (T+1, price limits, stamp tax)
+- Backtest uses the Python-native `BacktestRunner`; A-share rules are implemented in platform code.

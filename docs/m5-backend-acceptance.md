@@ -71,8 +71,7 @@ cd frontend && npm run test:smoke
 
 非 M5 回归探针：
 
-- `backend/tests/test_hikyuu_adapter.py backend/tests/test_trade_details.py`：38 passed, 2 failed。
-- `backend/tests/test_hikyuu_adapter.py` 本轮通过。
+- 历史 `backend/tests/test_hikyuu_adapter.py` 已被 `backend/tests/test_backtest_engine_selection.py` 取代。
 - `backend/tests/test_trade_details.py::TestMultiTradeSequenceTracking::test_four_trade_sequence_tracking` 仍失败，未产生卖出记录。
 - `backend/tests/test_trade_details.py::TestTradeRecordIntegration::test_complete_lifecycle_buy_hold_sell` 仍失败，未产生卖出记录。
 

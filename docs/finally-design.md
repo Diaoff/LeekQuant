@@ -3,7 +3,7 @@
 > 版本：v1.0  
 > 日期：2026-05-15  
 > 定位：基于 QuantDinger 裁剪的纯 A 股、本地优先、隐私至上的量化研究与模拟交易平台。  
-> 核心策略：最大化复用 Hikyuu、MyTT、AData、Baostock、AkShare、Qlib 的成熟能力，减少自研回测、指标、数据采集与因子表达式工作量。
+> 核心策略：最大化复用 MyTT、AData、Baostock、AkShare、Qlib 范式等成熟能力；回测采用 Python-native 引擎，确保与平台五档信号、风控和模拟交易口径一致。
 
 ---
 
@@ -22,7 +22,7 @@ Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法�
 | 来源 | 保留 | 裁剪 |
 | --- | --- | --- |
 | QuantDinger | FastAPI / React / Celery / Docker Compose 骨架、前后端分离形态、异步任务模式 | 非 A 股市场、跨资产交易、云端托管、多市场行情适配、复杂 AI 训练平台 |
-| Hikyuu | C++ 回测内核、A 股交易规则、Python 调用能力 | 不直接暴露复杂底层配置给普通用户 |
+| Python-native BacktestRunner | A 股回测、五档信号、费用、风控和交易限制 | 不引入外部回测内核，保持结果口径一致 |
 | Qlib | 因子表达式范式、因子计算与评估思路 | 不引入完整 Qlib 数据目录和重型训练流水线 |
 
 ### 1.3 核心功能范围
@@ -66,14 +66,14 @@ flowchart TB
 
     subgraph TASK["异步任务层：Celery + Redis"]
         DataWorker["数据 Worker<br/>股票列表 / K线 / 基本面 / 日历"]
-        BacktestWorker["回测 Worker<br/>Hikyuu 适配层"]
+        BacktestWorker["回测 Worker<br/>Python-native BacktestRunner"]
         FactorWorker["因子 Worker<br/>因子计算 / ICIR / 排名"]
         SimWorker["模拟交易 Worker<br/>撮合 / T+1 / 净值"]
         Beat["Celery Beat<br/>定时调度"]
     end
 
     subgraph ENGINE["计算与开源集成层"]
-        Hikyuu["Hikyuu<br/>C++ A股回测内核"]
+        BacktestEngine["BacktestRunner<br/>A股回测引擎"]
         MyTT["MyTT<br/>通达信/同花顺指标"]
         QlibLite["Qlib-like 因子表达式"]
         EastMoney["东方财富 WebSocket 解析器"]
@@ -111,7 +111,7 @@ flowchart TB
     DataWorker --> Baostock
     DataWorker --> AkShare
     DataWorker --> PG
-    BacktestWorker --> Hikyuu
+    BacktestWorker --> BacktestEngine
     BacktestWorker --> MyTT
     BacktestWorker --> PG
     FactorWorker --> QlibLite
@@ -143,7 +143,7 @@ flowchart TB
 | K线分区 | `daily_kline` 按 `trade_date` 年分区 | 全市场多年 K 线数据量大，按日期范围查询频繁 |
 | 数据源回退 | AData -> Baostock -> AkShare | 主源优先，备源补基本面，兜底源补分钟线和全市场数据 |
 | 实时独立 | 东方财富 WebSocket / AllTick 不进入历史数据链路 | 历史拉取和盘中推送故障域隔离 |
-| 回测异步 | Hikyuu 只在 Celery Worker 调用 | 避免阻塞 FastAPI 事件循环，便于控制 CPU 资源 |
+| 回测异步 | Python-native BacktestRunner 只在 Celery Worker 调用 | 避免阻塞 FastAPI 事件循环，便于控制 CPU 资源 |
 | 因子计算 | 简单聚合下推 PostgreSQL，复杂计算由 Worker 执行 | 减少数据搬运，保留 Python 灵活性 |
 | 模拟交易 | 委托 -> 成交 -> 持仓 -> 流水 -> 净值 6 表闭环 | 便于审计、复盘、还原账户状态 |
 
@@ -876,12 +876,12 @@ sequenceDiagram
 
 ---
 
-## 5. Hikyuu 回测引擎集成方案
+## 5. Python-native 回测引擎方案
 
 ### 5.1 集成原则
 
-- Hikyuu 是回测内核，不直接承担平台任务调度、用户认证、数据源拉取。
-- 平台通过 `HikyuuBacktestAdapter` 封装 Hikyuu API，避免业务层依赖 Hikyuu 具体类名。
+- Python-native `BacktestRunner` 是 v1 回测内核，不引入 Hikyuu 外部依赖。
+- 回测逻辑与五档信号、费用、涨跌停、停牌和风险控制使用同一套平台规则。
 - 用户策略源码保存在 `strategies.source_code`，回测时由 Worker 在隔离进程中编译和运行。
 - 回测结果统一序列化为 `backtest_results.performance`、`trade_records`、`equity_curve`。
 
@@ -895,10 +895,10 @@ FastAPI
 
 Celery Worker
   -> 加载 strategy / daily_kline
-  -> HikyuuBacktestAdapter
-       1. PostgreSQL K线 -> Hikyuu KData / 临时数据驱动
-       2. 用户 Python 策略 -> Signal / System 组件
-       3. A股费用与规则 -> TradeCost / Environment
+  -> BacktestRunner
+       1. PostgreSQL K线 -> KBar
+       2. 用户 Python 策略 -> 五档信号
+       3. A股费用、涨跌停、停牌、风控 -> 平台规则
        4. run
        5. 结果提取 -> JSONB
   -> 更新 backtest_results(status=success/failed)
@@ -907,51 +907,29 @@ Celery Worker
 ### 5.3 适配器接口
 
 ```python
-class HikyuuBacktestAdapter:
-    def __init__(self, db_session):
-        self.db = db_session
-
-    def run(self, config: dict) -> dict:
-        """
-        config:
-          strategy_id, source_code, target, start_date, end_date,
-          initial_cash, fee_model, benchmark_code, adjust
-        return:
-          performance, trade_records, equity_curve, per_stock
-        """
-        market_data = self.load_market_data(config)
-        strategy = self.compile_strategy(config["source_code"])
-        system = self.build_system(strategy, config)
-        raw_result = self.execute(system, market_data, config)
-        return self.serialize_result(raw_result)
+runner = BacktestRunner(config)
+results = runner.run(all_klines)
+results["engine"] = "python_native"
+results["performance"]["engine"] = "python_native"
 ```
 
 ### 5.4 数据对接
 
-首版建议优先使用内存转换或临时文件方式接入 Hikyuu，待稳定后再实现正式 PostgreSQL 数据驱动。
+回测任务从 PostgreSQL 读取日 K 数据并转换为 `KBar`，不通过外部回测数据驱动。
 
 ```python
-def load_market_data(self, ts_code: str, start: date, end: date) -> list[dict]:
-    rows = self.db.execute("""
+async def load_market_data(session, ts_code: str, start: date, end: date) -> list[KBar]:
+    result = await session.execute(text("""
         SELECT trade_date, open, high, low, close, volume, amount, adj_factor
         FROM daily_kline
         WHERE ts_code = :ts_code
           AND trade_date BETWEEN :start AND :end
         ORDER BY trade_date
-    """, {"ts_code": ts_code, "start": start, "end": end}).fetchall()
+    """), {"ts_code": ts_code, "start": start, "end": end})
 
     return [
-        {
-            "datetime": row.trade_date,
-            "open": row.open,
-            "high": row.high,
-            "low": row.low,
-            "close": row.close,
-            "volume": row.volume,
-            "amount": row.amount,
-            "adj_factor": row.adj_factor,
-        }
-        for row in rows
+        KBar(...)
+        for row in result.mappings().all()
     ]
 ```
 
@@ -959,7 +937,7 @@ def load_market_data(self, ts_code: str, start: date, end: date) -> list[dict]:
 
 | 规则 | 回测处理 | 模拟交易处理 |
 | --- | --- | --- |
-| T+1 | Hikyuu 交易环境或适配层禁止当日买入后当日卖出 | `available_shares` 次交易日 09:25 解锁 |
+| T+1 | 平台回测规则禁止当日买入后当日卖出 | `available_shares` 次交易日 09:25 解锁 |
 | 涨跌停 | 根据信号日 `pre_close`、ST 状态、板块规则判断是否可成交 | 买入涨停、卖出跌停时挂单或延后 |
 | 印花税 | 卖出收取，费率配置化 | `sim_trades.stamp_tax` 记录 |
 | 佣金 | 双向收取，最低 5 元 | `sim_trades.commission` 记录 |
@@ -1006,18 +984,6 @@ def generate_signal(ctx):
             "reason": "MA5 > MA20"
         }
     return {"signal_type": "观望", "target_position": ctx.current_position}
-```
-
-#### Hikyuu 高级接口
-
-```python
-from hikyuu import *
-from MyTT import *
-
-def create_system(params):
-    # 返回 Hikyuu System / Signal / MoneyManager 组件
-    # 具体 API 由固定的 Hikyuu 版本适配层封装
-    return build_cross_ma_system(params)
 ```
 
 ### 5.7 运行安全
@@ -1377,7 +1343,7 @@ def score_cross_section(factor_df, weights):
 | 队列 | 任务 |
 | --- | --- |
 | data | 股票列表更新、K线增量、基本面、交易日历 |
-| backtest | Hikyuu 回测、参数敏感性分析 |
+| backtest | Python-native 回测、参数敏感性分析 |
 | factor | 因子计算、IC/IR、打分排名 |
 | trading | 信号执行、模拟撮合、T+1 解锁、净值快照 |
 | default | 轻量后台任务 |
@@ -1616,8 +1582,6 @@ redis>=5.0.0
 adata>=3.0.0
 baostock>=0.8.8
 akshare>=1.14.0
-hikyuu>=2.1.0
-
 numpy>=1.26.0
 pandas>=2.1.0
 scipy>=1.13.0
@@ -1689,7 +1653,7 @@ beat_schedule = {
 | M0 基础环境 | Docker Compose、PostgreSQL、Redis、FastAPI、React 空壳 | 可一键启动，健康检查通过 | `docker compose up`，API `/health` |
 | M1 数据基座 | 股票列表、交易日历、日线 K 线全量和增量 | `stock_basic`、`daily_kline`、`trade_calendar` 有数据 | 随机股票 K 线与源数据比对 |
 | M2 自选股与策略 | 自选分组、策略 CRUD、基础前端页面 | 自选分组、自选股 API、市场页、策略管理 | 自选股分组管理 |
-| M3 策略与回测 | Monaco 编辑、MyTT 提示、Hikyuu 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
+| M3 策略与回测 | Monaco 编辑、MyTT 提示、Python-native 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
 | M4 信号与模拟交易 | 五档信号、模拟交易 6 表、T+1 / 涨跌停 / 费用 | 信号中心、模拟账户闭环 | 资金守恒和 T+1 单测 |
 | M5 多因子 | 因子定义、计算、IC/IR、排行榜 | 因子页、排行榜 | IC 计算样例验证 |
 | M6a HTTP 快照实时 | 东方财富 HTTP 快照、Redis 广播、WebSocket 订阅、前端实时看板 | 自选股实时刷新 | ✅ 已通过验收 |
@@ -1722,7 +1686,7 @@ beat_schedule = {
 - Docker Compose 一键启动所有服务。
 - 至少 20 只 A 股完成历史 K 线拉取与增量更新。
 - 策略编辑器能运行一个 MyTT 双均线策略。
-- Hikyuu 回测结果写入 `backtest_results`。
+- Python-native 回测结果写入 `backtest_results`，`performance.engine = "python_native"`。
 - 模拟交易能完成买入、T+1 解锁、卖出、费用记录、净值快照。
 - 因子排行榜能按配置输出 Top N 股票。
 - WebSocket 能对自选股推送实时 tick。
@@ -1736,9 +1700,8 @@ beat_schedule = {
 | 免费数据源不稳定 | K 线或基本面中断 | AData -> Baostock -> AkShare 自动回退；失败告警；本地缓存 |
 | 多源复权口径差异 | 回测收益失真 | 记录 `data_source`；以 AData 为基准；源切换后复权校准 |
 | 东方财富协议变化 | 实时行情中断 | 自建解析模块隔离；心跳重连；AllTick 可配置备用 |
-| Hikyuu API 变化 | 回测模块失效 | 锁定版本；适配层封装；核心回测单测 |
 | 用户策略安全 | 任意代码执行风险 | 子进程隔离、超时、白名单模块、禁网络和写文件 |
-| 大规模回测超时 | 用户体验差 | Celery 队列、并发限制、任务进度、Hikyuu C++ 加速 |
+| 大规模回测超时 | 用户体验差 | Celery 队列、并发限制、任务进度、分批执行 |
 | PostgreSQL 数据膨胀 | 磁盘占用增长 | 年分区、索引控制、可配置数据保留、磁盘告警 |
 | A 股规则遗漏 | 回测 / 模拟不真实 | T+1、涨跌停、ST、费用、停牌边界测试 |
 | 因子未来函数 | 因子结果虚高 | 因子表达式只允许历史窗口；IC 计算严格用未来收益标签 |
@@ -1750,7 +1713,6 @@ beat_schedule = {
 
 | 项目 | 用途 | 集成方式 |
 | --- | --- | --- |
-| Hikyuu | C++ 高性能 A 股回测引擎 | 后端 Celery Worker 中通过适配层调用 |
 | MyTT | 通达信 / 同花顺兼容指标 | 后端策略运行白名单导入；前端 Monaco 补全 |
 | AData | A 股历史 K 线、股票列表 | 数据层 Tier1 主源 |
 | Baostock | K 线备源、财务三表、估值 | 数据层 Tier2，基本面主源 |
