@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback, get_data_proxy_url, stock_basic_providers
+from app.data.models import DailyKline
 from app.data.repository import (
     backfill_stock_basic_market,
     create_alert,
@@ -29,6 +31,9 @@ SAMPLE_STOCK_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sh_main", ("600", "601")),
     ("sh_secondary", ("603", "605")),
 )
+PRICE_LIMIT_TOLERANCE = Decimal("0.0005")
+MAIN_BOARD_PRICE_LIMIT = Decimal("0.10")
+ST_PRICE_LIMIT = Decimal("0.05")
 
 
 def default_kline_window(today: date | None = None) -> tuple[date, date]:
@@ -85,6 +90,87 @@ def _balanced_sample_stock_codes(rows: list[Any], limit: int) -> list[str]:
                 return selected
 
     return selected
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _daily_kline_quality_issues(records: list[DailyKline], *, is_st: bool = False) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    limit_pct = ST_PRICE_LIMIT if is_st else MAIN_BOARD_PRICE_LIMIT
+    for record in records:
+        if record.is_suspended:
+            continue
+        if record.adj_factor is None:
+            issues.append(
+                {
+                    "type": "missing_adj_factor",
+                    "ts_code": record.ts_code,
+                    "trade_date": record.trade_date,
+                    "source": record.data_source,
+                    "reason": "adj_factor is missing on non-suspended daily kline",
+                }
+            )
+        close = _as_decimal(record.close)
+        pre_close = _as_decimal(record.pre_close)
+        if pre_close is None or pre_close == Decimal("0") or close is None:
+            continue
+        change_pct = (close - pre_close) / pre_close
+        if abs(change_pct) > limit_pct + PRICE_LIMIT_TOLERANCE:
+            issues.append(
+                {
+                    "type": "abnormal_price_change",
+                    "ts_code": record.ts_code,
+                    "trade_date": record.trade_date,
+                    "source": record.data_source,
+                    "close": record.close,
+                    "pre_close": record.pre_close,
+                    "change_pct": change_pct,
+                    "limit_pct": limit_pct,
+                    "reason": "close/pre_close change exceeds A-share price limit threshold",
+                }
+            )
+    return issues
+
+
+async def _create_kline_quality_alert(
+    session: AsyncSession,
+    *,
+    ts_code: str,
+    source: str,
+    start_date: date,
+    end_date: date,
+    issues: list[dict[str, Any]],
+) -> None:
+    if not issues:
+        return
+    counts: dict[str, int] = {}
+    for issue in issues:
+        issue_type = str(issue["type"])
+        counts[issue_type] = counts.get(issue_type, 0) + 1
+    await create_alert(
+        session,
+        level="warning",
+        category="data_quality",
+        title="Daily kline data quality warnings",
+        message=f"{ts_code} has {len(issues)} data quality warnings during kline sync",
+        payload={
+            "ts_code": ts_code,
+            "source": source,
+            "start_date": start_date,
+            "end_date": end_date,
+            "counts": counts,
+            "issues": issues[:20],
+        },
+    )
+
+
+async def _is_st_stock(session: AsyncSession, ts_code: str) -> bool:
+    result = await session.execute(text("SELECT is_st FROM stock_basic WHERE ts_code = :ts_code"), {"ts_code": ts_code})
+    return bool(result.scalar_one_or_none())
 
 
 async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> list[str]:
@@ -299,9 +385,18 @@ async def sync_kline(
                     )
                     for record in records:
                         validate_daily_kline(record)
+                    quality_issues = _daily_kline_quality_issues(records, is_st=await _is_st_stock(wk_session, ts_code))
                     count = await upsert_daily_kline(wk_session, records)
                     latest = max((record.trade_date for record in records), default=None)
                     await record_update_success(wk_session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+                    await _create_kline_quality_alert(
+                        wk_session,
+                        ts_code=ts_code,
+                        source=source,
+                        start_date=start_date,
+                        end_date=end_date,
+                        issues=quality_issues,
+                    )
                     await wk_session.commit()
                     return {"ts_code": ts_code, "source": source, "count": count}
                 except Exception as exc:
@@ -327,9 +422,18 @@ async def sync_kline(
             for record in records:
                 validate_daily_kline(record)
             assert session is not None
+            quality_issues = _daily_kline_quality_issues(records, is_st=await _is_st_stock(session, ts_code))
             count = await upsert_daily_kline(session, records)
             latest = max((record.trade_date for record in records), default=None)
             await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
+            await _create_kline_quality_alert(
+                session,
+                ts_code=ts_code,
+                source=source,
+                start_date=start_date,
+                end_date=end_date,
+                issues=quality_issues,
+            )
             return {"ts_code": ts_code, "source": source, "count": count}
         except Exception as exc:
             message = str(exc)
@@ -371,7 +475,12 @@ async def sync_kline(
                 category="data_sync",
                 title="Daily kline sync completed with failures",
                 message=f"{len(failures)} symbols failed during kline sync",
-                payload={"failures": failures[:20]},
+                payload={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "failure_count": len(failures),
+                    "failures": failures[:20],
+                },
             )
             if commit_each:
                 await session.commit()
@@ -383,7 +492,12 @@ async def sync_kline(
                     category="data_sync",
                     title="Daily kline sync completed with failures",
                     message=f"{len(failures)} symbols failed during kline sync",
-                    payload={"failures": failures[:20]},
+                    payload={
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "failure_count": len(failures),
+                        "failures": failures[:20],
+                    },
                 )
                 await alert_session.commit()
 

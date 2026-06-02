@@ -120,6 +120,51 @@ def test_data_status_returns_stable_empty_shape() -> None:
     assert body["recent_alerts"] == []
 
 
+def test_system_alerts_returns_filtered_alerts() -> None:
+    class FakeAlertSession(FakeTaskSession):
+        async def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            self.params.append(params or {})
+            return FakeResult(
+                [
+                    {
+                        "id": 7,
+                        "level": "warning",
+                        "category": "data_quality",
+                        "title": "Daily kline data quality warnings",
+                        "message": "000001.SZ has warnings",
+                        "payload": {"ts_code": "000001.SZ"},
+                        "is_resolved": False,
+                        "created_at": "2026-05-18T10:00:00+08:00",
+                        "resolved_at": None,
+                    }
+                ]
+            )
+
+    fake_session = FakeAlertSession()
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/system/alerts?level=warning&category=data_quality&is_resolved=false&limit=25&offset=5")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()[0]["payload"] == {"ts_code": "000001.SZ"}
+    assert "FROM alert_events" in fake_session.statements[0]
+    assert fake_session.params[0] == {
+        "level": "warning",
+        "category": "data_quality",
+        "is_resolved": False,
+        "limit": 25,
+        "offset": 5,
+    }
+
+
 def test_sample_kline_task_reports_queue_unavailable(monkeypatch) -> None:
     from kombu.exceptions import OperationalError
 

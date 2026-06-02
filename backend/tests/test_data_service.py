@@ -1,4 +1,5 @@
 from datetime import date
+from decimal import Decimal
 import asyncio
 
 import pytest
@@ -53,6 +54,8 @@ class FakeSession:
 
     async def execute(self, statement, params=None):
         sql = str(statement)
+        if "SELECT is_st FROM stock_basic" in sql:
+            return FakeResult([(False,)])
         if "SELECT ts_code" in sql:
             self.select_calls += 1
             if self.select_calls == 1:
@@ -62,6 +65,18 @@ class FakeSession:
 
     async def commit(self):
         self.commits += 1
+
+
+class StAwareSession(FakeSession):
+    def __init__(self, *, is_st=False):
+        super().__init__()
+        self.is_st = is_st
+
+    async def execute(self, statement, params=None):
+        sql = str(statement)
+        if "SELECT is_st FROM stock_basic" in sql:
+            return FakeResult([(self.is_st,)])
+        return await super().execute(statement, params)
 
 
 class StaticStockSession:
@@ -193,6 +208,165 @@ async def test_sync_kline_keeps_serial_transaction_when_commit_each_is_false(mon
 
     assert result["requested_symbols"] == 2
     assert session.commits == 1
+
+
+async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatch) -> None:
+    import app.data.service as service
+
+    class MissingAdjProvider:
+        name = "quality"
+
+        def fetch_daily_kline(self, ts_code, start_date, end_date):
+            return [
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=start_date,
+                    open=Decimal("10"),
+                    high=Decimal("10.5"),
+                    low=Decimal("9.8"),
+                    close=Decimal("10.2"),
+                    pre_close=Decimal("10"),
+                    adj_factor=None,
+                    data_source=self.name,
+                )
+            ]
+
+    captured = {}
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    async def fake_create_alert(*_args, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+    monkeypatch.setattr(service, "create_alert", fake_create_alert)
+
+    result = await sync_kline(
+        StAwareSession(),
+        ["000001.SZ"],
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[MissingAdjProvider()],
+    )
+
+    assert result["inserted_or_updated"] == 1
+    assert captured["category"] == "data_quality"
+    assert captured["payload"]["counts"] == {"missing_adj_factor": 1}
+    assert captured["payload"]["issues"][0]["ts_code"] == "000001.SZ"
+
+
+async def test_sync_kline_writes_quality_alert_for_abnormal_price_change(monkeypatch) -> None:
+    import app.data.service as service
+
+    class AbnormalChangeProvider:
+        name = "quality"
+
+        def fetch_daily_kline(self, ts_code, start_date, end_date):
+            return [
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=start_date,
+                    open=Decimal("10"),
+                    high=Decimal("11.5"),
+                    low=Decimal("9.8"),
+                    close=Decimal("11.2"),
+                    pre_close=Decimal("10"),
+                    adj_factor=Decimal("1"),
+                    data_source=self.name,
+                )
+            ]
+
+    alerts = []
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    async def fake_create_alert(*_args, **kwargs):
+        alerts.append(kwargs)
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+    monkeypatch.setattr(service, "create_alert", fake_create_alert)
+
+    await sync_kline(
+        StAwareSession(),
+        ["000001.SZ"],
+        date(2026, 5, 18),
+        date(2026, 5, 18),
+        providers=[AbnormalChangeProvider()],
+    )
+
+    assert alerts[0]["payload"]["counts"] == {"abnormal_price_change": 1}
+    issue = alerts[0]["payload"]["issues"][0]
+    assert issue["change_pct"] == Decimal("0.12")
+    assert issue["limit_pct"] == Decimal("0.10")
+
+
+async def test_sync_kline_skips_quality_alert_for_suspended_or_missing_pre_close(monkeypatch) -> None:
+    import app.data.service as service
+
+    class SkippedQualityProvider:
+        name = "quality"
+
+        def fetch_daily_kline(self, ts_code, start_date, end_date):
+            return [
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=start_date,
+                    open=Decimal("10"),
+                    high=Decimal("11.5"),
+                    low=Decimal("9.8"),
+                    close=Decimal("11.2"),
+                    pre_close=Decimal("10"),
+                    adj_factor=None,
+                    is_suspended=True,
+                    data_source=self.name,
+                ),
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=end_date,
+                    open=Decimal("10"),
+                    high=Decimal("11.5"),
+                    low=Decimal("9.8"),
+                    close=Decimal("11.2"),
+                    pre_close=None,
+                    adj_factor=Decimal("1"),
+                    data_source=self.name,
+                ),
+            ]
+
+    calls = {"alerts": 0}
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    async def fake_record_update_success(*_args, **_kwargs):
+        return None
+
+    async def fake_create_alert(*_args, **_kwargs):
+        calls["alerts"] += 1
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
+    monkeypatch.setattr(service, "create_alert", fake_create_alert)
+
+    await sync_kline(
+        StAwareSession(),
+        ["000001.SZ"],
+        date(2026, 5, 18),
+        date(2026, 5, 19),
+        providers=[SkippedQualityProvider()],
+    )
+
+    assert calls == {"alerts": 0}
 
 
 async def test_select_sample_stock_codes_balances_across_code_segments() -> None:
