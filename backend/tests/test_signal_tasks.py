@@ -150,6 +150,49 @@ async def test_generate_all_signals_logs_strategy_signal_without_account():
 
 
 @pytest.mark.asyncio
+async def test_generate_all_signals_without_explicit_date_uses_latest_synced_kline():
+    session = ScriptedSession(
+        [
+            FakeResult(scalar=date(2026, 5, 21)),
+            FakeResult([{"id": 3, "user_id": 1, "name": "S", "source_code": "def generate_signal(ctx):\n    return {'signal_type': '观望', 'current_position': 0}"}]),
+            FakeResult([{"ts_code": "000001.SZ"}]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult(kline_rows()),
+            FakeResult([]),
+            FakeResult([{"id": 77}]),
+        ]
+    )
+
+    result = await generate_all_signals_for_date(session)
+
+    assert result["trade_date"] == "2026-05-21"
+    assert result["signals_logged"] == 1
+    assert "SELECT MAX(trade_date)" in session.statements[0]
+    assert any(params.get("trade_date") == date(2026, 5, 21) for params in session.params)
+
+
+@pytest.mark.asyncio
+async def test_generate_all_signals_without_kline_falls_back_to_latest_open_calendar_day():
+    session = ScriptedSession(
+        [
+            FakeResult(scalar=None),
+            FakeResult(scalar=date(2026, 5, 20)),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
+    )
+
+    result = await generate_all_signals_for_date(session)
+
+    assert result["trade_date"] == "2026-05-20"
+    assert result["strategy_count"] == 0
+    assert "FROM trade_calendar" in session.statements[1]
+
+
+@pytest.mark.asyncio
 async def test_generate_all_signals_collects_strategy_errors_and_continues():
     session = ScriptedSession(
         [

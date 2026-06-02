@@ -103,33 +103,7 @@ def _child_main(conn: Connection, source_code: str, ctx: Any, options: StrategyE
     started = time.perf_counter()
     try:
         _apply_resource_limits(options)
-        from app.libs import MyTT
-
-        sandbox: dict[str, Any] = {"ctx": ctx}
-        for name in dir(MyTT):
-            if not name.startswith("_"):
-                sandbox[name] = getattr(MyTT, name)
-
-        exec(source_code, sandbox)
-        func = sandbox.get("generate_signal")
-        if func is None:
-            conn.send(
-                StrategyExecutionResult(
-                    ok=True,
-                    signal=None,
-                    duration_ms=int((time.perf_counter() - started) * 1000),
-                )
-            )
-            return
-
-        result = func(ctx)
-        conn.send(
-            StrategyExecutionResult(
-                ok=True,
-                signal=result if isinstance(result, dict) else None,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-            )
-        )
+        conn.send(_execute_strategy_inline(source_code, ctx, options=options, started=started))
     except BaseException as exc:
         tb = _truncate(traceback_mod.format_exc(), options.traceback_chars)
         try:
@@ -149,15 +123,61 @@ def _child_main(conn: Connection, source_code: str, ctx: Any, options: StrategyE
         conn.close()
 
 
+def _execute_strategy_inline(
+    source_code: str,
+    ctx: Any,
+    *,
+    options: StrategyExecutionOptions,
+    started: float | None = None,
+) -> StrategyExecutionResult:
+    started = started or time.perf_counter()
+    try:
+        from app.libs import MyTT
+
+        sandbox: dict[str, Any] = {"ctx": ctx}
+        for name in dir(MyTT):
+            if not name.startswith("_"):
+                sandbox[name] = getattr(MyTT, name)
+
+        exec(source_code, sandbox)
+        func = sandbox.get("generate_signal")
+        if func is None:
+            return StrategyExecutionResult(
+                ok=True,
+                signal=None,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+        result = func(ctx)
+        return StrategyExecutionResult(
+            ok=True,
+            signal=result if isinstance(result, dict) else None,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+    except BaseException as exc:
+        return StrategyExecutionResult(
+            ok=False,
+            error_type=exc.__class__.__name__,
+            error_message=str(exc),
+            traceback=_truncate(traceback_mod.format_exc(), options.traceback_chars),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            timed_out=False,
+        )
+
+
 def execute_strategy(
     source_code: str,
     ctx: Any,
     *,
     timeout_seconds: float | None = None,
+    allow_inline: bool = False,
 ) -> StrategyExecutionResult:
     """Run strategy code in an isolated child process and return a structured result."""
     options = _runtime_options(timeout_seconds)
     started = time.perf_counter()
+    if allow_inline:
+        return _execute_strategy_inline(source_code, ctx, options=options, started=started)
+
     proc_ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = proc_ctx.Pipe(duplex=False)
     process = proc_ctx.Process(

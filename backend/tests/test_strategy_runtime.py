@@ -60,3 +60,21 @@ def test_execute_strategy_times_out_and_terminates_child() -> None:
     assert result.ok is False
     assert result.error_type == "StrategyTimeoutError"
     assert result.timed_out is True
+
+
+def test_execute_strategy_allow_inline_runs_without_child_process(monkeypatch) -> None:
+    from app.backtest import strategy_runtime
+
+    def fail_process(*_args, **_kwargs):
+        raise AssertionError("inline execution must not spawn a child process")
+
+    monkeypatch.setattr(strategy_runtime.multiprocessing, "get_context", fail_process)
+
+    result = execute_strategy(
+        "def generate_signal(ctx):\n    return {'signal_type': '观望'}",
+        _ctx(),
+        allow_inline=True,
+    )
+
+    assert result.ok is True
+    assert result.signal == {"signal_type": "观望"}

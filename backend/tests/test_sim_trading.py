@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.realtime.models import RealtimeTick
-from app.realtime.risk_guard import GuardPosition, RealtimeRiskGuard, trigger_realtime_stop_order, write_risk_guard_heartbeat
+from app.realtime.risk_guard import GuardPosition, RealtimeRiskGuard, _aggressive_sell_price, trigger_realtime_stop_order, write_risk_guard_heartbeat
 from app.sim.service import SignalOrderRequest, _fee_config, _global_fee_config, generate_order_from_signal, match_order, snapshot_daily_nav, unlock_t1_positions
 
 
@@ -822,9 +822,9 @@ async def test_realtime_risk_guard_limit_up_take_profit_creates_sell_order():
             FakeResult([kline_row(trade_date=trade_date, pre_close=Decimal("10.0000"), close=Decimal("11.0000"), is_limit_up=True)]),
             FakeResult([]),
             FakeResult([signal_row(action="SELL_ALL", signal_type="卖出", trade_date=trade_date, current_position=Decimal("0.909091"))]),
-            FakeResult([order_row(direction="卖出", price=Decimal("10.9900"), volume=1000, frozen_amount=Decimal("0.0000"))]),
+            FakeResult([order_row(direction="卖出", price=Decimal("10.9800"), volume=1000, frozen_amount=Decimal("0.0000"))]),
             FakeResult([]),
-            *sell_match_results(price=Decimal("10.9900"), volume=1000, trade_date=trade_date),
+            *sell_match_results(price=Decimal("10.9800"), volume=1000, trade_date=trade_date),
         ]
     )
 
@@ -853,10 +853,10 @@ async def test_realtime_risk_guard_limit_up_take_profit_creates_sell_order():
     assert session.params[0]["price"] == Decimal("11.0000")
     assert session.params[6]["reason"] == "止盈"
     assert json.loads(session.params[6]["snapshot"])["source"] == "realtime_risk_guard"
-    assert session.params[7]["price"] == Decimal("10.9900")
+    assert session.params[7]["price"] == Decimal("10.9800")
     assert result["match"]["status"] == "全部成交"
     assert result["match"]["match_mode_used"] == "limit"
-    assert session.params[12]["price"] == Decimal("10.9900")
+    assert session.params[12]["price"] == Decimal("10.9800")
 
 
 @pytest.mark.asyncio
@@ -886,9 +886,9 @@ async def test_realtime_risk_guard_falls_back_to_latest_available_kline_for_orde
             FakeResult([kline_row(ts_code="000539.SZ", trade_date=latest_kline_date, pre_close=Decimal("9.0000"), close=Decimal("9.3000"))]),
             FakeResult([]),
             FakeResult([signal_row(action="SELL_ALL", signal_type="卖出", trade_date=trade_date, current_position=Decimal("0.900716"))]),
-            FakeResult([order_row(account_id=4, direction="卖出", price=Decimal("9.7700"), volume=1000, frozen_amount=Decimal("0.0000"))]),
+            FakeResult([order_row(account_id=4, direction="卖出", price=Decimal("9.7600"), volume=1000, frozen_amount=Decimal("0.0000"))]),
             FakeResult([]),
-            *sell_match_results(account_id=4, ts_code="000539.SZ", price=Decimal("9.7700"), volume=1000, trade_date=trade_date),
+            *sell_match_results(account_id=4, ts_code="000539.SZ", price=Decimal("9.7600"), volume=1000, trade_date=trade_date),
         ]
     )
 
@@ -914,7 +914,7 @@ async def test_realtime_risk_guard_falls_back_to_latest_available_kline_for_orde
     assert result["order"]["direction"] == "卖出"
     assert "ORDER BY dk.trade_date DESC" in session.statements[7]
     assert session.params[7]["trade_date"] == trade_date
-    assert session.params[10]["price"] == Decimal("9.7700")
+    assert session.params[10]["price"] == Decimal("9.7600")
     assert result["match"]["status"] == "全部成交"
     assert result["match"]["match_mode_used"] == "limit"
 
@@ -945,9 +945,9 @@ async def test_realtime_risk_guard_uses_realtime_price_when_daily_kline_missing(
             FakeResult([]),
             FakeResult([]),
             FakeResult([signal_row(action="SELL_ALL", signal_type="卖出", trade_date=trade_date, current_position=Decimal("0.900716"))]),
-            FakeResult([order_row(account_id=4, direction="卖出", price=Decimal("9.7700"), volume=1000, frozen_amount=Decimal("0.0000"))]),
+            FakeResult([order_row(account_id=4, direction="卖出", price=Decimal("9.7600"), volume=1000, frozen_amount=Decimal("0.0000"))]),
             FakeResult([]),
-            *sell_match_results(account_id=4, ts_code="000539.SZ", price=Decimal("9.7700"), volume=1000, trade_date=trade_date, with_kline=False),
+            *sell_match_results(account_id=4, ts_code="000539.SZ", price=Decimal("9.7600"), volume=1000, trade_date=trade_date, with_kline=False),
         ]
     )
 
@@ -974,9 +974,15 @@ async def test_realtime_risk_guard_uses_realtime_price_when_daily_kline_missing(
     snapshot = json.loads(session.params[9]["snapshot"])
     assert snapshot["source"] == "realtime_risk_guard"
     assert snapshot["kline_fallback"] == "realtime_order_price"
-    assert session.params[10]["price"] == Decimal("9.7700")
+    assert session.params[10]["price"] == Decimal("9.7600")
     assert result["match"]["status"] == "全部成交"
     assert result["match"]["match_mode_used"] == "order_price_fallback"
+
+
+def test_realtime_risk_guard_aggressive_sell_price_uses_bid1_minus_one_cent():
+    assert _aggressive_sell_price(RealtimeTick(ts_code="000001.SZ", price=Decimal("10.0000"), bid1=Decimal("9.9800"))) == Decimal("9.9700")
+    assert _aggressive_sell_price(RealtimeTick(ts_code="000001.SZ", price=Decimal("10.0000"))) == Decimal("9.9900")
+    assert _aggressive_sell_price(RealtimeTick(ts_code="000001.SZ", price=Decimal("0.0050"), bid1=Decimal("0.0050"))) == Decimal("0.0100")
 
 
 @pytest.mark.asyncio

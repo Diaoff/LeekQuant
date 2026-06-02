@@ -91,6 +91,11 @@ def _preflight_blocked_reason(position: GuardPosition, tick: RealtimeTick) -> st
     return None
 
 
+def _aggressive_sell_price(tick: RealtimeTick) -> Decimal:
+    base_price = tick.bid1 or tick.price
+    return max(base_price - Decimal("0.01"), Decimal("0.01")).quantize(Decimal("0.0001"))
+
+
 async def write_risk_guard_heartbeat(
     session: AsyncSession,
     *,
@@ -342,7 +347,7 @@ async def trigger_realtime_stop_order(
         },
     )
     await refresh_tick_position_value(session, position=position, tick=tick)
-    order_price = tick.bid1 or tick.price
+    order_price = _aggressive_sell_price(tick)
     result = await generate_order_from_signal(
         session,
         user_id=position.user_id,

@@ -21,7 +21,7 @@ from app.tasks.celery_app import celery_app
 from app.tasks.tracking import _run_tracked
 
 LOOKBACK_BARS = 60
-MAX_SIGNAL_CONCURRENCY = 8
+MAX_SIGNAL_CONCURRENCY = 4
 BUY_SIGNAL_TYPES = {"买入", "增持"}
 EXIT_SIGNAL_TYPES = {"卖出", "减仓"}
 INTRADAY_POSITION_SIGNAL_TYPES = {"增持", "减仓", "卖出", "观望"}
@@ -62,7 +62,7 @@ def _parse_kbar(row: dict[str, Any]) -> KBar:
 
 
 def _exec_strategy(source_code: str, ctx: BacktestContext) -> StrategyExecutionResult:
-    return execute_strategy(source_code, ctx)
+    return execute_strategy(source_code, ctx, allow_inline=True)
 
 
 def _is_intraday_trading_time(now: datetime | None = None) -> bool:
@@ -98,20 +98,33 @@ async def _fetch_midday_quotes(stock_codes: list[str]) -> dict[str, Decimal]:
     return {}
 
 
-async def _last_open_trade_date(session, requested: date | None) -> date | None:
+async def _resolve_signal_trade_date(session, requested: date | None) -> date | None:
     if requested is not None:
         return requested
     result = await session.execute(
         text(
             """
-            SELECT COALESCE(
-                (SELECT MAX(trade_date) FROM daily_kline),
-                (SELECT cal_date FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE ORDER BY cal_date DESC LIMIT 1)
-            )
+            SELECT MAX(trade_date)
+            FROM daily_kline
             """
         )
     )
-    return result.scalar_one_or_none()
+    latest_kline_date = result.scalar_one_or_none()
+    if latest_kline_date is not None:
+        return latest_kline_date
+
+    calendar_result = await session.execute(
+        text(
+            """
+            SELECT cal_date
+            FROM trade_calendar
+            WHERE is_open = TRUE AND cal_date <= CURRENT_DATE
+            ORDER BY cal_date DESC
+            LIMIT 1
+            """
+        )
+    )
+    return calendar_result.scalar_one_or_none()
 
 
 async def _active_strategies(session) -> list[dict[str, Any]]:
@@ -528,17 +541,9 @@ def _enrich_and_sort_signals(
 
 
 async def generate_all_signals_for_date(session, *, trade_date: date | None = None, concurrency: int | None = None) -> dict[str, Any]:
-    if trade_date is not None:
-        run_date = trade_date
-    else:
-        run_date = date.today()
-        cal = await session.execute(
-            text("SELECT is_open FROM trade_calendar WHERE cal_date = :d"),
-            {"d": run_date},
-        )
-        row = cal.mappings().one_or_none()
-        if not row or not row["is_open"]:
-            return {"skipped": True, "reason": "today is not an open trade day"}
+    run_date = await _resolve_signal_trade_date(session, trade_date)
+    if run_date is None:
+        return {"skipped": True, "reason": "no synced kline or open trade date available"}
 
     strategies = await _active_strategies(session)
     stock_codes = await _stock_codes(session)
