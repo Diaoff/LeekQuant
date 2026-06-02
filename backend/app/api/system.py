@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.repository import list_alerts
+from app.data.repository import list_alerts, resolve_alert
 from app.db.session import get_session
 
 router = APIRouter(prefix="/api/system", tags=["system"])
@@ -28,3 +28,14 @@ async def system_alerts(
         limit=limit,
         offset=offset,
     )
+
+
+@router.post("/alerts/{alert_id}/resolve")
+async def resolve_system_alert(
+    alert_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    alert = await resolve_alert(session, alert_id)
+    if alert is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="alert not found")
+    return alert

@@ -165,6 +165,73 @@ def test_system_alerts_returns_filtered_alerts() -> None:
     }
 
 
+def test_system_alert_resolve_marks_alert_resolved() -> None:
+    class FakeResolveAlertSession(FakeTaskSession):
+        async def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            self.params.append(params or {})
+            return FakeResult(
+                [
+                    {
+                        "id": 7,
+                        "level": "warning",
+                        "category": "data_quality",
+                        "title": "Daily kline data quality warnings",
+                        "message": "000001.SZ has warnings",
+                        "payload": {"ts_code": "000001.SZ"},
+                        "is_resolved": True,
+                        "created_at": "2026-05-18T10:00:00+08:00",
+                        "resolved_at": "2026-05-18T10:10:00+08:00",
+                    }
+                ]
+            )
+
+    fake_session = FakeResolveAlertSession()
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.post("/api/system/alerts/7/resolve")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["is_resolved"] is True
+    assert response.json()["payload"] == {"ts_code": "000001.SZ"}
+    assert "UPDATE alert_events" in fake_session.statements[0]
+    assert "RETURNING id, level, category" in fake_session.statements[0]
+    assert fake_session.params[0] == {"alert_id": 7}
+    assert fake_session.commits == 1
+
+
+def test_system_alert_resolve_returns_404_when_missing() -> None:
+    class FakeMissingAlertSession(FakeTaskSession):
+        async def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            self.params.append(params or {})
+            return FakeResult([])
+
+    fake_session = FakeMissingAlertSession()
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.post("/api/system/alerts/404/resolve")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "alert not found"
+    assert fake_session.params[0] == {"alert_id": 404}
+    assert fake_session.commits == 0
+
+
 def test_sample_kline_task_reports_queue_unavailable(monkeypatch) -> None:
     from kombu.exceptions import OperationalError
 

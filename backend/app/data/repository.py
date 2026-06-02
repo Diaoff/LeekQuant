@@ -392,6 +392,26 @@ async def list_alerts(
     return [dict(row) for row in result.mappings().all()]
 
 
+async def resolve_alert(session: AsyncSession, alert_id: int) -> dict[str, Any] | None:
+    result = await session.execute(
+        text(
+            """
+            UPDATE alert_events
+            SET is_resolved = TRUE,
+                resolved_at = NOW()
+            WHERE id = :alert_id
+            RETURNING id, level, category, title, message, payload, is_resolved, created_at, resolved_at
+            """
+        ),
+        {"alert_id": alert_id},
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return None
+    await session.commit()
+    return dict(row)
+
+
 async def create_pending_task_run(
     session: AsyncSession,
     *,

@@ -15,7 +15,6 @@
 
 当前剩余问题集中在：
 
-- `alert_events` 已能写入和查询，但缺少 resolve 操作，告警闭环不完整。
 - 模拟交易涨跌停语义已基本统一到撮合阶段阻断，但回测规则层仍提前阻断，复盘口径仍需选择并统一。
 - `sync_kline(commit_each=True)` 相关测试会触发真实 PostgreSQL 连接，测试隔离不足。
 
@@ -33,7 +32,6 @@
 
 | 编号 | 优先级 | 事项 | 当前状态 | 修复目标 |
 | --- | --- | --- | --- | --- |
-| R-004 | P1 | `alert_events` 告警闭环 | Partial | 在现有写入和查询基础上补 resolve repository/API，并覆盖测试。 |
 | R-005 | P1 | 涨跌停语义统一 | Partial | 明确并统一回测、模拟交易、信号记录的涨跌停处理口径。 |
 | R-010 | P1 | `sync_kline` 测试隔离 | Pending | `commit_each=True` 分支测试不应连接真实 PostgreSQL。 |
 
@@ -41,42 +39,7 @@
 
 ## 3. 待整改项
 
-### 3.1 R-004：`alert_events` 告警闭环
-
-**当前状态**
-
-- `alert_events` 表已存在。
-- 数据同步和质量异常路径已有 `create_alert()` 写入。
-- 已实现 `GET /api/system/alerts`，支持 level / category / is_resolved / limit / offset 查询。
-- 尚未实现 `resolve_alert_event()` 和 `POST /api/system/alerts/{id}/resolve`。
-
-**风险**
-
-- 告警只能查看，不能关闭或标记已处理。
-- 前端/运维无法区分新告警和已处理历史告警。
-- 文档中的“告警闭环”验收口径尚未完全满足。
-
-**修复方案**
-
-1. 在告警 repository 中新增 resolve 方法：
-   - 输入：`alert_id`
-   - 行为：将 `is_resolved = TRUE`，`resolved_at = NOW()`
-   - 返回：更新后的告警记录；不存在时返回 404 或等价业务错误。
-2. 在 `backend/app/api/system.py` 新增：
-   - `POST /api/system/alerts/{alert_id}/resolve`
-3. 补充 API 测试：
-   - 查询支持 resolved 过滤。
-   - resolve 成功返回 `is_resolved = true`。
-   - resolve 不存在 ID 返回 404。
-
-**验收标准**
-
-- 告警能写入、查询、过滤、标记处理。
-- resolve 操作不影响历史 payload 和创建时间。
-
----
-
-### 3.2 R-005：涨跌停语义统一
+### 3.1 R-005：涨跌停语义统一
 
 **当前状态**
 
@@ -123,7 +86,7 @@
 
 ---
 
-### 3.3 R-010：`sync_kline(commit_each=True)` 测试隔离
+### 3.2 R-010：`sync_kline(commit_each=True)` 测试隔离
 
 **当前状态**
 
@@ -168,8 +131,9 @@ backend/tests/test_data_service.py::test_sync_kline_reports_progress_on_completi
 | R-001 | P0 | 策略执行安全沙箱 | Done | `SAFE_BUILTINS` 已显式注入策略 sandbox；信号任务不再使用 inline 执行；`test_strategy_runtime.py` 覆盖 dangerous builtin / import / 文件读取拒绝。 |
 | R-002 | P0 | 移除 Hikyuu 适配器并统一回测引擎 | Done | 回测结果写入 `performance.engine = "python_native"`；`test_backtest_engine_selection.py` 覆盖。 |
 | R-003 | P0 | 逐股票 K 线缺口检测与修复 | Done | `infer_incremental_kline_ranges()`、`incremental_kline_update()` 已存在；`test_data_service.py` 和 `test_tasks.py` 覆盖 gap 场景。 |
+| R-004 | P1 | `alert_events` 告警闭环 | Done | 已实现 `GET /api/system/alerts` 和 `POST /api/system/alerts/{alert_id}/resolve`；`test_api_data.py` 覆盖过滤查询、resolve 成功和 404。 |
 | R-006 | P1 | 盘中持仓调仓文档同步 | Done | `finally-design.md` 已记录 `generate_intraday_position_signals` 任务、交易窗口和不默认 beat 调度策略。 |
-| R-007 | P1 | API/Celery/Docker 文档同步 | Mostly Done | `finally-design.md` 已同步当前任务路径、alerts 查询路径、local compose、celery command 和 Redis/生产安全说明；剩余 resolve API 归入 R-004。 |
+| R-007 | P1 | API/Celery/Docker 文档同步 | Done | `finally-design.md` 已同步当前任务路径、alerts 查询/resolve 路径、local compose、celery command 和 Redis/生产安全说明。 |
 | R-008 | P2 | 因子分析 MVP 与完整能力边界 | Done | `finally-design.md` 已区分因子 MVP 与 M7+ 表达式/图表增强能力。 |
 | R-009 | P2 | 生产安全配置说明 | Done | `finally-design.md` 已说明 Redis 密码、强 `SECRET_KEY`、受控 CORS、反向代理 TLS 等生产要求。 |
 
@@ -208,6 +172,18 @@ R-001 专项核查结果：
 python3 -m pytest backend/tests/test_strategy_runtime.py backend/tests/test_signal_tasks.py backend/tests/test_backtest_engine_selection.py -q
 ```
 
+R-004 专项核查结果：
+
+```text
+28 passed
+```
+
+命令：
+
+```bash
+python3 -m pytest backend/tests/test_api_data.py -q
+```
+
 全量目标命令最近一次核查结果：
 
 ```text
@@ -238,10 +214,10 @@ docker compose config
 | R-001 | P0 | 策略执行安全沙箱 | Done | 保持 `test_strategy_runtime.py` 通过。 |
 | R-002 | P0 | 移除 Hikyuu 适配器并统一回测引擎 | Done | 保持 `test_backtest_engine_selection.py` 通过。 |
 | R-003 | P0 | 逐股票 K 线缺口修复 | Done | 保持 gap 相关测试通过。 |
-| R-004 | P1 | `alert_events` 告警闭环 | Partial | resolve repository/API 和 404 测试通过。 |
+| R-004 | P1 | `alert_events` 告警闭环 | Done | 保持 `test_api_data.py` 通过。 |
 | R-005 | P1 | 涨跌停语义统一 | Partial | 回测和模拟交易同口径测试通过。 |
 | R-006 | P1 | 盘中调仓文档同步 | Done | 保持 `finally-design.md` 任务说明与代码一致。 |
-| R-007 | P1 | API/Celery/Docker 文档同步 | Mostly Done | resolve API 补齐后重新核查 OpenAPI 与文档。 |
+| R-007 | P1 | API/Celery/Docker 文档同步 | Done | 保持 API 路径与文档一致。 |
 | R-008 | P2 | 因子分析展示边界 | Done | 保持 MVP/M7+ 边界清晰。 |
 | R-009 | P2 | 生产部署安全文档 | Done | 保持 local/prod 配置边界清晰。 |
 | R-010 | P1 | `sync_kline` 测试隔离 | Pending | 目标测试命令全绿。 |
