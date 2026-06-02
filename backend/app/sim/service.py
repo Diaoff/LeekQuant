@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.backtest.cost import AShareCostCalculator, FeeConfig, build_fee_config
 from app.backtest.signals import SignalInput, apply_cn_rules, map_signal_to_action
 from app.data.providers import DataProviderError
+from app.realtime.models import RealtimeTick
 from app.realtime.providers import EastMoneyRealtimeProvider
 
 LOT_SIZE = 100
@@ -40,7 +41,8 @@ def _dec(value: Any, default: str = "0") -> Decimal:
 
 
 def _money(value: Decimal) -> Decimal:
-    return value.quantize(MONEY_QUANT)
+    quantized = value.quantize(MONEY_QUANT)
+    return Decimal("0").quantize(MONEY_QUANT) if quantized == 0 else quantized
 
 
 def _json(value: dict[str, Any] | None) -> str:
@@ -95,19 +97,19 @@ def serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_serialize_row(dict(row)) for row in rows]
 
 
-async def _realtime_prices(ts_codes: list[str]) -> tuple[dict[str, Decimal], str | None]:
+async def _realtime_ticks(ts_codes: list[str]) -> tuple[dict[str, RealtimeTick], str | None]:
     if not ts_codes:
         return {}, None
     try:
         ticks = await EastMoneyRealtimeProvider(ts_codes).fetch_snapshot()
     except DataProviderError as exc:
         return {}, str(exc)
-    return {tick.ts_code: tick.price for tick in ticks}, None
+    return {tick.ts_code: tick for tick in ticks}, None
 
 
 def _apply_realtime_position_values(
     positions: list[dict[str, Any]],
-    prices: dict[str, Decimal],
+    ticks: dict[str, RealtimeTick],
 ) -> tuple[list[dict[str, Any]], Decimal, Decimal, bool]:
     enriched: list[dict[str, Any]] = []
     total_value = Decimal("0")
@@ -117,8 +119,17 @@ def _apply_realtime_position_values(
         row = dict(position)
         ts_code = str(row["ts_code"])
         row["stock_name"] = row.get("stock_name") or ts_code
-        price = prices.get(ts_code)
+        tick = ticks.get(ts_code)
+        price = tick.price if tick is not None else None
         if price is not None:
+            if bool(row.get("closed_today")):
+                row["current_price"] = price
+                row["valuation_source"] = "realtime"
+                has_realtime = True
+                total_value += _dec(row.get("market_value"))
+                total_unrealized_pnl += _dec(row.get("unrealized_pnl"))
+                enriched.append(row)
+                continue
             shares = int(row.get("shares") or 0)
             avg_cost = _dec(row.get("avg_cost"))
             market_value = _money(price * shares)
@@ -136,14 +147,22 @@ def _apply_realtime_position_values(
     return enriched, _money(total_value), _money(total_unrealized_pnl), has_realtime
 
 
-async def _latest_position_closes(session: AsyncSession, ts_codes: list[str]) -> dict[str, Decimal]:
+def _position_quote_codes(positions: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(position["ts_code"])
+        for position in positions
+        if int(position.get("shares") or 0) > 0 or bool(position.get("closed_today"))
+    ]
+
+
+async def _position_today_baselines(session: AsyncSession, ts_codes: list[str]) -> dict[str, Decimal]:
     codes = sorted(set(ts_codes))
     if not codes:
         return {}
     result = await session.execute(
         text(
             """
-            SELECT DISTINCT ON (ts_code) ts_code, close
+            SELECT DISTINCT ON (ts_code) ts_code, COALESCE(pre_close, close) AS baseline_price
             FROM daily_kline
             WHERE ts_code = ANY(:ts_codes)
               AND close IS NOT NULL
@@ -152,20 +171,27 @@ async def _latest_position_closes(session: AsyncSession, ts_codes: list[str]) ->
         ),
         {"ts_codes": codes},
     )
-    return {str(row["ts_code"]): _dec(row["close"]) for row in result.mappings().all() if row.get("close") is not None}
+    return {str(row["ts_code"]): _dec(row["baseline_price"]) for row in result.mappings().all() if row.get("baseline_price") is not None}
 
 
 def _apply_position_today_pnl(
     positions: list[dict[str, Any]],
-    latest_closes: dict[str, Decimal],
+    baseline_prices: dict[str, Decimal],
+    ticks: dict[str, RealtimeTick],
 ) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
     for position in positions:
         row = dict(position)
         ts_code = str(row["ts_code"])
         shares = int(row.get("shares") or 0)
+        tick = ticks.get(ts_code)
+        if tick is not None:
+            row["today_pnl"] = _money(tick.change * shares)
+            row["today_pnl_rate"] = format((tick.change_pct / Decimal("100")).quantize(RATIO_QUANT), "f")
+            enriched.append(row)
+            continue
         current_price = _dec(row.get("current_price")) if row.get("current_price") is not None else None
-        previous_close = latest_closes.get(ts_code)
+        previous_close = baseline_prices.get(ts_code)
         if shares > 0 and current_price is not None and previous_close is not None and previous_close > 0:
             row["today_pnl"] = _money((current_price - previous_close) * shares)
             today_pnl_rate = ((current_price - previous_close) / previous_close).quantize(RATIO_QUANT)
@@ -182,10 +208,11 @@ async def enrich_account_with_realtime_valuation(
     account: dict[str, Any],
 ) -> dict[str, Any]:
     positions = await _account_positions(session, int(account["id"]))
-    prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
-    enriched_positions, position_value, unrealized_pnl, has_realtime = _apply_realtime_position_values(positions, prices)
-    latest_closes = await _latest_position_closes(session, [str(position["ts_code"]) for position in enriched_positions if int(position.get("shares") or 0) > 0])
-    enriched_positions = _apply_position_today_pnl(enriched_positions, latest_closes)
+    quote_codes = _position_quote_codes(positions)
+    ticks, error = await _realtime_ticks(quote_codes)
+    enriched_positions, position_value, unrealized_pnl, has_realtime = _apply_realtime_position_values(positions, ticks)
+    baseline_prices = await _position_today_baselines(session, _position_quote_codes(enriched_positions))
+    enriched_positions = _apply_position_today_pnl(enriched_positions, baseline_prices, ticks)
     row = dict(account)
     row["position_value"] = position_value
     row["unrealized_pnl"] = unrealized_pnl
@@ -221,24 +248,54 @@ async def _latest_nav_total_asset(session: AsyncSession, account_id: int) -> Dec
     return _dec(row["total_asset"]) if row else None
 
 
-async def _account_positions(session: AsyncSession, account_id: int) -> list[dict[str, Any]]:
+async def _position_rows(session: AsyncSession, account_id: int, *, limit: int | None = None) -> list[dict[str, Any]]:
+    limit_clause = "LIMIT :limit" if limit is not None else ""
+    params: dict[str, Any] = {"account_id": account_id}
+    if limit is not None:
+        params["limit"] = limit
     result = await session.execute(
         text(
-            """
-            SELECT p.id, p.account_id, p.ts_code, COALESCE(sb.name, p.ts_code) AS stock_name,
-                   p.shares, p.available_shares, p.frozen_shares, p.avg_cost,
-                   p.current_price, p.market_value, p.unrealized_pnl, p.profit_rate,
-                   p.first_buy_date, p.updated_at
-            FROM sim_positions p
-            LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
-            WHERE p.account_id = :account_id
-              AND p.shares > 0
-            ORDER BY p.updated_at DESC, p.id DESC
+            f"""
+            WITH today_traded AS (
+                SELECT st.account_id,
+                       st.ts_code,
+                       MAX(st.id) AS trade_id,
+                       SUM(CASE WHEN st.direction = '卖出' THEN st.volume ELSE 0 END)::INTEGER AS sold_shares,
+                       SUM(CASE WHEN st.direction = '卖出' THEN st.amount ELSE 0 END) AS sell_amount,
+                       SUM(CASE WHEN st.direction = '卖出' THEN st.total_fee ELSE 0 END) AS sell_fee,
+                       MAX(st.trade_time) AS updated_at
+                FROM sim_trades st
+                WHERE st.account_id = :account_id
+                  AND st.trade_time::DATE = CURRENT_DATE
+                GROUP BY st.account_id, st.ts_code
+            ),
+            current_positions AS (
+                SELECT p.id, p.account_id, p.ts_code, p.shares, p.available_shares, p.frozen_shares,
+                       p.avg_cost, p.current_price, p.market_value, p.unrealized_pnl, p.profit_rate,
+                       p.first_buy_date, p.updated_at, (p.shares = 0 AND tt.sold_shares > 0) AS closed_today
+                FROM sim_positions p
+                LEFT JOIN today_traded tt
+                  ON tt.account_id = p.account_id AND tt.ts_code = p.ts_code
+                WHERE p.account_id = :account_id
+                  AND (p.shares > 0 OR tt.sold_shares > 0)
+            )
+            SELECT pr.id, pr.account_id, pr.ts_code, COALESCE(sb.name, pr.ts_code) AS stock_name,
+                   pr.shares, pr.available_shares, pr.frozen_shares, pr.avg_cost,
+                   pr.current_price, pr.market_value, pr.unrealized_pnl, pr.profit_rate,
+                   pr.first_buy_date, pr.updated_at, pr.closed_today
+            FROM current_positions pr
+            LEFT JOIN stock_basic sb ON sb.ts_code = pr.ts_code
+            ORDER BY pr.updated_at DESC, pr.id DESC
+            {limit_clause}
             """
         ),
-        {"account_id": account_id},
+        params,
     )
     return [dict(row) for row in result.mappings().all()]
+
+
+async def _account_positions(session: AsyncSession, account_id: int) -> list[dict[str, Any]]:
+    return await _position_rows(session, account_id)
 
 
 async def list_accounts_with_realtime_valuation(
@@ -269,28 +326,12 @@ async def list_positions_with_realtime_valuation(
 ) -> list[dict[str, Any]]:
     await get_account_or_404(session, account_id, user_id)
     limit = min(max(limit, 1), 500)
-    result = await session.execute(
-        text(
-            """
-            SELECT p.id, p.account_id, p.ts_code, COALESCE(sb.name, p.ts_code) AS stock_name,
-                   p.shares, p.available_shares, p.frozen_shares, p.avg_cost,
-                   p.current_price, p.market_value, p.unrealized_pnl, p.profit_rate,
-                   p.first_buy_date, p.updated_at
-            FROM sim_positions p
-            LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
-            WHERE p.account_id = :account_id
-              AND p.shares > 0
-            ORDER BY p.updated_at DESC, p.id DESC
-            LIMIT :limit
-            """
-        ),
-        {"account_id": account_id, "limit": limit},
-    )
-    positions = [dict(row) for row in result.mappings().all()]
-    prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
-    enriched, _position_value, _unrealized_pnl, _has_realtime = _apply_realtime_position_values(positions, prices)
-    latest_closes = await _latest_position_closes(session, [str(position["ts_code"]) for position in enriched if int(position.get("shares") or 0) > 0])
-    enriched = _apply_position_today_pnl(enriched, latest_closes)
+    positions = await _position_rows(session, account_id, limit=limit)
+    quote_codes = _position_quote_codes(positions)
+    ticks, error = await _realtime_ticks(quote_codes)
+    enriched, _position_value, _unrealized_pnl, _has_realtime = _apply_realtime_position_values(positions, ticks)
+    baseline_prices = await _position_today_baselines(session, _position_quote_codes(enriched))
+    enriched = _apply_position_today_pnl(enriched, baseline_prices, ticks)
     serialized = serialize_rows(enriched)
     if error:
         for row in serialized:
@@ -459,15 +500,19 @@ async def list_child_rows(
     table: str,
     order_by: str,
     limit: int = 100,
+    include_stock_name: bool = False,
 ) -> list[dict[str, Any]]:
     await get_account_or_404(session, account_id, user_id)
     limit = min(max(limit, 1), 500)
+    select_clause = "t.*, COALESCE(sb.name, t.ts_code) AS stock_name" if include_stock_name else "t.*"
+    join_clause = "LEFT JOIN stock_basic sb ON sb.ts_code = t.ts_code" if include_stock_name else ""
     result = await session.execute(
         text(
             f"""
-            SELECT *
-            FROM {table}
-            WHERE account_id = :account_id
+            SELECT {select_clause}
+            FROM {table} t
+            {join_clause}
+            WHERE t.account_id = :account_id
             ORDER BY {order_by}
             LIMIT :limit
             """
@@ -1106,9 +1151,15 @@ async def match_order(
                     frozen_shares = frozen_shares - :volume,
                     current_price = CAST(:price AS NUMERIC),
                     market_value = (shares - :volume) * CAST(:price AS NUMERIC),
-                    unrealized_pnl = (CAST(:price AS NUMERIC) - avg_cost) * (shares - :volume),
+                    unrealized_pnl = CASE
+                        WHEN shares - :volume <= 0
+                            THEN (:amount - :total_fee) - (avg_cost * :volume)
+                        ELSE (CAST(:price AS NUMERIC) - avg_cost) * (shares - :volume)
+                    END,
                     profit_rate = CASE
                         WHEN avg_cost <= 0 THEN 0
+                        WHEN shares - :volume <= 0
+                            THEN (((:amount - :total_fee) / :volume) - avg_cost) / avg_cost
                         ELSE (CAST(:price AS NUMERIC) - avg_cost) / avg_cost
                     END,
                     available_shares = LEAST(available_shares, shares - :volume),
@@ -1116,18 +1167,14 @@ async def match_order(
                 WHERE account_id = :account_id AND ts_code = :ts_code
                 """
             ),
-            {"account_id": account_id, "ts_code": ts_code, "volume": volume, "price": price},
-        )
-        await session.execute(
-            text(
-                """
-                DELETE FROM sim_positions
-                WHERE account_id = :account_id
-                  AND ts_code = :ts_code
-                  AND shares <= 0
-                """
-            ),
-            {"account_id": account_id, "ts_code": ts_code},
+            {
+                "account_id": account_id,
+                "ts_code": ts_code,
+                "volume": volume,
+                "price": price,
+                "amount": amount,
+                "total_fee": fees.total_fee,
+            },
         )
         await session.execute(
             text(

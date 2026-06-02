@@ -587,7 +587,7 @@ async def test_match_sell_charges_stamp_tax_only_on_sell():
 
 
 @pytest.mark.asyncio
-async def test_match_full_sell_deletes_cleared_position():
+async def test_match_full_sell_keeps_today_cleared_position():
     session = ScriptedSession(
         [
             FakeResult([order_row(direction="卖出", volume=1000, frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
@@ -622,10 +622,12 @@ async def test_match_full_sell_deletes_cleared_position():
 
     await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    delete_idx = find_statement_index(session, "DELETE FROM sim_positions")
-    assert "shares <= 0" in session.statements[delete_idx]
-    assert session.params[delete_idx] == {"account_id": 1, "ts_code": "000001.SZ"}
-    assert find_statement_index(session, "available_cash = available_cash + :net_income") > delete_idx
+    sell_update_idx = find_statement_index(session, "SET shares = shares - :volume")
+    assert "WHEN shares - :volume <= 0" in session.statements[sell_update_idx]
+    assert session.params[sell_update_idx]["amount"] == Decimal("10000.0000")
+    assert session.params[sell_update_idx]["total_fee"] == Decimal("10.1000")
+    assert all("DELETE FROM sim_positions" not in statement for statement in session.statements)
+    assert find_statement_index(session, "available_cash = available_cash + :net_income") > sell_update_idx
 
 
 @pytest.mark.asyncio
@@ -1433,7 +1435,6 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
             FakeResult([]),
             FakeResult([]),
             FakeResult([]),
-            FakeResult([]),
             FakeResult([], rowcount=1),
             FakeResult([]),
             FakeResult([]),
@@ -1488,8 +1489,7 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
     assert unlocked == 1
     assert sell_signal["action"] == "SELL_ALL"
     assert sell_match["status"] == "全部成交"
-    sell_delete_idx = find_statement_index(session, "DELETE FROM sim_positions")
-    assert "shares <= 0" in session.statements[sell_delete_idx]
+    assert all("DELETE FROM sim_positions" not in statement for statement in session.statements)
     assert nav["total_asset"] == "101877.5152"
 
     buy_freeze_idx = find_param_index(session, "remark", "买入委托冻结 000001.SZ")
@@ -1505,6 +1505,8 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
     unlock_idx = find_statement_index(session, "WITH today_buys")
     assert session.params[unlock_idx]["trade_date"] == sell_trade_date
     sell_income_idx = find_statement_index(session, "available_cash = available_cash + :net_income")
+    sell_position_update_idx = find_statement_index(session, "SET shares = shares - :volume", start=unlock_idx)
+    assert "WHEN shares - :volume <= 0" in session.statements[sell_position_update_idx]
     assert session.params[sell_income_idx]["net_income"] == Decimal("100903.2552")
     nav_refresh_idx = find_statement_index(session, "FROM daily_kline dk", start=sell_income_idx)
     nav_upsert_idx = find_statement_index(session, "INSERT INTO sim_daily_nav", start=nav_refresh_idx)

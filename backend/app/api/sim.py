@@ -160,8 +160,9 @@ async def get_orders(
         user_id=_extract_user_id(req),
         account_id=account_id,
         table="sim_orders",
-        order_by="submit_time DESC, id DESC",
+        order_by="t.submit_time DESC, t.id DESC",
         limit=limit,
+        include_stock_name=True,
     )
 
 
@@ -177,8 +178,9 @@ async def get_trades(
         user_id=_extract_user_id(req),
         account_id=account_id,
         table="sim_trades",
-        order_by="trade_time DESC, id DESC",
+        order_by="t.trade_time DESC, t.id DESC",
         limit=limit,
+        include_stock_name=True,
     )
 
 
@@ -194,7 +196,7 @@ async def get_cash_flow(
         user_id=_extract_user_id(req),
         account_id=account_id,
         table="sim_cash_flow",
-        order_by="created_at DESC, id DESC",
+        order_by="t.created_at DESC, t.id DESC",
         limit=limit,
     )
 
@@ -211,7 +213,7 @@ async def get_nav(
         user_id=_extract_user_id(req),
         account_id=account_id,
         table="sim_daily_nav",
-        order_by="nav_date DESC",
+        order_by="t.nav_date DESC",
         limit=limit,
     )
 

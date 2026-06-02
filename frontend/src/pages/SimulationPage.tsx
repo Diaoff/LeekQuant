@@ -37,6 +37,7 @@ interface Position {
   profit_rate: string
   today_pnl: string
   today_pnl_rate: string
+  closed_today?: boolean
 }
 
 type PositionSortKey = 'unrealized_pnl'
@@ -45,6 +46,7 @@ type SortDirection = 'asc' | 'desc'
 interface Order {
   id: number
   ts_code: string
+  stock_name: string | null
   direction: string
   price: string | null
   volume: number
@@ -58,6 +60,7 @@ interface Order {
 interface Trade {
   id: number
   ts_code: string
+  stock_name: string | null
   direction: string
   price: string
   volume: number
@@ -101,6 +104,16 @@ function money(value: string | number | null | undefined) {
   return `¥${formatNumber(value, 2)}`
 }
 
+function fixedMoney(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === '') return '暂无'
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return '暂无'
+  return `¥${new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(numeric)}`
+}
+
 function cnMarketTone(value: string | number | null | undefined) {
   const n = Number(value)
   if (n > 0) return 'text-red-600'
@@ -112,6 +125,12 @@ function signedMoney(value: string | number | null | undefined) {
   const n = Number(value)
   const sign = n > 0 ? '+' : ''
   return `${sign}${money(value)}`
+}
+
+function signedFixedMoney(value: string | number | null | undefined) {
+  const n = Number(value)
+  const sign = n > 0 ? '+' : ''
+  return `${sign}${fixedMoney(value)}`
 }
 
 function formatPercentFromRatio(value: unknown) {
@@ -744,31 +763,35 @@ export default function SimulationPage() {
               <RiskGuardSection status={riskGuardStatus} takeProfitBreached={takeProfitBreached} />
 
               <DataTable title="持仓" loading={detailLoading} empty="暂无持仓">
-                <table className="min-w-[760px] w-full text-left text-sm">
+                <table className="min-w-[840px] w-full text-left text-sm">
                   <thead className="bg-tableHead text-xs text-muted">
                     <tr>
                       <th className="px-4 py-3">股票</th>
                       <th className="px-4 py-3">持仓 / 可卖</th>
                       <th className="px-4 py-3">成本 / 现价</th>
                       <th className="px-4 py-3">市值</th>
-                      <th className="px-4 py-3">
+                      <th className="w-[160px] px-4 py-3 text-right">
                         <button
                           type="button"
                           onClick={() => togglePositionSort('unrealized_pnl')}
-                          className="inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-left font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
+                          className="ml-auto inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-right font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
                           aria-label={`按收益金额${positionSort?.key === 'unrealized_pnl' && positionSort.direction === 'desc' ? '升序' : '降序'}排序`}
                         >
-                          收益 / 今日
+                          累计收益
                           {positionSortIcon('unrealized_pnl')}
                         </button>
                       </th>
+                      <th className="w-[160px] px-4 py-3 text-right">今日收益</th>
                     </tr>
                   </thead>
                   <tbody>
                     {sortedPositions.map((position) => (
                       <tr key={position.id} className="border-t border-line">
                         <td className="px-4 py-3">
-                          <div className="font-medium text-ink">{position.stock_name || position.ts_code}</div>
+                          <div className="flex items-center gap-2 font-medium text-ink">
+                            <span>{position.stock_name || position.ts_code}</span>
+                            {position.closed_today ? <span className="rounded bg-line px-1.5 py-0.5 text-[10px] font-medium text-muted">今日清仓</span> : null}
+                          </div>
                           <div className="mt-0.5 font-mono text-xs text-muted">{position.ts_code}</div>
                         </td>
                         <td className="px-4 py-3 font-mono tabular-nums">
@@ -780,15 +803,13 @@ export default function SimulationPage() {
                           <div className="mt-0.5 text-xs text-muted">{money(position.current_price)}</div>
                         </td>
                         <td className="px-4 py-3 font-mono tabular-nums">{money(position.market_value)}</td>
-                        <td className="px-4 py-3 font-mono tabular-nums">
-                          <div className={`flex min-w-[170px] items-center justify-between gap-3 ${cnMarketTone(position.unrealized_pnl)}`}>
-                            <span>{signedMoney(position.unrealized_pnl)}</span>
-                            <span>{signedPercentFromRatio(position.profit_rate)}</span>
-                          </div>
-                          <div className={`mt-0.5 flex min-w-[170px] items-center justify-between gap-3 text-xs ${cnMarketTone(position.today_pnl)}`}>
-                            <span>{signedMoney(position.today_pnl)}</span>
-                            <span>{signedPercentFromRatio(position.today_pnl_rate)}</span>
-                          </div>
+                        <td className={`w-[160px] px-4 py-3 text-right font-mono tabular-nums ${cnMarketTone(position.unrealized_pnl)}`}>
+                          <div className="whitespace-nowrap">{signedFixedMoney(position.unrealized_pnl)}</div>
+                          <div className="mt-0.5 whitespace-nowrap text-xs">{signedPercentFromRatio(position.profit_rate)}</div>
+                        </td>
+                        <td className={`w-[160px] px-4 py-3 text-right font-mono tabular-nums ${cnMarketTone(position.today_pnl)}`}>
+                          <div className="whitespace-nowrap">{signedFixedMoney(position.today_pnl)}</div>
+                          <div className="mt-0.5 whitespace-nowrap text-xs">{signedPercentFromRatio(position.today_pnl_rate)}</div>
                         </td>
                       </tr>
                     ))}
@@ -819,7 +840,10 @@ export default function SimulationPage() {
                     {orders.map((order) => (
                       <tr key={order.id} className="border-t border-line">
                         <td className="px-4 py-3 text-muted">{formatDateTime(order.submit_time)}</td>
-                        <td className="px-4 py-3 font-medium">{order.ts_code}</td>
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-ink">{order.stock_name || order.ts_code}</div>
+                          <div className="mt-0.5 font-mono text-xs text-muted">{order.ts_code}</div>
+                        </td>
                         <td className={`px-4 py-3 ${order.direction === '买入' ? 'text-red-600' : 'text-emerald-600'}`}>{order.direction}</td>
                         <td className="px-4 py-3">{money(order.price)}</td>
                         <td className="px-4 py-3">{formatNumber(order.volume)}</td>
@@ -855,7 +879,10 @@ export default function SimulationPage() {
                       {trades.map((trade) => (
                         <tr key={trade.id} className="border-t border-line">
                           <td className="px-4 py-3 text-muted">{formatDateTime(trade.trade_time)}</td>
-                          <td className="px-4 py-3 font-medium">{trade.ts_code}</td>
+                          <td className="px-4 py-3">
+                            <div className="font-medium text-ink">{trade.stock_name || trade.ts_code}</div>
+                            <div className="mt-0.5 font-mono text-xs text-muted">{trade.ts_code}</div>
+                          </td>
                           <td className={`px-4 py-3 ${trade.direction === '买入' ? 'text-red-600' : 'text-emerald-600'}`}>{trade.direction}</td>
                           <td className="px-4 py-3">{money(trade.amount)}</td>
                           <td className="px-4 py-3">{money(trade.total_fee)}</td>
