@@ -131,7 +131,8 @@ flowchart TB
 | backend | FastAPI + SQLAlchemy + Alembic | REST API、WebSocket、认证、任务提交 |
 | celery_worker | Celery | 数据拉取、回测、因子、模拟交易等耗时任务 |
 | celery_beat | Celery Beat | 定时触发交易日历、K线更新、信号生成、净值快照 |
-| realtime_ws | Python asyncio / websockets | 东方财富实时行情连接、解析、Redis 广播（首版已合并到 backend 进程） |
+| realtime_risk_guard | Python asyncio | 模拟盘实时止盈/止损守护进程 |
+| realtime_ws | Python asyncio / websockets | 东方财富流式解析服务（M6b 待实现；M6a 实时订阅由 backend `/ws/realtime` 提供） |
 | postgres | PostgreSQL 15+ | 统一持久化存储 |
 | redis | Redis 7 | Celery Broker / Result Backend、热点缓存、Pub/Sub |
 
@@ -1354,14 +1355,29 @@ def score_cross_section(factor_df, weights):
 | 模拟交易 | `GET /api/sim/accounts/{id}/nav` | 净值曲线 |
 | 因子 | `GET /api/factors` | 因子定义 |
 | 因子 | `GET /api/factors/rank` | 打分排行榜（支持 scope_type=all / watchlist_group） |
-| 系统 | `GET /api/system/tasks` | 任务运行状态 |
-| 实时行情 | `GET /api/realtime/snapshot` | 东方财富 HTTP 快照 |
-| 数据源 | `GET /api/sources` | 数据源配置 |
-| 数据 | `POST /api/data/sync` | 手动触发数据同步 |
+| 因子 | `GET /api/factors/values` | 单因子横截面值 |
+| 因子 | `GET /api/factors/analysis` | 因子 IC/IR 分析结果 |
+| 任务 | `GET /api/tasks/recent` | 最近任务运行状态 |
+| 任务 | `GET /api/tasks/{task_id}` | 单个 Celery 任务状态 |
+| 实时行情 | `GET /api/realtime/snapshot` | 东方财富 HTTP 快照，参数 `ts_codes` |
+| 实时风控 | `GET /api/realtime/risk-guard/status` | 实时止盈/止损守护状态 |
+| 数据源 | `GET /api/data/sources` | 数据源配置 |
+| 数据源 | `PUT /api/data/sources` | 更新数据源启用状态 |
+| 数据源 | `POST /api/data/sources/check` | 检查全部数据源 |
+| 数据 | `GET /api/data/status` | 数据更新状态 |
+| 数据 | `POST /api/data/sync/stock-basic` | 手动同步股票基础信息 |
+| 数据 | `POST /api/data/sync/trade-calendar` | 手动同步交易日历 |
+| 数据 | `POST /api/data/sync/kline` | 手动同步样例 K 线 |
+| 数据任务 | `POST /api/tasks/data/sync-all-kline` | 触发全量 K 线同步 |
+| 数据任务 | `POST /api/tasks/data/incremental-kline` | 触发增量 K 线同步 |
+| 数据任务 | `POST /api/tasks/data/fundamentals` | 触发基本面同步 |
 | 任务 | `POST /api/tasks/factors/compute` | 触发因子计算 |
 | 任务 | `POST /api/tasks/factors/analyze` | 触发 IC/IR 分析 |
-| 偏好 | `GET /api/preferences` | 用户偏好 |
-| 系统 | `GET /api/system/alerts` | 告警列表 |
+| 偏好 | `GET /api/preferences/trading-fee` | 交易费率偏好 |
+| 偏好 | `GET /api/preferences/kline-sync` | K 线同步偏好 |
+| 系统 | `GET /api/system/alerts` | 告警列表，支持 level / category / is_resolved / limit / offset |
+
+`POST /api/auth/login`、`GET /api/system/tasks`、`POST /api/data/sync` 不是当前实现路径，保留为 M7+ 兼容入口候选。
 
 ### 9.2 WebSocket
 
@@ -1376,8 +1392,7 @@ def score_cross_section(factor_df, weights):
 ```json
 {
   "action": "subscribe",
-  "channel": "realtime",
-  "codes": ["600000.SH", "000001.SZ"]
+  "ts_codes": ["600000.SH", "000001.SZ"]
 }
 ```
 
@@ -1390,6 +1405,8 @@ def score_cross_section(factor_df, weights):
 | factor | 因子计算、IC/IR、打分排名 |
 | trading | 信号执行、模拟撮合、T+1 解锁、净值快照 |
 | default | 轻量后台任务 |
+
+当前 Celery 应用入口为 `app.tasks.celery_app:celery_app`。`app.tasks.data_tasks.*` 路由到 `data`，`app.tasks.factor_tasks.*` 路由到 `factor`，`app.tasks.trading_tasks.*` 和 `app.tasks.signal_tasks.*` 路由到 `trading`，`app.tasks.run_backtest` 路由到 `backtest`。
 
 ---
 
@@ -1458,34 +1475,32 @@ const MYTT_COMPLETIONS = [
 ```yaml
 services:
   postgres:
-    image: postgres:15-alpine
-    container_name: leek-postgres
+    image: ${IMAGE_PREFIX:-}postgres:15-alpine
+    container_name: leek-quant-postgres
     environment:
-      POSTGRES_DB: leek_quant
-      POSTGRES_USER: leek
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-leek_quant_dev}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      POSTGRES_DB: ${POSTGRES_DB:-leek_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-leek_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U leek -d leek_quant"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    container_name: leek-redis
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-leek_redis_dev}  # 本地开发可不设密码，生产部署必须设置
-    volumes:
-      - redisdata:/data
+    image: ${IMAGE_PREFIX:-}redis:7-alpine
+    container_name: leek-quant-redis
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-127.0.0.1:6379}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-leek_redis_dev}", "ping"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1495,37 +1510,42 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: leek-backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+      args:
+        BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        BUILD_REGION: ${BUILD_REGION:-cn}
+    container_name: leek-quant-backend
     environment:
-      DATABASE_URL: postgresql+asyncpg://leek:${DB_PASSWORD:-leek_quant_dev}@postgres:5432/leek_quant
-      REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
-      SECRET_KEY: ${SECRET_KEY:-change-me}
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-    volumes:
-      - ./backend:/app
-      - ./data/runtime:/runtime
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-127.0.0.1:8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     restart: unless-stopped
 
   celery_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: leek-celery-worker
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-4} -Q default,data,backtest,factor,trading
+    container_name: leek-quant-celery-worker
+    command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "default,data,backtest,factor,trading"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://leek:${DB_PASSWORD:-leek_quant_dev}@postgres:5432/leek_quant
-      REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
-    volumes:
-      - ./backend:/app
-      - ./data/runtime:/runtime
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
+      TZ: ${TZ:-Asia/Shanghai}
     depends_on:
       postgres:
         condition: service_healthy
@@ -1537,54 +1557,60 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: leek-celery-beat
-    command: celery -A app.celery_app beat --loglevel=info
+    container_name: leek-quant-celery-beat
+    command: ["celery", "-A", "app.tasks.celery_app:celery_app", "beat", "--loglevel=INFO"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://leek:${DB_PASSWORD:-leek_quant_dev}@postgres:5432/leek_quant
-      REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
-    volumes:
-      - ./backend:/app
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
+      TZ: ${TZ:-Asia/Shanghai}
     depends_on:
-      - celery_worker
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
-  # realtime_ws: 首版已合并到 backend 进程，通过 FastAPI WebSocket 端点提供。
-  # 若需独立部署实时行情解析服务，可取消以下注释。
-  # realtime_ws:
-  #   build:
-  #     context: ./backend
-  #     dockerfile: Dockerfile
-  #   container_name: leek-realtime-ws
-  #   command: python -m app.realtime.eastmoney_ws
-  #   environment:
-  #     REDIS_URL: redis://:${REDIS_PASSWORD:-leek_redis_dev}@redis:6379/0
-  #     REALTIME_PROVIDER: ${REALTIME_PROVIDER:-eastmoney}
-  #     ALLTICK_TOKEN: ${ALLTICK_TOKEN:-}
-  #   volumes:
-  #     - ./backend:/app
-  #   depends_on:
-  #     redis:
-  #       condition: service_healthy
-  #   restart: unless-stopped
+  realtime_risk_guard:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: leek-quant-realtime-risk-guard
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      TZ: ${TZ:-Asia/Shanghai}
+    command: ["python", "-m", "app.realtime.risk_guard", "--mode", "${REALTIME_RISK_GUARD_MODE:-snapshot}", "--refresh-interval", "${REALTIME_RISK_GUARD_INTERVAL:-15}"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: leek-frontend
-    environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
-      VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:-ws://localhost:8000}
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:20-alpine}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}nginx:1.25-alpine
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    container_name: leek-quant-frontend
     ports:
-      - "80:80"
+      - "${FRONTEND_PORT:-8080}:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  pgdata:
-  redisdata:
+  postgres-data:
 ```
+
+当前根目录 `docker-compose.yml` 是本地开发配置：PostgreSQL、Redis、Backend 端口默认绑定 `127.0.0.1`，Redis 默认无密码，前端默认暴露 `8080`，并包含独立 `realtime_risk_guard` 服务。生产部署必须覆盖本地默认值：设置强 `POSTGRES_PASSWORD`、`SECRET_KEY` 和受控 `BACKEND_CORS_ORIGINS`，Redis 应启用密码或放入私有网络且不公开端口，外部访问应经反向代理和 TLS，数据库与 Redis 不应绑定公网地址。
 
 ### 11.2 后端 Dockerfile
 

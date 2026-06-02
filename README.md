@@ -155,6 +155,8 @@ docker compose up -d
 | 🐘 PostgreSQL | localhost:5432 |
 | ⚡ Redis | localhost:6379 |
 
+当前 `docker-compose.yml` 面向本地开发：PostgreSQL、Redis、Backend 默认绑定 `127.0.0.1`，Redis 默认无密码，并包含 `realtime_risk_guard` 服务。生产部署需要覆盖本地默认值：设置强 `POSTGRES_PASSWORD`、`SECRET_KEY` 和受控 `BACKEND_CORS_ORIGINS`，Redis 不应公开到公网，外部入口应通过反向代理和 TLS 暴露。
+
 ---
 
 ## 📁 项目结构
@@ -310,11 +312,19 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 | 因子 | GET | `/api/factors/rank?page_size=N` | 多因子 Top N 排行榜 |
 | 因子 | GET | `/api/factors/values` | 单因子横截面值 |
 | 因子 | GET | `/api/factors/analysis` | 因子 IC/IR 分析结果 |
+| 任务 | GET | `/api/tasks/recent` | 最近任务运行状态 |
+| 任务 | GET | `/api/tasks/{task_id}` | 单个任务状态 |
+| 数据 | GET | `/api/data/status` | 数据更新状态 |
+| 数据 | POST | `/api/data/sync/stock-basic` | 同步股票基础信息 |
+| 数据 | POST | `/api/data/sync/trade-calendar` | 同步交易日历 |
+| 数据 | POST | `/api/tasks/data/incremental-kline` | 触发增量 K 线同步 |
 | 任务 | POST | `/api/tasks/factors/compute` | 触发单日因子计算 |
 | 任务 | POST | `/api/tasks/factors/analyze` | 触发因子 IC/IR 分析 |
-| 系统 | GET | `/api/system/tasks` | 任务运行状态 |
+| 实时行情 | GET | `/api/realtime/snapshot` | 东方财富 HTTP 快照 |
+| 实时风控 | GET | `/api/realtime/risk-guard/status` | 实时止盈/止损守护状态 |
+| 系统 | GET | `/api/system/alerts` | 告警列表 |
 | WebSocket | WS | `/ws/realtime` | 实时行情订阅 |
-| WebSocket | WS | `/ws/tasks` | 任务状态推送 |
+| WebSocket | WS | `/ws/tasks` | 任务状态推送（M6b 待实现） |
 
 ---
 
