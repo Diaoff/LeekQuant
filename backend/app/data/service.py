@@ -19,7 +19,7 @@ from app.data.repository import (
     upsert_stock_basic,
     upsert_trade_calendar,
 )
-from app.data.stock_scope import SUPPORTED_STOCK_SQL_CONDITION, is_supported_stock_basic
+from app.data.stock_scope import SUPPORTED_STOCK_SQL_CONDITION, is_supported_stock_basic, supported_stock_sql_condition
 from app.data.validators import validate_daily_kline, validate_stock_basic, validate_trade_calendar
 
 SAMPLE_STOCK_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -483,7 +483,7 @@ async def infer_incremental_kline_ranges(
             FROM stock_basic sb
             LEFT JOIN latest_kline lk ON lk.ts_code = sb.ts_code
             WHERE sb.is_delisted = FALSE
-              AND {SUPPORTED_STOCK_SQL_CONDITION}
+              AND {supported_stock_sql_condition("sb")}
               {code_filter}
             ORDER BY sb.symbol
             {limit_clause}

@@ -77,8 +77,10 @@ class IncrementalRangeSession:
         self.rows = rows
         self.latest_open = latest_open
         self.params = []
+        self.statements = []
 
     async def execute(self, statement, params=None):
+        self.statements.append(str(statement))
         self.params.append(params or {})
         sql = str(statement)
         if "SELECT MAX(cal_date)" in sql:
@@ -261,6 +263,18 @@ async def test_infer_incremental_kline_ranges_returns_only_symbols_with_tail_gap
             "end_date": date(2026, 5, 29),
         }
     ]
+
+
+async def test_infer_incremental_kline_ranges_qualifies_supported_stock_filter() -> None:
+    session = IncrementalRangeSession([])
+
+    await infer_incremental_kline_ranges(session)
+
+    range_sql = session.statements[1]
+    assert "COALESCE(sb.market" in range_sql
+    assert "COALESCE(sb.exchange" in range_sql
+    assert "split_part(sb.ts_code" in range_sql
+    assert "split_part(ts_code" not in range_sql
 
 
 async def test_infer_incremental_kline_ranges_starts_new_stock_from_list_date_open_day() -> None:
