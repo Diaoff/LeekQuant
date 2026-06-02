@@ -425,3 +425,83 @@ async def infer_incremental_kline_window(session: AsyncSession) -> tuple[date | 
     if start_date is None or end_date is None or start_date > end_date:
         return None, None
     return start_date, end_date
+
+
+async def infer_incremental_kline_ranges(
+    session: AsyncSession,
+    *,
+    ts_codes: list[str] | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    if ts_codes is not None and not ts_codes:
+        return []
+
+    latest_open_result = await session.execute(text("SELECT MAX(cal_date) FROM trade_calendar WHERE is_open = TRUE"))
+    end_date = latest_open_result.scalar_one_or_none()
+    if end_date is None:
+        return []
+
+    default_start, _default_end = default_kline_window()
+    code_filter = ""
+    limit_clause = ""
+    params: dict[str, Any] = {"end_date": end_date, "default_start": default_start}
+    if ts_codes is not None:
+        code_filter = "AND sb.ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))"
+        params["ts_codes"] = ts_codes
+    if limit is not None:
+        limit_clause = "LIMIT :limit"
+        params["limit"] = max(0, limit)
+
+    result = await session.execute(
+        text(
+            f"""
+            WITH latest_kline AS (
+                SELECT ts_code, MAX(trade_date) AS last_trade_date
+                FROM daily_kline
+                GROUP BY ts_code
+            )
+            SELECT
+                sb.ts_code,
+                lk.last_trade_date,
+                CASE
+                    WHEN lk.last_trade_date IS NULL THEN (
+                        SELECT MIN(tc.cal_date)
+                        FROM trade_calendar tc
+                        WHERE tc.is_open = TRUE
+                          AND tc.cal_date >= COALESCE(sb.list_date, :default_start)
+                          AND tc.cal_date <= :end_date
+                    )
+                    ELSE (
+                        SELECT MIN(tc.cal_date)
+                        FROM trade_calendar tc
+                        WHERE tc.is_open = TRUE
+                          AND tc.cal_date > lk.last_trade_date
+                          AND tc.cal_date <= :end_date
+                    )
+                END AS start_date,
+                :end_date AS end_date
+            FROM stock_basic sb
+            LEFT JOIN latest_kline lk ON lk.ts_code = sb.ts_code
+            WHERE sb.is_delisted = FALSE
+              AND {SUPPORTED_STOCK_SQL_CONDITION}
+              {code_filter}
+            ORDER BY sb.symbol
+            {limit_clause}
+            """
+        ),
+        params,
+    )
+    ranges = []
+    for row in result.mappings().all():
+        start_date = row["start_date"]
+        if start_date is None or start_date > end_date:
+            continue
+        ranges.append(
+            {
+                "ts_code": row["ts_code"],
+                "start_date": start_date,
+                "end_date": end_date,
+                "last_trade_date": row["last_trade_date"],
+            }
+        )
+    return ranges

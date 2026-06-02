@@ -4,7 +4,7 @@ import asyncio
 import pytest
 
 from app.data.models import DailyKline, StockBasic
-from app.data.service import select_sample_stock_codes, sync_kline, sync_stock_basic
+from app.data.service import infer_incremental_kline_ranges, select_sample_stock_codes, sync_kline, sync_stock_basic
 
 pytestmark = pytest.mark.asyncio
 
@@ -39,6 +39,12 @@ class FakeResult:
     def all(self):
         return self._rows
 
+    def mappings(self):
+        return self
+
+    def scalar_one_or_none(self):
+        return self._rows[0][0] if self._rows else None
+
 
 class FakeSession:
     def __init__(self):
@@ -63,6 +69,20 @@ class StaticStockSession:
         self.rows = rows
 
     async def execute(self, statement, params=None):
+        return FakeResult(self.rows)
+
+
+class IncrementalRangeSession:
+    def __init__(self, rows, latest_open=date(2026, 5, 29)):
+        self.rows = rows
+        self.latest_open = latest_open
+        self.params = []
+
+    async def execute(self, statement, params=None):
+        self.params.append(params or {})
+        sql = str(statement)
+        if "SELECT MAX(cal_date)" in sql:
+            return FakeResult([(self.latest_open,)])
         return FakeResult(self.rows)
 
 
@@ -213,6 +233,57 @@ async def test_select_sample_stock_codes_fills_when_segments_are_sparse() -> Non
         "001201.SZ",
         "001202.SZ",
     ]
+
+
+async def test_infer_incremental_kline_ranges_returns_only_symbols_with_tail_gaps() -> None:
+    rows = [
+        {
+            "ts_code": "000001.SZ",
+            "last_trade_date": date(2026, 5, 29),
+            "start_date": None,
+            "end_date": date(2026, 5, 29),
+        },
+        {
+            "ts_code": "600000.SH",
+            "last_trade_date": date(2026, 5, 15),
+            "start_date": date(2026, 5, 18),
+            "end_date": date(2026, 5, 29),
+        },
+    ]
+
+    ranges = await infer_incremental_kline_ranges(IncrementalRangeSession(rows))
+
+    assert ranges == [
+        {
+            "ts_code": "600000.SH",
+            "last_trade_date": date(2026, 5, 15),
+            "start_date": date(2026, 5, 18),
+            "end_date": date(2026, 5, 29),
+        }
+    ]
+
+
+async def test_infer_incremental_kline_ranges_starts_new_stock_from_list_date_open_day() -> None:
+    rows = [
+        {
+            "ts_code": "001234.SZ",
+            "last_trade_date": None,
+            "start_date": date(2026, 5, 20),
+            "end_date": date(2026, 5, 29),
+        }
+    ]
+
+    ranges = await infer_incremental_kline_ranges(IncrementalRangeSession(rows))
+
+    assert ranges[0]["ts_code"] == "001234.SZ"
+    assert ranges[0]["last_trade_date"] is None
+    assert ranges[0]["start_date"] == date(2026, 5, 20)
+
+
+async def test_infer_incremental_kline_ranges_returns_empty_without_trade_calendar() -> None:
+    ranges = await infer_incremental_kline_ranges(IncrementalRangeSession([], latest_open=None))
+
+    assert ranges == []
 
 
 async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:

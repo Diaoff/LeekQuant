@@ -7,7 +7,7 @@ from typing import Any
 from app.core.config import get_settings
 from app.data.service import (
     default_kline_window,
-    infer_incremental_kline_window,
+    infer_incremental_kline_ranges,
     select_all_stock_codes,
     sync_kline,
     sync_stock_basic,
@@ -134,31 +134,66 @@ def incremental_kline_update(self, concurrency: int | None = None) -> dict[str, 
     effective_concurrency = _effective_data_sync_concurrency(concurrency)
 
     async def run(session) -> dict[str, Any]:
-        start, end = await infer_incremental_kline_window(session)
-        if start is None or end is None:
-            return {"skipped": True, "reason": "no new open trade dates"}
+        ranges = await infer_incremental_kline_ranges(session)
         all_codes = await select_all_stock_codes(session)
         await session.close()
-        total = len(all_codes)
+        if not ranges:
+            return {
+                "skipped": True,
+                "reason": "no per-stock kline gaps found",
+                "requested_symbols": 0,
+                "gap_symbols": 0,
+                "skipped_symbols": len(all_codes),
+                "inserted_or_updated": 0,
+                "source_counts": {},
+                "failures": [],
+            }
+
+        grouped_ranges: dict[tuple[date, date], list[str]] = {}
+        for item in ranges:
+            key = (item["start_date"], item["end_date"])
+            grouped_ranges.setdefault(key, []).append(item["ts_code"])
+
+        total = len(ranges)
+        progress_offset = 0
 
         def progress(i: int, _total: int, code: str) -> None:
             try:
                 self.update_state(
                     state="PROGRESS",
-                    meta={"current": i, "total": total, "current_code": code},
+                    meta={"current": progress_offset + i, "total": total, "current_code": code},
                 )
             except Exception:
                 pass
 
-        return await sync_kline(
-            None,
-            all_codes,
-            start,
-            end,
-            progress_callback=progress,
-            commit_each=True,
-            concurrency=effective_concurrency,
-        )
+        inserted_or_updated = 0
+        source_counts: dict[str, int] = {}
+        failures: list[dict[str, str]] = []
+
+        for (start, end), ts_codes in grouped_ranges.items():
+            result = await sync_kline(
+                None,
+                ts_codes,
+                start,
+                end,
+                progress_callback=progress,
+                commit_each=True,
+                concurrency=effective_concurrency,
+            )
+            progress_offset += len(ts_codes)
+            inserted_or_updated += int(result.get("inserted_or_updated", 0))
+            for source, count in result.get("source_counts", {}).items():
+                source_counts[source] = source_counts.get(source, 0) + int(count)
+            failures.extend(result.get("failures", []))
+
+        return {
+            "requested_symbols": total,
+            "gap_symbols": total,
+            "skipped_symbols": max(len(all_codes) - total, 0),
+            "inserted_or_updated": inserted_or_updated,
+            "source_counts": source_counts,
+            "failures": failures,
+        }
 
     return asyncio.run(
         _run_tracked(

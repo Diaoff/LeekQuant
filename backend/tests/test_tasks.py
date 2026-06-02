@@ -195,11 +195,18 @@ def test_incremental_kline_update_uses_default_concurrency(monkeypatch) -> None:
         captured["payload"] = payload
         return await fn(FakeSession())
 
-    async def fake_infer_incremental_kline_window(session):
-        return date(2026, 5, 1), date(2026, 5, 2)
+    async def fake_infer_incremental_kline_ranges(session):
+        return [
+            {
+                "ts_code": "000001.SZ",
+                "start_date": date(2026, 5, 1),
+                "end_date": date(2026, 5, 2),
+                "last_trade_date": date(2026, 4, 30),
+            }
+        ]
 
     async def fake_select_all_stock_codes(session):
-        return ["000001.SZ"]
+        return ["000001.SZ", "600000.SH"]
 
     async def fake_sync_kline(
         session,
@@ -214,26 +221,146 @@ def test_incremental_kline_update_uses_default_concurrency(monkeypatch) -> None:
         captured["sync"] = {
             "session": session,
             "ts_codes": ts_codes,
+            "start_date": start_date,
+            "end_date": end_date,
             "commit_each": commit_each,
             "concurrency": concurrency,
         }
         return {"requested_symbols": 1, "inserted_or_updated": 1, "source_counts": {}, "failures": []}
 
     monkeypatch.setattr(data_tasks, "_run_tracked", fake_run_tracked)
-    monkeypatch.setattr(data_tasks, "infer_incremental_kline_window", fake_infer_incremental_kline_window)
+    monkeypatch.setattr(data_tasks, "infer_incremental_kline_ranges", fake_infer_incremental_kline_ranges)
     monkeypatch.setattr(data_tasks, "select_all_stock_codes", fake_select_all_stock_codes)
     monkeypatch.setattr(data_tasks, "sync_kline", fake_sync_kline)
 
     result = data_tasks.incremental_kline_update.run()
 
     assert result["requested_symbols"] == 1
+    assert result["gap_symbols"] == 1
+    assert result["skipped_symbols"] == 1
     assert captured["payload"]["concurrency"] == 2
     assert captured["sync"] == {
         "session": None,
         "ts_codes": ["000001.SZ"],
+        "start_date": date(2026, 5, 1),
+        "end_date": date(2026, 5, 2),
         "commit_each": True,
         "concurrency": 2,
     }
+
+
+def test_incremental_kline_update_groups_per_stock_ranges_and_reports_progress(monkeypatch) -> None:
+    from app.tasks import data_tasks
+
+    class FakeSession:
+        async def close(self):
+            return None
+
+    updates = []
+    sync_calls = []
+
+    async def fake_run_tracked(_task_name, _task_id, _payload, fn):
+        return await fn(FakeSession())
+
+    async def fake_infer_incremental_kline_ranges(_session):
+        return [
+            {
+                "ts_code": "000001.SZ",
+                "start_date": date(2026, 5, 1),
+                "end_date": date(2026, 5, 2),
+                "last_trade_date": date(2026, 4, 30),
+            },
+            {
+                "ts_code": "000002.SZ",
+                "start_date": date(2026, 5, 1),
+                "end_date": date(2026, 5, 2),
+                "last_trade_date": date(2026, 4, 30),
+            },
+            {
+                "ts_code": "600000.SH",
+                "start_date": date(2026, 5, 2),
+                "end_date": date(2026, 5, 2),
+                "last_trade_date": date(2026, 5, 1),
+            },
+        ]
+
+    async def fake_select_all_stock_codes(_session):
+        return ["000001.SZ", "000002.SZ", "600000.SH", "600001.SH"]
+
+    async def fake_sync_kline(
+        session,
+        ts_codes,
+        start_date,
+        end_date,
+        providers=None,
+        progress_callback=None,
+        commit_each=False,
+        concurrency=1,
+    ):
+        sync_calls.append((ts_codes, start_date, end_date, commit_each, concurrency))
+        for index, code in enumerate(ts_codes, start=1):
+            progress_callback(index, len(ts_codes), code)
+        return {
+            "requested_symbols": len(ts_codes),
+            "inserted_or_updated": len(ts_codes),
+            "source_counts": {"fake": len(ts_codes)},
+            "failures": [],
+        }
+
+    monkeypatch.setattr(data_tasks, "_run_tracked", fake_run_tracked)
+    monkeypatch.setattr(data_tasks, "infer_incremental_kline_ranges", fake_infer_incremental_kline_ranges)
+    monkeypatch.setattr(data_tasks, "select_all_stock_codes", fake_select_all_stock_codes)
+    monkeypatch.setattr(data_tasks, "sync_kline", fake_sync_kline)
+    monkeypatch.setattr(data_tasks.incremental_kline_update, "update_state", lambda **kwargs: updates.append(kwargs))
+
+    result = data_tasks.incremental_kline_update.run(concurrency=3)
+
+    assert sync_calls == [
+        (["000001.SZ", "000002.SZ"], date(2026, 5, 1), date(2026, 5, 2), True, 3),
+        (["600000.SH"], date(2026, 5, 2), date(2026, 5, 2), True, 3),
+    ]
+    assert result["requested_symbols"] == 3
+    assert result["skipped_symbols"] == 1
+    assert result["inserted_or_updated"] == 3
+    assert result["source_counts"] == {"fake": 3}
+    assert updates == [
+        {"state": "PROGRESS", "meta": {"current": 1, "total": 3, "current_code": "000001.SZ"}},
+        {"state": "PROGRESS", "meta": {"current": 2, "total": 3, "current_code": "000002.SZ"}},
+        {"state": "PROGRESS", "meta": {"current": 3, "total": 3, "current_code": "600000.SH"}},
+    ]
+
+
+def test_incremental_kline_update_skips_when_no_per_stock_gaps(monkeypatch) -> None:
+    from app.tasks import data_tasks
+
+    class FakeSession:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    fake_session = FakeSession()
+
+    async def fake_run_tracked(_task_name, _task_id, _payload, fn):
+        return await fn(fake_session)
+
+    async def fake_infer_incremental_kline_ranges(_session):
+        return []
+
+    async def fake_select_all_stock_codes(_session):
+        return ["000001.SZ", "600000.SH"]
+
+    monkeypatch.setattr(data_tasks, "_run_tracked", fake_run_tracked)
+    monkeypatch.setattr(data_tasks, "infer_incremental_kline_ranges", fake_infer_incremental_kline_ranges)
+    monkeypatch.setattr(data_tasks, "select_all_stock_codes", fake_select_all_stock_codes)
+
+    result = data_tasks.incremental_kline_update.run()
+
+    assert result["skipped"] is True
+    assert result["requested_symbols"] == 0
+    assert result["skipped_symbols"] == 2
+    assert fake_session.closed is True
 
 
 def test_sync_all_kline_task_uses_default_concurrency_and_tracks_payload(monkeypatch) -> None:
