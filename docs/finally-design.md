@@ -1321,13 +1321,26 @@ def score_cross_section(factor_df, weights):
 - IR：IC 均值 / IC 标准差，用于评估稳定性。
 - ICIR：与 IR 同义或按团队口径单独保留。
 
-分析结果进入 `factor_analysis`，前端展示：
+分析结果进入 `factor_analysis`。当前 M5 MVP 与 M7+ 完整因子研究能力边界如下：
 
-- IC 时间序列。
-- IC 分布直方图。
-- 分层收益。
-- 多空组合收益。
-- 因子衰减曲线。
+| 能力 | M5 MVP 当前实现 | M7+ 完整能力 |
+| --- | --- | --- |
+| 因子来源 | 8 个内置因子，Python Worker 直接计算 | Qlib-like 表达式解析、用户自定义动态因子 |
+| 因子值 | 写入 `factor_values`，支持单日横截面查询 | 支持更完整的时序查询、导出、版本化因子定义 |
+| 打分排行 | `scoring_rank` 按 DB 权重合成 Top N | 支持股票池、行业中性、更多作用域和组合导出 |
+| IC/IR 指标 | `ic`、`ic_mean`、`ic_std`、`ir/icir`、`ic_gt_0_pct` | 多周期对比、Rank IC、滚动窗口稳定性分析 |
+| IC 序列 | 存入 `factor_analysis.details.ic_by_date`，前端用迷你折线展示 | 独立 `GET /api/factors/analysis/{factor_name}/series` 和完整交互图 |
+| 分组收益 | `group_returns` 五分组均值，前端条形展示 | 多空组合收益、分层累计收益、换手与容量分析 |
+| 图表展示 | `/factor` 页面展示定义、排行、单因子值、IC/IR 卡片、迷你 IC 曲线、分组收益 | IC 分布直方图、多空组合收益曲线、因子衰减曲线、分层收益曲线 |
+
+M5 MVP 不隐式支持未解析的 `factor_definitions.expression` 动态执行。表达式字段用于记录因子定义和后续 M7+ 扩展，当前计算逻辑只处理内置因子集合。
+
+M7+ 因子研究增强计划：
+
+- 因子分析序列 API：`GET /api/factors/analysis/{factor_name}/series`。
+- IC 分布直方图、Rank IC、多周期 IC/IR 对比。
+- 分层累计收益、多空组合收益、因子衰减曲线。
+- 动态表达式引擎、表达式校验、因子运行审计。
 
 ---
 
@@ -1610,7 +1623,18 @@ volumes:
   postgres-data:
 ```
 
-当前根目录 `docker-compose.yml` 是本地开发配置：PostgreSQL、Redis、Backend 端口默认绑定 `127.0.0.1`，Redis 默认无密码，前端默认暴露 `8080`，并包含独立 `realtime_risk_guard` 服务。生产部署必须覆盖本地默认值：设置强 `POSTGRES_PASSWORD`、`SECRET_KEY` 和受控 `BACKEND_CORS_ORIGINS`，Redis 应启用密码或放入私有网络且不公开端口，外部访问应经反向代理和 TLS，数据库与 Redis 不应绑定公网地址。
+当前根目录 `docker-compose.yml` 是本地开发配置：PostgreSQL、Redis、Backend 端口默认绑定 `127.0.0.1`，Redis 默认无密码，前端默认暴露 `8080`，并包含独立 `realtime_risk_guard` 服务。生产部署必须覆盖本地默认值：设置强 `POSTGRES_PASSWORD` 和受控 `BACKEND_CORS_ORIGINS`，Redis 应启用密码或放入私有网络且不公开端口，外部访问应经反向代理和 TLS，数据库与 Redis 不应绑定公网地址。生产 Compose 建议见 `docs/deployment-production.md`。
+
+### 11.1.1 生产安全边界
+
+本地 Compose 的 Redis 无密码是开发便利，不是生产安全配置。生产部署必须至少满足：
+
+1. Redis 不暴露公网；优先删除 Redis `ports`，仅允许 backend、Celery 和 `realtime_risk_guard` 通过 Docker 网络访问。
+2. 若 Redis 需要跨网络访问，必须使用 `redis-server --requirepass ${REDIS_PASSWORD}`，并将 backend、`celery_worker`、`celery_beat`、`realtime_risk_guard` 的 `REDIS_URL` 改为 `redis://:${REDIS_PASSWORD}@redis:6379/0`。
+3. PostgreSQL 不暴露公网；`POSTGRES_PASSWORD` 必须从生产环境注入，不能使用 `change-me`。
+4. Backend 不直接公网暴露；使用反向代理承载 HTTPS/TLS，backend 端口只绑定 `127.0.0.1` 或仅在 Docker 网络内监听。
+5. `BACKEND_CORS_ORIGINS` 必须限定为真实生产前端域名，不使用通配符。
+6. 使用 `docker-compose.prod.yml` 覆盖本地默认值，并在部署前执行 `docker compose -f docker-compose.yml -f docker-compose.prod.yml config`。
 
 ### 11.2 后端 Dockerfile
 
@@ -1722,10 +1746,10 @@ beat_schedule = {
 | M2 自选股与策略 | 自选分组、策略 CRUD、基础前端页面 | 自选分组、自选股 API、市场页、策略管理 | 自选股分组管理 |
 | M3 策略与回测 | Monaco 编辑、MyTT 提示、Python-native 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
 | M4 信号与模拟交易 | 五档信号、模拟交易 6 表、T+1 / 涨跌停 / 费用 | 信号中心、模拟账户闭环 | 资金守恒和 T+1 单测 |
-| M5 多因子 | 因子定义、计算、IC/IR、排行榜 | 因子页、排行榜 | IC 计算样例验证 |
+| M5 多因子 | 内置因子定义、计算、IC/IR MVP、排行榜 | 因子页、排行榜、IC/IR 卡片、迷你 IC 曲线、分组收益 | IC 计算样例验证 |
 | M6a HTTP 快照实时 | 东方财富 HTTP 快照、Redis 广播、WebSocket 订阅、前端实时看板 | 自选股实时刷新 | ✅ 已通过验收 |
 | M6b WebSocket 流式 | 东方财富 WebSocket 流式推送、任务/信号 WebSocket 通道、断线重连 | 断线重连测试 | 待实现 |
-| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、认证系统、股票池、因子表达式引擎、周/月线物化视图、文档 | 系统设置页、任务监控、README | 全链路 smoke test |
+| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、认证系统、股票池、完整因子研究、因子表达式引擎、周/月线物化视图、文档 | 系统设置页、任务监控、README、因子研究图表 | 全链路 smoke test |
 
 ---
 

@@ -57,7 +57,8 @@
 - 因子分类：估值、成长、质量、动量、波动、技术
 - IC / IR 分析评估因子有效性
 - 横截面打分排名 + 权重可配置
-- M5 已完成：内置 8 个因子、`factor_definitions.enabled/default_weight` 配置、Top N 排行榜、IC/IR 写入、Celery/API 任务入口与前端 `/factor` 页面 MVP
+- M5 已完成：内置 8 个因子、`factor_definitions.enabled/default_weight` 配置、Top N 排行榜、IC/IR MVP、迷你 IC 曲线、分组收益、Celery/API 任务入口与前端 `/factor` 页面 MVP
+- M7+ 规划：动态因子表达式、IC 分布、多空组合收益、分层累计收益、因子衰减曲线
 
 ### 🔴 实时行情推送
 - 东方财富 WebSocket 自建解析器
@@ -155,7 +156,7 @@ docker compose up -d
 | 🐘 PostgreSQL | localhost:5432 |
 | ⚡ Redis | localhost:6379 |
 
-当前 `docker-compose.yml` 面向本地开发：PostgreSQL、Redis、Backend 默认绑定 `127.0.0.1`，Redis 默认无密码，并包含 `realtime_risk_guard` 服务。生产部署需要覆盖本地默认值：设置强 `POSTGRES_PASSWORD`、`SECRET_KEY` 和受控 `BACKEND_CORS_ORIGINS`，Redis 不应公开到公网，外部入口应通过反向代理和 TLS 暴露。
+当前 `docker-compose.yml` 面向本地开发：PostgreSQL、Redis、Backend 默认绑定 `127.0.0.1`，Redis 默认无密码，并包含 `realtime_risk_guard` 服务。生产部署必须覆盖本地默认值：设置强 `POSTGRES_PASSWORD`、受控 `BACKEND_CORS_ORIGINS`，Redis 不应公开到公网；如 Redis 不只在私有 Docker 网络内使用，必须启用密码并同步更新所有服务的 `REDIS_URL`。外部入口应通过反向代理和 TLS 暴露，详见 [生产部署说明](docs/deployment-production.md)。
 
 ---
 
@@ -218,9 +219,9 @@ leek-quant/
 | **M2 股票池与自选股** | ✅ 完成 | 动态筛选(ST/退市/行业) + 分组管理 + 基础前端 |
 | **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Python-native异步回测 |
 | **M4 信号与模拟交易** | 🚧 开发中 | 五档信号状态机 + 6表闭环 + T+1解锁 |
-| **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR/API/任务 + 前端因子页 MVP |
+| **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR MVP/API/任务 + 前端因子页 MVP |
 | **M6 实时行情** | 📋 规划中 | 东方财富WebSocket + Redis广播 |
-| **M7 优化完善** | 📋 规划中 | 监控告警 + 参数敏感性 + 文档完善 |
+| **M7 优化完善** | 📋 规划中 | 监控告警 + 参数敏感性 + 完整因子研究图表 + 动态因子表达式 + 文档完善 |
 
 ---
 
