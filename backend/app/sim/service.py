@@ -189,6 +189,7 @@ async def _account_positions(session: AsyncSession, account_id: int) -> list[dic
             FROM sim_positions p
             LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
             WHERE p.account_id = :account_id
+              AND p.shares > 0
             ORDER BY p.updated_at DESC, p.id DESC
             """
         ),
@@ -235,6 +236,7 @@ async def list_positions_with_realtime_valuation(
             FROM sim_positions p
             LEFT JOIN stock_basic sb ON sb.ts_code = p.ts_code
             WHERE p.account_id = :account_id
+              AND p.shares > 0
             ORDER BY p.updated_at DESC, p.id DESC
             LIMIT :limit
             """
@@ -1016,7 +1018,12 @@ async def match_order(
                     END,
                     current_price = EXCLUDED.current_price,
                     market_value = (sim_positions.shares + EXCLUDED.shares) * EXCLUDED.current_price,
-                    first_buy_date = COALESCE(sim_positions.first_buy_date, EXCLUDED.first_buy_date),
+                    first_buy_date = CASE
+                        WHEN sim_positions.shares <= 0 THEN EXCLUDED.first_buy_date
+                        ELSE COALESCE(sim_positions.first_buy_date, EXCLUDED.first_buy_date)
+                    END,
+                    unrealized_pnl = 0,
+                    profit_rate = 0,
                     updated_at = NOW()
                 """
             ),
@@ -1054,12 +1061,28 @@ async def match_order(
                     frozen_shares = frozen_shares - :volume,
                     current_price = CAST(:price AS NUMERIC),
                     market_value = (shares - :volume) * CAST(:price AS NUMERIC),
+                    unrealized_pnl = (CAST(:price AS NUMERIC) - avg_cost) * (shares - :volume),
+                    profit_rate = CASE
+                        WHEN avg_cost <= 0 THEN 0
+                        ELSE (CAST(:price AS NUMERIC) - avg_cost) / avg_cost
+                    END,
                     available_shares = LEAST(available_shares, shares - :volume),
                     updated_at = NOW()
                 WHERE account_id = :account_id AND ts_code = :ts_code
                 """
             ),
             {"account_id": account_id, "ts_code": ts_code, "volume": volume, "price": price},
+        )
+        await session.execute(
+            text(
+                """
+                DELETE FROM sim_positions
+                WHERE account_id = :account_id
+                  AND ts_code = :ts_code
+                  AND shares <= 0
+                """
+            ),
+            {"account_id": account_id, "ts_code": ts_code},
         )
         await session.execute(
             text(
@@ -1189,7 +1212,8 @@ async def refresh_account_assets(session: AsyncSession, *, account_id: int) -> N
             """
             UPDATE sim_accounts
             SET total_asset = available_cash + frozen_cash + COALESCE((
-                    SELECT SUM(market_value) FROM sim_positions WHERE account_id = :account_id
+                    SELECT SUM(market_value) FROM sim_positions
+                    WHERE account_id = :account_id AND shares > 0
                 ), 0),
                 updated_at = NOW()
             WHERE id = :account_id
@@ -1214,6 +1238,7 @@ async def refresh_position_market_values(session: AsyncSession, *, account_id: i
                 updated_at = NOW()
             FROM daily_kline dk
             WHERE p.account_id = :account_id
+              AND p.shares > 0
               AND dk.ts_code = p.ts_code
               AND dk.trade_date = :nav_date
               AND dk.close IS NOT NULL
@@ -1318,6 +1343,7 @@ async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int
                 FROM sim_positions p
                 LEFT JOIN today_buys tb
                   ON tb.account_id = p.account_id AND tb.ts_code = p.ts_code
+                WHERE p.shares > 0
             )
             UPDATE sim_positions p
             SET available_shares = s.expected_available,
@@ -1358,7 +1384,7 @@ async def snapshot_daily_nav(session: AsyncSession, *, account_id: int, nav_date
     )
     account = dict(account_result.mappings().one())
     pos_result = await session.execute(
-        text("SELECT COALESCE(SUM(market_value), 0) FROM sim_positions WHERE account_id = :account_id"),
+        text("SELECT COALESCE(SUM(market_value), 0) FROM sim_positions WHERE account_id = :account_id AND shares > 0"),
         {"account_id": account_id},
     )
     position_value = _dec(pos_result.scalar_one())

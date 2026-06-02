@@ -582,7 +582,50 @@ async def test_match_sell_charges_stamp_tax_only_on_sell():
     assert "current_price = CAST(:price AS NUMERIC)" in session.statements[4]
     assert "market_value = (shares - :volume) * CAST(:price AS NUMERIC)" in session.statements[4]
     assert session.params[3]["stamp_tax"] == Decimal("3.0000")
-    assert session.params[5]["net_income"] == Decimal("5991.9400")
+    sell_income_idx = find_statement_index(session, "available_cash = available_cash + :net_income")
+    assert session.params[sell_income_idx]["net_income"] == Decimal("5991.9400")
+
+
+@pytest.mark.asyncio
+async def test_match_full_sell_deletes_cleared_position():
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(direction="卖出", volume=1000, frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row()]),
+            FakeResult([
+                {
+                    "id": 12,
+                    "order_id": 9,
+                    "account_id": 1,
+                    "ts_code": "000001.SZ",
+                    "direction": "卖出",
+                    "price": Decimal("10.0000"),
+                    "volume": 1000,
+                    "amount": Decimal("10000.0000"),
+                    "stamp_tax": Decimal("5.0000"),
+                    "commission": Decimal("5.0000"),
+                    "transfer_fee": Decimal("0.1000"),
+                    "total_fee": Decimal("10.1000"),
+                    "trade_time": datetime(2026, 5, 21),
+                }
+            ]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
+    )
+
+    await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+
+    delete_idx = find_statement_index(session, "DELETE FROM sim_positions")
+    assert "shares <= 0" in session.statements[delete_idx]
+    assert session.params[delete_idx] == {"account_id": 1, "ts_code": "000001.SZ"}
+    assert find_statement_index(session, "available_cash = available_cash + :net_income") > delete_idx
 
 
 @pytest.mark.asyncio
@@ -1390,6 +1433,7 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
             FakeResult([]),
             FakeResult([]),
             FakeResult([]),
+            FakeResult([]),
             FakeResult([], rowcount=1),
             FakeResult([]),
             FakeResult([]),
@@ -1444,6 +1488,8 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
     assert unlocked == 1
     assert sell_signal["action"] == "SELL_ALL"
     assert sell_match["status"] == "全部成交"
+    sell_delete_idx = find_statement_index(session, "DELETE FROM sim_positions")
+    assert "shares <= 0" in session.statements[sell_delete_idx]
     assert nav["total_asset"] == "101877.5152"
 
     buy_freeze_idx = find_param_index(session, "remark", "买入委托冻结 000001.SZ")
@@ -1478,6 +1524,7 @@ async def test_unlock_t1_unlocks_older_locked_buys():
     assert "WITH today_buys AS" in session.statements[1]
     assert "trade_time::DATE = :trade_date" in session.statements[1]
     assert "p.shares - p.frozen_shares - COALESCE(tb.volume, 0)" in session.statements[1]
+    assert "WHERE p.shares > 0" in session.statements[1]
     assert "p.available_shares <> s.expected_available" in session.statements[1]
 
 

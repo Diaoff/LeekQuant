@@ -482,6 +482,54 @@ def test_sim_positions_endpoint_uses_realtime_prices(monkeypatch):
     assert body[0]["unrealized_pnl"] == "-1500.0000"
     assert body[0]["profit_rate"] == "-0.15000000"
     assert body[0]["valuation_source"] == "realtime"
+    assert "p.shares > 0" in fake_session.statements[1]
+
+
+def test_sim_positions_endpoint_hides_cleared_positions(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        return []
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("100000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("100000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "user_trading_fee_config": None,
+                    }
+                ]
+            ),
+            FakeResult([]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts/1/positions")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert "p.shares > 0" in fake_session.statements[1]
 
 
 def test_sim_account_list_falls_back_to_stored_valuation_on_realtime_error(monkeypatch):
