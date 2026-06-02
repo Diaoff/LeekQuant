@@ -13,10 +13,7 @@
 
 本文件用于跟踪剩余整改项。已完成事项不再作为待办展开，仅在“已完成归档”中保留证据路径。
 
-当前剩余问题集中在：
-
-- 模拟交易涨跌停语义已基本统一到撮合阶段阻断，但回测规则层仍提前阻断，复盘口径仍需选择并统一。
-- `sync_kline(commit_each=True)` 相关测试会触发真实 PostgreSQL 连接，测试隔离不足。
+当前整改清单中的 R-001 到 R-010 均已完成。后续新发现的差异应新增编号，不再复用本轮已归档事项。
 
 整改原则保持不变：
 
@@ -30,97 +27,13 @@
 
 ## 2. 剩余问题分级
 
-| 编号 | 优先级 | 事项 | 当前状态 | 修复目标 |
-| --- | --- | --- | --- | --- |
-| R-005 | P1 | 涨跌停语义统一 | Partial | 明确并统一回测、模拟交易、信号记录的涨跌停处理口径。 |
-| R-010 | P1 | `sync_kline` 测试隔离 | Pending | `commit_each=True` 分支测试不应连接真实 PostgreSQL。 |
+当前无剩余待整改项。
 
 ---
 
 ## 3. 待整改项
 
-### 3.1 R-005：涨跌停语义统一
-
-**当前状态**
-
-- 模拟交易下单路径已调用 `apply_cn_rules(..., enforce_price_limits=False)`，涨停买入/跌停卖出允许生成委托。
-- 模拟交易撮合阶段会按涨跌停阻断，订单保持待成交，并写入 `reject_reason`。
-- `finally-design.md` 已说明“涨停买入、跌停卖出不在下单前写 BLOCKED；撮合阶段不成交”。
-- Python-native 回测 `_apply_rules()` 仍在规则层直接阻断：
-  - 买入涨停返回“涨停不可买入”。
-  - 卖出跌停返回“跌停不可卖出”。
-
-**风险**
-
-- 模拟交易与回测对同一信号可能产生不同解释。
-- 复盘时难以判断“策略没有生成交易”还是“生成交易后因撮合规则未成交”。
-- `signal_log.action`、回测交易记录、模拟委托状态的语义边界仍不完全一致。
-
-**推荐口径**
-
-统一采用当前 `finally-design.md` 和模拟交易已实现的口径：
-
-- 信号可以记录。
-- 委托可以生成。
-- 非交易日、停牌、T+1 可在下单前阻断。
-- 涨停买入、跌停卖出在撮合阶段阻断或保持待成交，并记录原因。
-
-**修复方案**
-
-1. 调整回测规则层：
-   - `_apply_rules()` 不再因涨停买入/跌停卖出直接阻断。
-   - 保留停牌、无持仓、T+1 等下单前阻断规则。
-2. 在回测成交逻辑中引入撮合阶段涨跌停判断：
-   - 买入遇涨停不成交，记录 skipped / blocked reason。
-   - 卖出遇跌停不成交，记录 skipped / blocked reason。
-3. 统一测试命名和断言：
-   - `test_signals.py` 保留 `enforce_price_limits=False` 的规则层用例。
-   - `test_sim_trading.py` 保持撮合阶段阻断用例。
-   - `test_adapter.py` 增加或更新回测涨跌停撮合语义测试。
-
-**验收标准**
-
-- 文档、回测、模拟交易对涨跌停解释一致。
-- 涨停买入/跌停卖出不会在信号/下单前被误标为策略无动作。
-- 撮合失败原因可在订单或回测交易结果中复盘。
-
----
-
-### 3.2 R-010：`sync_kline(commit_each=True)` 测试隔离
-
-**当前状态**
-
-目标测试命令当前结果为 `170 passed, 1 failed`。失败项：
-
-```text
-backend/tests/test_data_service.py::test_sync_kline_reports_progress_on_completion
-```
-
-失败原因：
-
-- `sync_kline(..., commit_each=True, concurrency=2)` 分支内部使用 `async_session_factory()` 创建真实 worker session。
-- 测试只替换了部分 repository 方法，没有替换 per-stock session factory 或 `_is_st_stock()`。
-- 在沙箱环境中连接本地 PostgreSQL 被拒绝，报 `PermissionError: [Errno 1] Operation not permitted`。
-
-**风险**
-
-- 单元测试依赖真实数据库，CI 或沙箱环境不稳定。
-- `commit_each=True` 分支的并发/进度逻辑可测性不足。
-
-**修复方案**
-
-1. 选择一个明确实现方式：
-   - 推荐：在 `sync_kline()` 增加仅内部使用的可注入 session factory 参数，例如 `session_factory=None`，默认使用 `async_session_factory`。
-   - 测试中注入 fake session factory，避免真实 DB 连接。
-2. 或者在测试中 monkeypatch `app.data.service.async_session_factory` / `_is_st_stock()`，但长期可维护性弱于显式注入。
-3. 保持生产行为不变：
-   - 未传入 session factory 时仍使用真实 `async_session_factory()`。
-   - `commit_each=False` 路径不受影响。
-
-**验收标准**
-
-- `test_sync_kline_reports_progress_on_completion` 不再连接真实 PostgreSQL。
-- 逐股票 gap 和增量 K 线相关测试稳定通过。
+当前无待整改项。
 
 ---
 
@@ -132,10 +45,12 @@ backend/tests/test_data_service.py::test_sync_kline_reports_progress_on_completi
 | R-002 | P0 | 移除 Hikyuu 适配器并统一回测引擎 | Done | 回测结果写入 `performance.engine = "python_native"`；`test_backtest_engine_selection.py` 覆盖。 |
 | R-003 | P0 | 逐股票 K 线缺口检测与修复 | Done | `infer_incremental_kline_ranges()`、`incremental_kline_update()` 已存在；`test_data_service.py` 和 `test_tasks.py` 覆盖 gap 场景。 |
 | R-004 | P1 | `alert_events` 告警闭环 | Done | 已实现 `GET /api/system/alerts` 和 `POST /api/system/alerts/{alert_id}/resolve`；`test_api_data.py` 覆盖过滤查询、resolve 成功和 404。 |
+| R-005 | P1 | 涨跌停语义统一 | Done | 回测不再在规则层阻断涨停买入/跌停卖出；撮合阶段记录 `match_status = BLOCKED` 和原因；`test_adapter.py`、`test_signals.py`、`test_sim_trading.py` 覆盖。 |
 | R-006 | P1 | 盘中持仓调仓文档同步 | Done | `finally-design.md` 已记录 `generate_intraday_position_signals` 任务、交易窗口和不默认 beat 调度策略。 |
 | R-007 | P1 | API/Celery/Docker 文档同步 | Done | `finally-design.md` 已同步当前任务路径、alerts 查询/resolve 路径、local compose、celery command 和 Redis/生产安全说明。 |
 | R-008 | P2 | 因子分析 MVP 与完整能力边界 | Done | `finally-design.md` 已区分因子 MVP 与 M7+ 表达式/图表增强能力。 |
 | R-009 | P2 | 生产安全配置说明 | Done | `finally-design.md` 已说明 Redis 密码、强 `SECRET_KEY`、受控 CORS、反向代理 TLS 等生产要求。 |
+| R-010 | P1 | `sync_kline` 测试隔离 | Done | `sync_kline()` 支持注入 `session_factory`；`commit_each=True` 单测使用 fake session factory，不再连接真实 PostgreSQL；`test_data_service.py`、`test_tasks.py` 覆盖。 |
 
 ---
 
@@ -184,13 +99,31 @@ R-004 专项核查结果：
 python3 -m pytest backend/tests/test_api_data.py -q
 ```
 
-全量目标命令最近一次核查结果：
+R-005 专项核查结果：
 
 ```text
-170 passed, 1 failed
+145 passed
 ```
 
-失败项为 R-010 中记录的 `test_sync_kline_reports_progress_on_completion`。
+命令：
+
+```bash
+python3 -m pytest backend/tests/test_adapter.py backend/tests/test_signals.py backend/tests/test_sim_trading.py -q
+```
+
+R-010 专项核查结果：
+
+```text
+30 passed
+```
+
+命令：
+
+```bash
+python3 -m pytest backend/tests/test_data_service.py backend/tests/test_tasks.py -q
+```
+
+全量目标命令建议在合并前重新运行一次。
 
 涉及前端或 WebSocket 时追加：
 
@@ -215,9 +148,9 @@ docker compose config
 | R-002 | P0 | 移除 Hikyuu 适配器并统一回测引擎 | Done | 保持 `test_backtest_engine_selection.py` 通过。 |
 | R-003 | P0 | 逐股票 K 线缺口修复 | Done | 保持 gap 相关测试通过。 |
 | R-004 | P1 | `alert_events` 告警闭环 | Done | 保持 `test_api_data.py` 通过。 |
-| R-005 | P1 | 涨跌停语义统一 | Partial | 回测和模拟交易同口径测试通过。 |
+| R-005 | P1 | 涨跌停语义统一 | Done | 保持 `test_adapter.py`、`test_signals.py`、`test_sim_trading.py` 通过。 |
 | R-006 | P1 | 盘中调仓文档同步 | Done | 保持 `finally-design.md` 任务说明与代码一致。 |
 | R-007 | P1 | API/Celery/Docker 文档同步 | Done | 保持 API 路径与文档一致。 |
 | R-008 | P2 | 因子分析展示边界 | Done | 保持 MVP/M7+ 边界清晰。 |
 | R-009 | P2 | 生产部署安全文档 | Done | 保持 local/prod 配置边界清晰。 |
-| R-010 | P1 | `sync_kline` 测试隔离 | Pending | 目标测试命令全绿。 |
+| R-010 | P1 | `sync_kline` 测试隔离 | Done | 保持 `test_data_service.py` 和 `test_tasks.py` 通过。 |

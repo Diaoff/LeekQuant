@@ -146,6 +146,13 @@ async def test_sync_kline_reports_progress_on_completion(monkeypatch) -> None:
                 return FakeResult([("000001.SZ",), ("600000.SH",)])
             return FakeResult([])
 
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return TwoCodeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
     calls = []
 
     async def fake_upsert_daily_kline(_session, records):
@@ -168,6 +175,7 @@ async def test_sync_kline_reports_progress_on_completion(monkeypatch) -> None:
         progress_callback=lambda current, total, code: progress.append((current, total, code)),
         commit_each=True,
         concurrency=2,
+        session_factory=FakeSessionContext,
     )
 
     assert result["requested_symbols"] == 2

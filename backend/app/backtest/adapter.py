@@ -289,7 +289,7 @@ class BacktestRunner:
                 candidates.append(self._build_signal_candidate(ts_code, bar, action_info, signal, td))
 
             for candidate in sorted(candidates, key=self._candidate_sort_key):
-                self._execute_action(
+                match_blocked_reason = self._execute_action(
                     candidate.action,
                     candidate.ts_code,
                     candidate.bar,
@@ -297,7 +297,11 @@ class BacktestRunner:
                     candidate.signal,
                     exit_reason=candidate.exit_reason,
                 )
-                self.signals.append(self._candidate_signal_record(candidate))
+                signal_record = self._candidate_signal_record(candidate)
+                if match_blocked_reason:
+                    signal_record["match_status"] = "BLOCKED"
+                    signal_record["reason"] = match_blocked_reason
+                self.signals.append(signal_record)
 
         return self._compute_results()
 
@@ -439,13 +443,9 @@ class BacktestRunner:
     ) -> tuple[str, bool]:
         if bar.is_suspended:
             return "停牌", True
-        if action.action == "BUY" and bar.is_limit_up:
-            return "涨停不可买入", True
-        if action.action in ("SELL_ALL", "SELL_PARTIAL") and bar.is_limit_down:
-            return "跌停不可卖出", True
         if action.action.startswith("SELL"):
             pos = self.positions.get(ts_code)
-            if pos and pos.shares <= 0:
+            if not pos or pos.shares <= 0:
                 return "无持仓", True
         return "", False
 
@@ -457,7 +457,7 @@ class BacktestRunner:
         total_asset: Decimal,
         signal: dict | None = None,
         exit_reason: str | None = None,
-    ) -> None:
+    ) -> str | None:
         price_path = self._infer_candle_path(bar.open, bar.high, bar.low, bar.close)
 
         # 选择买入时更优的价格（阳线取low，阴线取open）
@@ -465,6 +465,8 @@ class BacktestRunner:
         sell_price = price_path[2] if bar.close >= bar.open else price_path[1]
 
         if action.action == "BUY":
+            if bar.is_limit_up:
+                return "涨停不可买入"
             price = buy_price
             target_value = total_asset * Decimal(str(action.target_position))
             current_value = Decimal("0")
@@ -473,11 +475,11 @@ class BacktestRunner:
                 current_value = pos.avg_cost * pos.shares
             delta_value = max(target_value - current_value, Decimal("0"))
             if delta_value <= 0 or price <= 0:
-                return
+                return None
             raw_shares = int(delta_value / price)
             volume = (raw_shares // 100) * 100
             if volume <= 0:
-                return
+                return None
             cost = self.calculator.calculate("买入", price * volume)
             total_cost = price * volume + cost.total_fee
             if total_cost > self.cash:
@@ -490,7 +492,7 @@ class BacktestRunner:
                         break
                     volume -= 100
                 if volume <= 0:
-                    return
+                    return None
 
             balance_before = self._book_asset()
             pos_ratio_before = self._position_ratio(balance_before) if balance_before > 0 else 0
@@ -532,12 +534,15 @@ class BacktestRunner:
                 holding_days=0,
                 exit_reason="",
             ))
+            return None
 
         elif action.action in ("SELL_ALL", "SELL_PARTIAL"):
+            if bar.is_limit_down:
+                return "跌停不可卖出"
             price = sell_price
             pos = self.positions.get(ts_code)
             if not pos or pos.shares <= 0:
-                return
+                return None
 
             if action.action == "SELL_ALL":
                 volume = pos.shares
@@ -546,12 +551,12 @@ class BacktestRunner:
                 current_value = pos.avg_cost * pos.shares
                 sell_value = max(current_value - target_value, Decimal("0"))
                 if sell_value <= 0 or price <= 0:
-                    return
+                    return None
                 raw_shares = int(sell_value / price)
                 volume = min(pos.shares, (raw_shares // 100) * 100)
 
             if volume <= 0:
-                return
+                return None
 
             cost = self.calculator.calculate("卖出", price * volume)
             net_amount = price * volume - cost.total_fee
@@ -606,6 +611,9 @@ class BacktestRunner:
 
             if pos.shares == 0:
                 del self.positions[ts_code]
+            return None
+
+        return None
 
     def _compute_results(self) -> dict[str, Any]:
         if not self.equity_curve:

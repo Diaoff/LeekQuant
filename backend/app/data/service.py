@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, AsyncContextManager
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -337,9 +337,11 @@ async def sync_kline(
     progress_callback: Callable[[int, int, str], None] | None = None,
     commit_each: bool = False,
     concurrency: int = 1,
+    session_factory: Callable[[], AsyncContextManager[AsyncSession]] | None = None,
 ) -> dict[str, Any]:
     from app.db.session import async_session_factory as _per_stock_sf
 
+    per_stock_session_factory = session_factory or _per_stock_sf
     provider_list = providers or default_providers()
     concurrency = max(1, concurrency)
     if ts_codes is None:
@@ -372,7 +374,7 @@ async def sync_kline(
 
     async def process_code(ts_code: str) -> dict[str, Any]:
         if commit_each:
-            async with _per_stock_sf() as wk_session:
+            async with per_stock_session_factory() as wk_session:
                 try:
                     source, records = await asyncio.to_thread(
                         fetch_with_fallback,
@@ -485,7 +487,7 @@ async def sync_kline(
             if commit_each:
                 await session.commit()
         else:
-            async with _per_stock_sf() as alert_session:
+            async with per_stock_session_factory() as alert_session:
                 await create_alert(
                     alert_session,
                     level="warning" if total else "error",

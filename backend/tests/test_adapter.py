@@ -236,18 +236,21 @@ class TestAShareRuleFiltering:
         assert result["trade_count"] == 0
         assert all(s["action"] == "BLOCKED" for s in runner.signals)
 
-    def test_limit_up_blocks_buy(self):
-        """涨停日不能买入"""
+    def test_limit_up_buy_records_signal_and_blocks_match(self):
+        """涨停买入信号保留，撮合阶段不成交"""
         config = sample_backtest_config(source_code=ALWAYS_BUY_STRATEGY)
         runner = BacktestRunner(config)
         klines = generate_klines(is_limit_up=True, days=10)
         result = runner.run({"000001.SZ": klines})
 
+        assert result["trade_count"] == 0
         buy_signals = [s for s in runner.signals if s.get("action") == "BUY"]
-        assert len(buy_signals) == 0
+        assert len(buy_signals) > 0
+        assert all(s.get("match_status") == "BLOCKED" for s in buy_signals)
+        assert all(s.get("reason") == "涨停不可买入" for s in buy_signals)
 
-    def test_limit_down_blocks_sell(self):
-        """跌停日不能卖出（需要先有持仓）"""
+    def test_limit_down_sell_records_signal_and_blocks_match(self):
+        """跌停卖出信号保留，撮合阶段不成交"""
         sell_strategy = '''
 def generate_signal(ctx):
     return {"signal_type": "卖出", "current_position": 0.5}
@@ -258,8 +261,11 @@ def generate_signal(ctx):
         klines = generate_klines(is_limit_down=True, days=10)
         result = runner.run({"000001.SZ": klines})
 
-        sell_blocked = [s for s in runner.signals if s.get("action") == "BLOCKED"]
-        assert len(sell_blocked) > 0
+        assert result["trade_count"] == 0
+        sell_signals = [s for s in runner.signals if s.get("action") == "SELL_ALL"]
+        assert len(sell_signals) > 0
+        assert all(s.get("match_status") == "BLOCKED" for s in sell_signals)
+        assert all(s.get("reason") == "跌停不可卖出" for s in sell_signals)
 
     def test_no_position_cannot_sell(self):
         """无持仓时不能卖出"""
