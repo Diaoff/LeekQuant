@@ -35,9 +35,11 @@ interface Position {
   market_value: string
   unrealized_pnl: string
   profit_rate: string
+  today_pnl: string
+  today_pnl_rate: string
 }
 
-type PositionSortKey = 'unrealized_pnl' | 'profit_rate'
+type PositionSortKey = 'unrealized_pnl'
 type SortDirection = 'asc' | 'desc'
 
 interface Order {
@@ -742,7 +744,7 @@ export default function SimulationPage() {
               <RiskGuardSection status={riskGuardStatus} takeProfitBreached={takeProfitBreached} />
 
               <DataTable title="持仓" loading={detailLoading} empty="暂无持仓">
-                <table className="min-w-[860px] w-full text-left text-sm">
+                <table className="min-w-[760px] w-full text-left text-sm">
                   <thead className="bg-tableHead text-xs text-muted">
                     <tr>
                       <th className="px-4 py-3">股票</th>
@@ -756,19 +758,8 @@ export default function SimulationPage() {
                           className="inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-left font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
                           aria-label={`按收益金额${positionSort?.key === 'unrealized_pnl' && positionSort.direction === 'desc' ? '升序' : '降序'}排序`}
                         >
-                          收益金额
+                          收益 / 今日
                           {positionSortIcon('unrealized_pnl')}
-                        </button>
-                      </th>
-                      <th className="px-4 py-3">
-                        <button
-                          type="button"
-                          onClick={() => togglePositionSort('profit_rate')}
-                          className="inline-flex min-h-8 items-center gap-1.5 rounded px-1 text-left font-medium text-muted outline-none hover:text-ink focus-visible:ring-2 focus-visible:ring-accent"
-                          aria-label={`按收益率${positionSort?.key === 'profit_rate' && positionSort.direction === 'desc' ? '升序' : '降序'}排序`}
-                        >
-                          收益率
-                          {positionSortIcon('profit_rate')}
                         </button>
                       </th>
                     </tr>
@@ -789,8 +780,16 @@ export default function SimulationPage() {
                           <div className="mt-0.5 text-xs text-muted">{money(position.current_price)}</div>
                         </td>
                         <td className="px-4 py-3 font-mono tabular-nums">{money(position.market_value)}</td>
-                        <td className={`px-4 py-3 font-mono tabular-nums ${cnMarketTone(position.unrealized_pnl)}`}>{signedMoney(position.unrealized_pnl)}</td>
-                        <td className={`px-4 py-3 font-mono tabular-nums ${cnMarketTone(position.profit_rate)}`}>{formatNumber(Number(position.profit_rate) * 100, 2)}%</td>
+                        <td className="px-4 py-3 font-mono tabular-nums">
+                          <div className={`flex min-w-[170px] items-center justify-between gap-3 ${cnMarketTone(position.unrealized_pnl)}`}>
+                            <span>{signedMoney(position.unrealized_pnl)}</span>
+                            <span>{signedPercentFromRatio(position.profit_rate)}</span>
+                          </div>
+                          <div className={`mt-0.5 flex min-w-[170px] items-center justify-between gap-3 text-xs ${cnMarketTone(position.today_pnl)}`}>
+                            <span>{signedMoney(position.today_pnl)}</span>
+                            <span>{signedPercentFromRatio(position.today_pnl_rate)}</span>
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

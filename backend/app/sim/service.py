@@ -136,6 +136,47 @@ def _apply_realtime_position_values(
     return enriched, _money(total_value), _money(total_unrealized_pnl), has_realtime
 
 
+async def _latest_position_closes(session: AsyncSession, ts_codes: list[str]) -> dict[str, Decimal]:
+    codes = sorted(set(ts_codes))
+    if not codes:
+        return {}
+    result = await session.execute(
+        text(
+            """
+            SELECT DISTINCT ON (ts_code) ts_code, close
+            FROM daily_kline
+            WHERE ts_code = ANY(:ts_codes)
+              AND close IS NOT NULL
+            ORDER BY ts_code, trade_date DESC
+            """
+        ),
+        {"ts_codes": codes},
+    )
+    return {str(row["ts_code"]): _dec(row["close"]) for row in result.mappings().all() if row.get("close") is not None}
+
+
+def _apply_position_today_pnl(
+    positions: list[dict[str, Any]],
+    latest_closes: dict[str, Decimal],
+) -> list[dict[str, Any]]:
+    enriched: list[dict[str, Any]] = []
+    for position in positions:
+        row = dict(position)
+        ts_code = str(row["ts_code"])
+        shares = int(row.get("shares") or 0)
+        current_price = _dec(row.get("current_price")) if row.get("current_price") is not None else None
+        previous_close = latest_closes.get(ts_code)
+        if shares > 0 and current_price is not None and previous_close is not None and previous_close > 0:
+            row["today_pnl"] = _money((current_price - previous_close) * shares)
+            today_pnl_rate = ((current_price - previous_close) / previous_close).quantize(RATIO_QUANT)
+            row["today_pnl_rate"] = format(today_pnl_rate, "f")
+        else:
+            row["today_pnl"] = _money(Decimal("0"))
+            row["today_pnl_rate"] = "0.00000000"
+        enriched.append(row)
+    return enriched
+
+
 async def enrich_account_with_realtime_valuation(
     session: AsyncSession,
     account: dict[str, Any],
@@ -143,6 +184,8 @@ async def enrich_account_with_realtime_valuation(
     positions = await _account_positions(session, int(account["id"]))
     prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
     enriched_positions, position_value, unrealized_pnl, has_realtime = _apply_realtime_position_values(positions, prices)
+    latest_closes = await _latest_position_closes(session, [str(position["ts_code"]) for position in enriched_positions if int(position.get("shares") or 0) > 0])
+    enriched_positions = _apply_position_today_pnl(enriched_positions, latest_closes)
     row = dict(account)
     row["position_value"] = position_value
     row["unrealized_pnl"] = unrealized_pnl
@@ -246,6 +289,8 @@ async def list_positions_with_realtime_valuation(
     positions = [dict(row) for row in result.mappings().all()]
     prices, error = await _realtime_prices([str(position["ts_code"]) for position in positions if int(position.get("shares") or 0) > 0])
     enriched, _position_value, _unrealized_pnl, _has_realtime = _apply_realtime_position_values(positions, prices)
+    latest_closes = await _latest_position_closes(session, [str(position["ts_code"]) for position in enriched if int(position.get("shares") or 0) > 0])
+    enriched = _apply_position_today_pnl(enriched, latest_closes)
     serialized = serialize_rows(enriched)
     if error:
         for row in serialized:

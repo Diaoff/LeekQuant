@@ -278,6 +278,7 @@ def test_sim_account_list_uses_realtime_prices_for_total_asset(monkeypatch):
                     }
                 ]
             ),
+            FakeResult([{"ts_code": "000001.SZ", "close": Decimal("11.0000")}]),
             FakeResult([{"total_asset": Decimal("12000.0000")}]),
         ]
     )
@@ -305,6 +306,8 @@ def test_sim_account_list_uses_realtime_prices_for_total_asset(monkeypatch):
     assert body[0]["positions"][0]["market_value"] == "12000.0000"
     assert body[0]["positions"][0]["unrealized_pnl"] == "2000.0000"
     assert body[0]["positions"][0]["profit_rate"] == "0.20000000"
+    assert body[0]["positions"][0]["today_pnl"] == "1000.0000"
+    assert body[0]["positions"][0]["today_pnl_rate"] == "0.09090909"
 
 
 def test_sim_account_list_sorts_by_realtime_total_asset_desc(monkeypatch):
@@ -372,6 +375,7 @@ def test_sim_account_list_sorts_by_realtime_total_asset_desc(monkeypatch):
                     }
                 ]
             ),
+            FakeResult([{"ts_code": "000001.SZ", "close": Decimal("11.0000")}]),
             FakeResult([]),
             FakeResult(
                 [
@@ -392,6 +396,7 @@ def test_sim_account_list_sorts_by_realtime_total_asset_desc(monkeypatch):
                     }
                 ]
             ),
+            FakeResult([{"ts_code": "600000.SH", "close": Decimal("19.0000")}]),
             FakeResult([]),
         ]
     )
@@ -460,7 +465,7 @@ def test_sim_positions_endpoint_uses_realtime_prices(monkeypatch):
                     }
                 ]
             ),
-            FakeResult([{"total_asset": Decimal("12200.0000")}]),
+            FakeResult([{"ts_code": "000001.SZ", "close": Decimal("8.0000")}]),
         ]
     )
 
@@ -481,8 +486,77 @@ def test_sim_positions_endpoint_uses_realtime_prices(monkeypatch):
     assert body[0]["market_value"] == "8500.0000"
     assert body[0]["unrealized_pnl"] == "-1500.0000"
     assert body[0]["profit_rate"] == "-0.15000000"
+    assert body[0]["today_pnl"] == "500.0000"
+    assert body[0]["today_pnl_rate"] == "0.06250000"
     assert body[0]["valuation_source"] == "realtime"
     assert "p.shares > 0" in fake_session.statements[1]
+
+
+def test_sim_positions_endpoint_defaults_today_pnl_without_latest_close(monkeypatch):
+    from app.sim import service as sim_service
+
+    async def fake_snapshot(self):
+        return [RealtimeTick(ts_code="000001.SZ", price=Decimal("8.5000"))]
+
+    monkeypatch.setattr(sim_service.EastMoneyRealtimeProvider, "fetch_snapshot", fake_snapshot)
+    fake_session = FakeSession(
+        [
+            FakeResult(
+                [
+                    {
+                        "id": 1,
+                        "user_id": 1,
+                        "strategy_id": None,
+                        "name": "M4",
+                        "initial_cash": Decimal("100000.0000"),
+                        "available_cash": Decimal("1000.0000"),
+                        "frozen_cash": Decimal("0.0000"),
+                        "total_asset": Decimal("11000.0000"),
+                        "status": "active",
+                        "config": {},
+                        "created_at": date(2026, 5, 21),
+                        "updated_at": date(2026, 5, 21),
+                        "user_trading_fee_config": None,
+                    }
+                ]
+            ),
+            FakeResult(
+                [
+                    {
+                        "id": 9,
+                        "account_id": 1,
+                        "ts_code": "000001.SZ",
+                        "stock_name": "平安银行",
+                        "shares": 1000,
+                        "available_shares": 1000,
+                        "frozen_shares": 0,
+                        "avg_cost": Decimal("10.0000"),
+                        "current_price": Decimal("10.0000"),
+                        "market_value": Decimal("10000.0000"),
+                        "unrealized_pnl": Decimal("0.0000"),
+                        "profit_rate": Decimal("0.00000000"),
+                        "updated_at": date(2026, 5, 21),
+                    }
+                ]
+            ),
+            FakeResult([]),
+        ]
+    )
+
+    async def override_session():
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_session
+    try:
+        client = TestClient(app)
+        response = client.get("/api/sim/accounts/1/positions")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["today_pnl"] == "0.0000"
+    assert body[0]["today_pnl_rate"] == "0.00000000"
 
 
 def test_sim_positions_endpoint_hides_cleared_positions(monkeypatch):
@@ -579,6 +653,7 @@ def test_sim_account_list_falls_back_to_stored_valuation_on_realtime_error(monke
                     }
                 ]
             ),
+            FakeResult([]),
             FakeResult([{"total_asset": Decimal("12200.0000")}]),
         ]
     )
