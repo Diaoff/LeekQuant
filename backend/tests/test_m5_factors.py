@@ -55,21 +55,21 @@ class CaptureSession:
 
 def enabled_definitions():
     return [
-        {"name": "pe_ttm", "direction": -1, "default_weight": Decimal("1.0")},
-        {"name": "pb", "direction": -1, "default_weight": Decimal("1.0")},
-        {"name": "roe", "direction": 1, "default_weight": Decimal("1.2")},
-        {"name": "revenue_growth", "direction": 1, "default_weight": Decimal("1.0")},
-        {"name": "mom_20d", "direction": 1, "default_weight": Decimal("1.0")},
-        {"name": "mom_60d", "direction": 1, "default_weight": Decimal("1.0")},
-        {"name": "rsi6", "direction": 1, "default_weight": Decimal("0.8")},
-        {"name": "vol_20d", "direction": -1, "default_weight": Decimal("0.8")},
+        {"name": "pe_ttm", "direction": -1, "default_weight": Decimal("1.0"), "expression": "pe_ttm"},
+        {"name": "pb", "direction": -1, "default_weight": Decimal("1.0"), "expression": "pb"},
+        {"name": "roe", "direction": 1, "default_weight": Decimal("1.2"), "expression": "roe"},
+        {"name": "revenue_growth", "direction": 1, "default_weight": Decimal("1.0"), "expression": "revenue_growth"},
+        {"name": "mom_20d", "direction": 1, "default_weight": Decimal("1.0"), "expression": "$close / Ref($close, 20) - 1"},
+        {"name": "mom_60d", "direction": 1, "default_weight": Decimal("1.0"), "expression": "$close / Ref($close, 60) - 1"},
+        {"name": "rsi6", "direction": 1, "default_weight": Decimal("0.8"), "expression": "RSI($close, 6)"},
+        {"name": "vol_20d", "direction": -1, "default_weight": Decimal("0.8"), "expression": "STD($close / Ref($close, 1) - 1, 20)"},
     ]
 
 
 def enabled_definitions_with_custom():
     return [
         *enabled_definitions(),
-        {"name": "user_custom_alpha", "direction": 1, "default_weight": Decimal("1.0")},
+        {"name": "user_custom_alpha", "direction": 1, "default_weight": Decimal("1.0"), "expression": "$close / Ref($close, 5) - 1"},
     ]
 
 
@@ -205,8 +205,8 @@ async def test_compute_factors_only_clears_computable_builtin_factor_values():
 
     assert result["factor_count"] == 9
     assert "DELETE FROM factor_values" in session.statements[3]
-    assert "user_custom_alpha" not in session.params[3]["factor_names"]
-    assert set(session.params[3]["factor_names"]) == {row["name"] for row in enabled_definitions()}
+    all_names = {row["name"] for row in enabled_definitions()} | {"user_custom_alpha"}
+    assert set(session.params[3]["factor_names"]) == all_names
 
 
 @pytest.mark.asyncio

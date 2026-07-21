@@ -160,3 +160,74 @@ def test_daily_kline_requires_trade_date() -> None:
             "adata",
             ts_code="000001.SZ",
         )
+
+
+def test_normalize_daily_kline_defaults_is_suspended_to_false_when_not_provided() -> None:
+    record = normalize_daily_kline(
+        {
+            "date": "2026-05-18",
+            "open": "10",
+            "high": "11",
+            "low": "9",
+            "close": "10.5",
+            "volume": "1000",
+        },
+        "akshare",
+        ts_code="000001.SZ",
+    )
+
+    assert record.is_suspended is False
+
+
+def test_normalize_daily_kline_accepts_explicit_is_suspended_true() -> None:
+    record = normalize_daily_kline(
+        {
+            "date": "2026-05-18",
+            "open": "10",
+            "high": "11",
+            "low": "9",
+            "close": "10.5",
+            "volume": "1000",
+        },
+        "baostock",
+        ts_code="000001.SZ",
+        is_suspended=True,
+    )
+
+    assert record.is_suspended is True
+
+
+def test_normalize_daily_kline_accepts_explicit_is_suspended_false() -> None:
+    record = normalize_daily_kline(
+        {
+            "date": "2026-05-18",
+            "open": "10",
+            "high": "11",
+            "low": "9",
+            "close": "10.5",
+            "volume": "1000",
+        },
+        "baostock",
+        ts_code="000001.SZ",
+        is_suspended=False,
+    )
+
+    assert record.is_suspended is False
+
+
+def test_normalize_daily_kline_none_is_suspended_falls_back_to_false() -> None:
+    record = normalize_daily_kline(
+        {
+            "date": "2026-05-18",
+            "open": "10",
+            "high": "11",
+            "low": "9",
+            "close": "10.5",
+            "volume": "1000",
+        },
+        "baostock",
+        ts_code="000001.SZ",
+        is_suspended=None,
+    )
+
+    assert record.is_suspended is False

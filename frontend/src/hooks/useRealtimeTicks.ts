@@ -1,5 +1,6 @@
 import React from 'react'
 import { apiBaseUrl, fetchJson } from '../lib/utils'
+import { useWebSocket } from './useWebSocket'
 
 export interface RealtimeTick {
   ts_code: string
@@ -11,6 +12,10 @@ export interface RealtimeTick {
   bid1: string | null
   ask1: string | null
   ts: string
+  /** Redis Stream ID — set by backend when persistence is enabled.
+   * Tracked so client can replay missed ticks via ?replay_from=<stream_id>
+   * after a reconnect. Forward-compat: undefined when backend doesn't emit. */
+  stream_id?: string
 }
 
 type RealtimeStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
@@ -18,12 +23,6 @@ type RealtimeStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
 interface SnapshotResponse {
   items: RealtimeTick[]
   errors: string[]
-}
-
-function realtimeWebSocketUrl() {
-  const url = new URL('/ws/realtime', apiBaseUrl)
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  return url.toString()
 }
 
 function normalizeCodes(tsCodes: string[]) {
@@ -37,64 +36,49 @@ export function useRealtimeTicks(tsCodes: string[]) {
   const codes = React.useMemo(() => normalizeCodes(tsCodes), [tsCodes])
   const codesKey = codes.join(',')
 
+  // Track the latest Redis stream_id so we can ask the server to replay any
+  // ticks produced during a disconnect window on the next reconnect.
+  const lastTickStreamIdRef = React.useRef<string | undefined>(undefined)
+
+  const subscribeMsg = React.useMemo(
+    () => codes.length > 0 ? { action: 'subscribe', ts_codes: codes } as Record<string, unknown> : undefined,
+    [codesKey],
+  )
+
+  // On each (re)connect, build the WS URL with ?replay_from=<stream_id> if we
+  // have one. Called by WebSocketConnection.ensureOpen() via reconnectPath.
+  // Using useCallback so the reference is stable across renders unless the
+  // underlying stream_id source changes (it doesn't — we read from a ref).
+  const buildWsPath = React.useCallback((): string => {
+    const streamId = lastTickStreamIdRef.current
+    if (!streamId) return '/ws/realtime'
+    return `/ws/realtime?replay_from=${encodeURIComponent(streamId)}`
+  }, [])
+
+  useWebSocket({
+    path: '/ws/realtime',
+    reconnectPath: buildWsPath,
+    subscribeMsg,
+    onMessage: (payload) => {
+      const tick = payload as Partial<RealtimeTick>
+      if (!tick.ts_code || tick.price === undefined) return
+      // Track stream_id for future reconnects (forward-compat: backend may
+      // not include it yet, in which case we keep the previous ref).
+      if (tick.stream_id) {
+        lastTickStreamIdRef.current = tick.stream_id
+      }
+      setError(null)
+      setTicks((current) => ({ ...current, [tick.ts_code!]: tick as RealtimeTick }))
+    },
+    onError: (detail) => setError(detail),
+  })
+
   React.useEffect(() => {
     if (codes.length === 0) {
       setStatus('idle')
       setError(null)
       return
     }
-
-    let closed = false
-    const socket = new WebSocket(realtimeWebSocketUrl())
-    setStatus('connecting')
-    setError(null)
-
-    socket.addEventListener('open', () => {
-      if (closed) return
-      setStatus('open')
-      socket.send(JSON.stringify({ action: 'subscribe', ts_codes: codes }))
-    })
-
-    socket.addEventListener('message', (event) => {
-      try {
-        const payload = JSON.parse(String(event.data)) as Partial<RealtimeTick> & { type?: string; detail?: string }
-        if (payload.type === 'error') {
-          setStatus('error')
-          setError(payload.detail ?? '实时行情连接异常')
-          return
-        }
-        if (!payload.ts_code || payload.price === undefined) return
-        const tick = payload as RealtimeTick
-        setError(null)
-        setTicks((current) => ({ ...current, [tick.ts_code]: tick }))
-      } catch {
-        setStatus('error')
-        setError('实时行情数据解析失败')
-      }
-    })
-
-    socket.addEventListener('error', () => {
-      if (!closed) {
-        setStatus('error')
-        setError('实时行情连接失败')
-      }
-    })
-
-    socket.addEventListener('close', () => {
-      if (!closed) setStatus('closed')
-    })
-
-    return () => {
-      closed = true
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ action: 'unsubscribe', ts_codes: codes }))
-      }
-      socket.close()
-    }
-  }, [codesKey])
-
-  React.useEffect(() => {
-    if (codes.length === 0) return
     let cancelled = false
     fetchJson<SnapshotResponse>(`/api/realtime/snapshot?ts_codes=${encodeURIComponent(codes.join(','))}`)
       .then((payload) => {

@@ -53,10 +53,14 @@ def test_execute_strategy_returns_structured_exception() -> None:
 
 
 def test_execute_strategy_times_out_and_terminates_child() -> None:
+    # This test specifically exercises spawn-mode timeout enforcement.
+    # Inline mode (the new default) has no process-level timeout and would hang
+    # on an infinite loop, so we explicitly request spawn mode here.
     result = execute_strategy(
         "def generate_signal(ctx):\n    while True:\n        pass",
         _ctx(),
         timeout_seconds=0.2,
+        allow_inline=False,
     )
 
     assert result.ok is False
@@ -76,6 +80,27 @@ def test_execute_strategy_allow_inline_runs_without_child_process(monkeypatch) -
         "def generate_signal(ctx):\n    return {'signal_type': '观望'}",
         _ctx(),
         allow_inline=True,
+    )
+
+    assert result.ok is True
+    assert result.signal == {"signal_type": "观望"}
+
+
+def test_execute_strategy_daemon_process_runs_inline(monkeypatch) -> None:
+    from app.backtest import strategy_runtime
+
+    def fail_process(*_args, **_kwargs):
+        raise AssertionError("daemon execution must not spawn a child process")
+
+    class DaemonProcess:
+        daemon = True
+
+    monkeypatch.setattr(strategy_runtime.multiprocessing, "current_process", lambda: DaemonProcess())
+    monkeypatch.setattr(strategy_runtime.multiprocessing, "get_context", fail_process)
+
+    result = execute_strategy(
+        "def generate_signal(ctx):\n    return {'signal_type': '观望'}",
+        _ctx(),
     )
 
     assert result.ok is True

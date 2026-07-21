@@ -109,7 +109,10 @@ def _http_json(url: str, params: dict[str, Any] | None = None, timeout: int = 15
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="ignore")
     except URLError as exc:
-        raise DataProviderError(f"http request failed for {url}: {exc}") from exc
+        # Wrap as ConnectionError so fetcher's _RETRYABLE catches it (was DataProviderError
+        # which was non-retryable, masking transient network errors).
+        from requests.exceptions import ConnectionError as ReqConnectionError
+        raise ReqConnectionError(f"http request failed for {url}: {exc}") from exc
 
     body = body.strip()
     if body.startswith(("jQuery", "callback")):
@@ -164,14 +167,19 @@ def _market_value(value: Any) -> Any:
 
 @register_provider
 class EastMoneyHttpProvider:
+    """HTTP snapshot provider for EastMoney.
+
+    Used as a degraded fallback when primary A-share providers (AData/Baostock/AkShare)
+    are unavailable. Design contract: priority order AData→Baostock→AkShare→EastMoney.
+    """
     name = "eastmoney_http"
+    priority_default = 10
     display_name = "EastMoney HTTP"
     capabilities = frozenset({
         ProviderCapability.STOCK_BASIC,
         ProviderCapability.DAILY_KLINE,
         ProviderCapability.FUNDAMENTALS,
     })
-    priority_default = 1
 
     def fetch_stock_basic(self) -> list[StockBasic]:
         rows: list[dict[str, Any]] = []
@@ -231,7 +239,7 @@ class EastMoneyHttpProvider:
                 "fields1": "f1,f2,f3,f4,f5,f6",
                 "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
                 "klt": "101",
-                "fqt": "0",
+                "fqt": "1",  # 前复权 (qfq): returns adjusted prices directly
                 "beg": _date_arg(start_date),
                 "end": _date_arg(end_date),
             },
@@ -338,7 +346,7 @@ class TencentHttpProvider:
     name = "tencent_http"
     display_name = "Tencent Finance HTTP"
     capabilities = frozenset({ProviderCapability.FUNDAMENTALS, ProviderCapability.REALTIME_QUOTE})
-    priority_default = 2
+    priority_default = 20
 
     def fetch_stock_basic(self) -> list[StockBasic]:
         raise _unsupported(self.name, ProviderCapability.STOCK_BASIC)
@@ -494,7 +502,7 @@ class ADataProvider:
     name = "adata"
     display_name = "AData"
     capabilities = frozenset({ProviderCapability.STOCK_BASIC, ProviderCapability.DAILY_KLINE})
-    priority_default = 10
+    priority_default = 1
 
     def fetch_stock_basic(self) -> list[StockBasic]:
         try:
@@ -515,11 +523,16 @@ class ADataProvider:
             raise DataProviderError("adata is not installed") from exc
 
         symbol = ts_code.split(".", 1)[0]
+        # adj=True: 前复权 (qfq) prices. AData does not expose adj_factor
+        # separately, so adj_factor stays None — backtest uses the qfq prices
+        # directly. Fixes the bug where ex-dividend days produced fake阴线
+        # and triggered spurious sell signals.
         frame = adata.stock.market.get_market(
             stock_code=symbol,
             k_type=1,
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
+            adj=True,
         )
         return [normalize_daily_kline(row, self.name, ts_code=ts_code) for row in dataframe_records(frame)]
 
@@ -538,7 +551,12 @@ class BaostockProvider:
         ProviderCapability.DAILY_KLINE,
         ProviderCapability.FUNDAMENTALS,
     })
-    priority_default = 20
+    priority_default = 2
+
+    def __init__(self) -> None:
+        # baostock module maintains global login state; serialize login/logout
+        # across threads (provider is used as singleton in data/service.py).
+        self._lock = threading.Lock()
 
     def _run(self, fn):
         try:
@@ -546,13 +564,14 @@ class BaostockProvider:
         except ImportError as exc:
             raise DataProviderError("baostock is not installed") from exc
 
-        login_result = bs.login()
-        if getattr(login_result, "error_code", "0") != "0":
-            raise DataProviderError(f"baostock login failed: {getattr(login_result, 'error_msg', '')}")
-        try:
-            return fn(bs)
-        finally:
-            bs.logout()
+        with self._lock:
+            login_result = bs.login()
+            if getattr(login_result, "error_code", "0") != "0":
+                raise DataProviderError(f"baostock login failed: {getattr(login_result, 'error_msg', '')}")
+            try:
+                return fn(bs)
+            finally:
+                bs.logout()
 
     def fetch_stock_basic(self) -> list[StockBasic]:
         def query(bs):
@@ -583,14 +602,18 @@ class BaostockProvider:
         def query(bs):
             code, suffix = ts_code.split(".", 1)
             bs_code = f"{suffix.lower()}.{code}"
-            fields = "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus"
+            # adjustflag="2" = 前复权 (qfq): returns adjusted prices directly.
+            # adj_factor included for audit/reference (e.g., converting between
+            # raw and adjusted prices for display). Backtest uses the qfq
+            # prices as-is — multiplying again would double-adjust.
+            fields = "date,code,open,high,low,close,preclose,volume,amount,turn,tradestatus,adj_factor"
             result = bs.query_history_k_data_plus(
                 bs_code,
                 fields,
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
                 frequency="d",
-                adjustflag="3",
+                adjustflag="2",
             )
             rows: list[dict[str, str]] = []
             while result.error_code == "0" and result.next():
@@ -604,7 +627,14 @@ class BaostockProvider:
             row["trade_date"] = row.get("date")
             row["pre_close"] = row.get("preclose")
             row["turnover_rate"] = row.get("turn")
-            normalized.append(normalize_daily_kline(row, self.name, ts_code=ts_code))
+            # adj_factor key already matches normalize_daily_kline's lookup
+            raw_tradestatus = row.get("tradestatus")
+            if raw_tradestatus is None or str(raw_tradestatus).strip() == "":
+                is_suspended: bool | None = None
+            else:
+                # baostock: tradestatus "1" = trading, "0" = suspended
+                is_suspended = str(raw_tradestatus).strip() != "1"
+            normalized.append(normalize_daily_kline(row, self.name, ts_code=ts_code, is_suspended=is_suspended))
         return normalized
 
     def fetch_stock_fundamentals(
@@ -649,7 +679,7 @@ class AkShareProvider:
         ProviderCapability.FUNDAMENTALS,
         ProviderCapability.REALTIME_QUOTE,
     })
-    priority_default = 30
+    priority_default = 3
 
     def fetch_stock_basic(self) -> list[StockBasic]:
         try:
@@ -694,12 +724,17 @@ class AkShareProvider:
             raise DataProviderError("akshare is not installed") from exc
 
         symbol = ts_code.split(".", 1)[0]
+        # adjust="qfq" = 前复权: returns adjusted prices directly. Fixes
+        # the bug where ex-dividend days produced fake阴线 and triggered
+        # spurious sell signals in backtest.
+        # stock_zh_a_hist doesn't expose adj_factor as a separate column,
+        # so adj_factor stays None — backtest uses the qfq prices as-is.
         frame = ak.stock_zh_a_hist(
             symbol=symbol,
             period="daily",
             start_date=_date_arg(start_date),
             end_date=_date_arg(end_date),
-            adjust="",
+            adjust="qfq",
         )
         return [normalize_daily_kline(row, self.name, ts_code=ts_code) for row in dataframe_records(frame)]
 

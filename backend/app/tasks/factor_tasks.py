@@ -5,12 +5,23 @@ import asyncio
 from datetime import date
 from typing import Any
 
+from app.data.providers import DataProviderError
 from app.factor.service import analyze_factor_icir, compute_factors_for_date
+from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
-from app.tasks.tracking import _run_tracked
+from app.tasks.tracking import _run_tracked, with_session
 
 
-@celery_app.task(name="app.tasks.factor_tasks.compute_daily_factors", bind=True)
+@celery_app.task(
+    name="app.tasks.factor_tasks.compute_daily_factors",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.factor_tasks.compute_daily_factors")
 def compute_daily_factors(
     self,
     trade_date: str | None = None,
@@ -28,8 +39,8 @@ def compute_daily_factors(
             "compute_daily_factors",
             self.request.id,
             {"trade_date": run_date, "scope_type": scope_type, "scope_value": scope_value},
-            lambda session: compute_factors_for_date(
-                session,
+            with_session(
+                compute_factors_for_date,
                 trade_date=run_date,
                 scope_type=scope_type,
                 scope_value=scope_value,
@@ -38,7 +49,15 @@ def compute_daily_factors(
     )
 
 
-@celery_app.task(name="app.tasks.factor_tasks.analyze_factor_icir", bind=True)
+@celery_app.task(
+    name="app.tasks.factor_tasks.analyze_factor_icir",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
 def analyze_factor_icir_task(
     self,
     factor_name: str,
@@ -58,8 +77,8 @@ def analyze_factor_icir_task(
                 "period_end": end,
                 "forward_days": forward_days,
             },
-            lambda session: analyze_factor_icir(
-                session,
+            with_session(
+                analyze_factor_icir,
                 factor_name=factor_name,
                 period_start=start,
                 period_end=end,

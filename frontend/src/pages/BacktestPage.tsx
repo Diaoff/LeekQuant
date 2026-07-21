@@ -1,6 +1,6 @@
 import React from 'react'
 import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2, GitCompare, ZoomIn, ZoomOut, RotateCcw, ShieldAlert } from 'lucide-react'
-import { createChart, createSeriesMarkers, ColorType, LineSeries, CandlestickSeries } from 'lightweight-charts'
+import { createChart, createSeriesMarkers, ColorType, LineSeries, CandlestickSeries, AreaSeries } from 'lightweight-charts'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { fetchJson, formatNumber, formatDateTime } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
@@ -99,6 +99,7 @@ interface BacktestResult {
   performance: Record<string, unknown> | null
   trade_records: unknown[] | null
   equity_curve: { date: string; total_asset: number; cash: number }[] | null
+  daily_returns: number[] | null
   kline_data: Record<string, KlineBar[]> | null
   stock_names: Record<string, string> | null
   error_message: string | null
@@ -147,6 +148,9 @@ export default function BacktestPage() {
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
   const [compareBacktests, setCompareBacktests] = React.useState<BacktestResult[]>([])
   const [compareLoading, setCompareLoading] = React.useState(false)
+  const [page, setPage] = React.useState(1)
+  const [totalCount, setTotalCount] = React.useState(0)
+  const pageSize = 20
 
   const isCompareMode = searchParams.get('ids') !== null
   const compareIds = React.useMemo(() => {
@@ -159,14 +163,20 @@ export default function BacktestPage() {
     setLoading(true)
     setError(null)
     try {
-      const data = await fetchJson<BacktestResult[]>('/api/backtests?limit=50')
-      setResults(data)
+      const data = await fetchJson<{ items: BacktestResult[]; total: number } | BacktestResult[]>(`/api/backtests?limit=${pageSize}&offset=${(page - 1) * pageSize}`)
+      if (Array.isArray(data)) {
+        setResults(data)
+        setTotalCount(data.length)
+      } else {
+        setResults(data.items)
+        setTotalCount(data.total)
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [page, pageSize])
 
   const loadCompareBacktests = React.useCallback(async (ids: number[]) => {
     setCompareLoading(true)
@@ -280,6 +290,28 @@ export default function BacktestPage() {
 
   React.useEffect(() => { void loadResults() }, [loadResults])
 
+  const runningIdsRef = React.useRef<number[]>([])
+  React.useEffect(() => {
+    const currentRunningIds = results.filter(r => r.status === 'running').map(r => r.id)
+    const prev = JSON.stringify(runningIdsRef.current)
+    const curr = JSON.stringify(currentRunningIds)
+    if (prev === curr && runningIdsRef.current.length > 0) return
+    runningIdsRef.current = currentRunningIds
+    if (currentRunningIds.length === 0) return
+    const interval = window.setInterval(async () => {
+      try {
+        const updated = await Promise.all(currentRunningIds.map(id => fetchJson<BacktestResult>(`/api/backtests/${id}/status`)))
+        setResults(prev => prev.map(r => {
+          const u = updated.find(u => u.id === r.id)
+          return u ? { ...r, status: u.status, total_return: u.total_return, error_message: u.error_message } : r
+        }))
+        const completed = updated.filter(u => u.status === 'success' || u.status === 'failed')
+        if (completed.length > 0) void loadResults()
+      } catch { /* ignore */ }
+    }, 3000)
+    return () => window.clearInterval(interval)
+  }, [results, loadResults])
+
   if (isCompareMode) {
     return (
       <>
@@ -385,6 +417,27 @@ export default function BacktestPage() {
               </tbody>
             </table>
           </div>
+          {totalCount > pageSize && (
+            <div className="flex items-center justify-between border-t border-line px-4 py-3">
+              <span className="text-xs text-muted">共 {totalCount} 条，第 {page}/{Math.ceil(totalCount / pageSize)} 页</span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPage(p => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                  className="rounded border border-line px-3 py-1 text-xs text-ink hover:bg-rowHover disabled:opacity-40"
+                >
+                  上一页
+                </button>
+                <button
+                  onClick={() => setPage(p => Math.min(Math.ceil(totalCount / pageSize), p + 1))}
+                  disabled={page >= Math.ceil(totalCount / pageSize)}
+                  className="rounded border border-line px-3 py-1 text-xs text-ink hover:bg-rowHover disabled:opacity-40"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          )}
         </section>
       )}
 
@@ -570,6 +623,55 @@ function BacktestDetailSkeleton() {
   )
 }
 
+function DrawdownChart({ dailyReturns, dates }: { dailyReturns: number[]; dates: string[] }) {
+  const ref = React.useRef<HTMLDivElement>(null)
+  const chartApiRef = React.useRef<ChartApi | null>(null)
+
+  React.useEffect(() => {
+    if (!ref.current || dailyReturns.length === 0) return
+    const container = ref.current
+    const isDark = document.documentElement.getAttribute('data-theme') === 'dark'
+    const chart = createChart(container, {
+      width: container.clientWidth,
+      height: 120,
+      layout: { background: { type: ColorType.Solid, color: isDark ? '#172033' : '#ffffff' }, textColor: isDark ? '#e8eaed' : '#334155' },
+      grid: { vertLines: { color: 'transparent' }, horzLines: { color: isDark ? '#2a3a52' : '#f1f5f9' } },
+      timeScale: { visible: false },
+      rightPriceScale: { borderColor: isDark ? '#2a3a52' : '#e2e8f0' },
+      handleScroll: false,
+      handleScale: false,
+    })
+    chartApiRef.current = chart
+
+    const ddValues: number[] = []
+    let peak = 1
+    let cum = 1
+    for (const r of dailyReturns) {
+      cum *= 1 + r
+      if (cum > peak) peak = cum
+      ddValues.push((cum - peak) / peak)
+    }
+    const series = chart.addSeries(AreaSeries, {
+      lineColor: '#ef4444',
+      topColor: 'rgba(239,68,68,0.3)',
+      bottomColor: 'rgba(239,68,68,0.0)',
+      lineWidth: 1,
+    })
+    const data = ddValues.map((v, i) => ({
+      time: (dates[i] ?? `${2020 + Math.floor(i / 252)}-01-01`) as string,
+      value: v * 100,
+    }))
+    series.setData(data as Array<{ time: string; value: number }>)
+    chart.timeScale().fitContent()
+
+    const handleResize = () => chart.applyOptions({ width: container.clientWidth })
+    window.addEventListener('resize', handleResize)
+    return () => { window.removeEventListener('resize', handleResize); chartApiRef.current = null; chart.remove() }
+  }, [dailyReturns, dates])
+
+  return <div ref={ref} className="h-[120px] w-full" />
+}
+
 function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: () => void }) {
   const perf = result.performance as Record<string, string | number> | null
   const trades = (result.trade_records ?? []) as TradeRecord[]
@@ -649,6 +751,16 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
         crosshairMarkerRadius: 4,
       })
       lineSeries.setData(equityCurve.map((d) => ({ time: d.date, value: d.total_asset })))
+      const bmCurve = (result.performance as Record<string, unknown>)?.benchmark as Record<string, unknown> | undefined
+      if (bmCurve?.benchmark_curve && Array.isArray(bmCurve.benchmark_curve) && bmCurve.benchmark_curve.length > 0) {
+        const bmSeries = chart.addSeries(LineSeries, {
+          color: '#94a3b8',
+          lineWidth: 1,
+          lineStyle: 2,
+          crosshairMarkerRadius: 3,
+        })
+        bmSeries.setData((bmCurve.benchmark_curve as Array<{ date: string; value: number }>).map(d => ({ time: d.date, value: d.value })))
+      }
       chart.timeScale().fitContent()
     }
 
@@ -742,6 +854,15 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
     { icon: <BarChart3 className="h-4 w-4 text-slate-600" />, label: '交易次数', value: formatNumber(result.trade_count ?? trades.length) },
     { icon: <ShieldAlert className="h-4 w-4 text-amber-600" />, label: '止损 / 止盈 / 移动 / 时间', value: riskLabel },
   ]
+  const extraMetrics = [
+    perf?.sortino_ratio != null ? { label: 'Sortino', value: formatNumber(perf.sortino_ratio, 2) } : null,
+    perf?.calmar_ratio != null ? { label: 'Calmar', value: formatNumber(perf.calmar_ratio, 2) } : null,
+    perf?.profit_factor != null ? { label: '盈亏比', value: formatNumber(perf.profit_factor, 2) } : null,
+    perf?.win_rate_pct != null ? { label: '胜率', value: `${formatNumber(perf.win_rate_pct, 1)}%` } : null,
+    perf?.avg_holding_days != null ? { label: '平均持仓', value: `${formatNumber(perf.avg_holding_days, 1)}天` } : null,
+    perf?.total_fees != null ? { label: '总费用', value: formatNumber(perf.total_fees, 2) } : null,
+    perf?.max_consecutive_losses != null ? { label: '最大连亏', value: `${perf.max_consecutive_losses}次` } : null,
+  ].filter(Boolean) as Array<{ label: string; value: string }>
 
   const totalPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0)
   const avgHoldingDays = (() => { const d = trades.filter(t => (t.holding_days ?? 0) > 0); return d.length > 0 ? d.reduce((s, t) => s + (t.holding_days || 0), 0) / d.length : 0 })()
@@ -757,6 +878,24 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
         <h2 className="text-base font-semibold text-ink">{result.strategy_name ?? '回测详情'}</h2>
         <span className="rounded-full border border-line bg-tableHead px-2.5 py-1 text-xs text-muted">{result.target_label ?? '全市场'}</span>
         <span className="text-sm text-muted">{result.start_date} ~ {result.end_date}</span>
+        <button
+          onClick={() => {
+            if (!trades.length) return
+            const headers = ['日期','股票','方向','价格','数量','金额','手续费','印花税','过户费','总费用','盈亏','持仓天数','退出原因']
+            const rows = trades.map(t => [t.trade_date, t.ts_code, t.direction, t.price, t.volume, t.amount, t.commission, t.stamp_tax, t.transfer_fee, t.total_fee, t.pnl, t.holding_days, t.exit_reason].join(','))
+            const csv = [headers.join(','), ...rows].join('\n')
+            const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
+            const url = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = url
+            a.download = `backtest_${result.id}_${result.strategy_name ?? 'result'}.csv`
+            a.click()
+            URL.revokeObjectURL(url)
+          }}
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-line px-3 py-1.5 text-xs font-medium text-ink hover:bg-rowHover"
+        >
+          导出 CSV
+        </button>
       </div>
 
       <div className="grid gap-4 p-4 md:grid-cols-3 xl:grid-cols-6">
@@ -767,6 +906,60 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
           </div>
         ))}
       </div>
+      {extraMetrics.length > 0 && (
+        <div className="grid gap-3 px-4 pb-2 md:grid-cols-4 xl:grid-cols-7">
+          {extraMetrics.map((m) => (
+            <div key={m.label} className="rounded border border-line bg-tableHead px-3 py-2 text-center">
+              <div className="text-[10px] uppercase tracking-wider text-muted">{m.label}</div>
+              <div className="mt-0.5 text-sm font-semibold tabular-nums text-ink">{m.value}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(perf?.benchmark) && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line bg-tableHead p-3">
+            <div className="text-xs font-semibold text-muted mb-2">基准对比 ({(perf.benchmark as Record<string, unknown>).benchmark_code ?? 'CSI300'})</div>
+            <div className="grid grid-cols-4 gap-3 text-center text-xs">
+              <div><div className="text-muted">Alpha</div><div className={`mt-1 font-mono text-sm ${Number((perf.benchmark as Record<string, unknown>).alpha ?? 0) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{formatNumber(Number((perf.benchmark as Record<string, unknown>).alpha ?? 0) * 100, 2)}%</div></div>
+              <div><div className="text-muted">基准收益</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).benchmark_annual_return ?? 0) * 100, 2)}%</div></div>
+              <div><div className="text-muted">跟踪误差</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).tracking_error ?? 0) * 100, 2)}%</div></div>
+              <div><div className="text-muted">信息比率</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber((perf.benchmark as Record<string, unknown>).information_ratio ?? 0, 2)}</div></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {perf?.monthly_returns && Object.keys(perf.monthly_returns as Record<string, unknown>).length > 0 && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line p-3">
+            <div className="text-xs font-semibold text-muted mb-2">月度收益</div>
+            <div className="flex flex-wrap gap-1">
+              {Object.entries(perf.monthly_returns as Record<string, number>).sort().map(([month, ret]) => (
+                <div key={month} className="flex flex-col items-center">
+                  <div className="text-[9px] text-muted">{month.slice(5)}</div>
+                  <div
+                    className={`w-10 h-6 flex items-center justify-center rounded text-[9px] font-medium ${ret >= 0 ? 'bg-red-100 text-red-700' : 'bg-emerald-100 text-emerald-700'}`}
+                    title={`${month}: ${(ret * 100).toFixed(2)}%`}
+                  >
+                    {(ret * 100).toFixed(1)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {result.daily_returns && result.daily_returns.length > 0 && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line p-3">
+            <div className="text-xs font-semibold text-muted mb-2">回撤曲线</div>
+            <DrawdownChart dailyReturns={result.daily_returns} dates={(result.equity_curve ?? []).map((e: { date: string }) => e.date)} />
+          </div>
+        </div>
+      )}
 
       {trades.length > 0 && (
         <>

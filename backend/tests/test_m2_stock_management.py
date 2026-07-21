@@ -12,6 +12,7 @@ from app.data.normalizers import normalize_stock_fundamental
 from app.data.repository import upsert_stock_fundamentals
 from app.data.stock_service import (
     StockFilters,
+    add_watchlist_items_batch,
     add_watchlist_item,
     create_watchlist_group,
     delete_watchlist_group,
@@ -329,6 +330,46 @@ async def test_watchlist_rejects_unknown_ts_code() -> None:
 
     with pytest.raises(ValueError, match="unknown ts_code"):
         await add_watchlist_item(session, ts_code="000001.SZ")
+
+
+@pytest.mark.asyncio
+async def test_watchlist_batch_creates_group_dedupes_and_keeps_unknown_errors() -> None:
+    session = CaptureSession(
+        [
+            FakeResult([{"ts_code": "000001.SZ"}, {"ts_code": "600000.SH"}]),
+            FakeResult(),
+            FakeResult([{"id": 10, "group_name": "强势股", "ts_code": "000001.SZ", "note": "signals", "sort_order": 0}]),
+            FakeResult([{"id": 11, "group_name": "强势股", "ts_code": "600000.SH", "note": "signals", "sort_order": 1}]),
+        ]
+    )
+
+    result = await add_watchlist_items_batch(
+        session,
+        ts_codes=["000001.SZ", "000001.sz", "600000.SH", "999999.SH"],
+        group_name=" 强势股 ",
+        note="signals",
+    )
+
+    assert result["group_name"] == "强势股"
+    assert result["added_count"] == 2
+    assert result["skipped_count"] == 1
+    assert [item["ts_code"] for item in result["items"]] == ["000001.SZ", "600000.SH"]
+    assert result["errors"] == [{"ts_code": "999999.SH", "error": "unknown ts_code"}]
+    assert session.commits == 1
+
+    sql = "\n".join(session.statements)
+    assert "INSERT INTO watchlist_groups" in sql
+    assert "ON CONFLICT (user_id, group_name, ts_code)" in sql
+    assert session.params[2]["group_name"] == "强势股"
+    assert session.params[2]["note"] == "signals"
+
+
+@pytest.mark.asyncio
+async def test_watchlist_batch_rejects_blank_group() -> None:
+    session = CaptureSession()
+
+    with pytest.raises(ValueError, match="group_name is required"):
+        await add_watchlist_items_batch(session, ts_codes=["000001.SZ"], group_name=" ")
 
 
 @pytest.mark.asyncio

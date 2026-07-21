@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -17,8 +18,9 @@ from app.preferences.service import get_full_kline_sync_concurrency
 from app.realtime.models import RealtimeTick
 from app.realtime.providers import EastMoneyRealtimeProvider
 from app.sim.service import SignalOrderRequest, _insert_signal, _money, generate_order_from_signal
+from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
-from app.tasks.tracking import _run_tracked
+from app.tasks.tracking import _run_tracked, with_session
 
 LOOKBACK_BARS = 60
 MAX_SIGNAL_CONCURRENCY = 4
@@ -29,6 +31,8 @@ A_SHARE_INTRADAY_WINDOWS = (
     (time(9, 25), time(11, 30)),
     (time(13, 0), time(15, 0)),
 )
+
+SIGNAL_EVENTS_CHANNEL = "signal:new"
 
 
 class StrategySignalExecutionError(RuntimeError):
@@ -148,6 +152,7 @@ async def _stock_codes(session) -> list[str]:
             WITH latest_fund AS (
                 SELECT DISTINCT ON (ts_code) ts_code, pe_ttm
                 FROM stock_fundamentals
+                WHERE report_date IS NOT NULL
                 ORDER BY ts_code, report_date DESC
             )
             SELECT sb.ts_code
@@ -635,6 +640,31 @@ async def generate_all_signals_for_date(session, *, trade_date: date | None = No
     return stats
 
 
+def _publish_signal_batch(stats: dict[str, Any]) -> None:
+    """Publish a signal batch summary to Redis for WebSocket fanout."""
+    import redis as redis_sync
+
+    from app.core.config import get_settings
+
+    try:
+        client = redis_sync.from_url(get_settings().redis_url, socket_timeout=2, socket_connect_timeout=2)
+        payload = {
+            "type": "signal_batch",
+            "trade_date": stats.get("trade_date"),
+            "strategy_count": stats.get("strategy_count", 0),
+            "signals_logged": stats.get("signals_logged", 0),
+            "orders_created": stats.get("orders_created", 0),
+            "error_count": stats.get("error_count", 0),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        client.publish(SIGNAL_EVENTS_CHANNEL, json.dumps(payload, ensure_ascii=False, default=str))
+        client.close()
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).debug("Failed to publish signal batch to Redis", exc_info=True)
+
+
 def _intraday_order_price(signal_type: str, tick: RealtimeTick) -> Decimal:
     if signal_type in BUY_SIGNAL_TYPES:
         return tick.ask1 or tick.price
@@ -807,20 +837,39 @@ async def generate_intraday_position_signals_for_date(
     return stats
 
 
-@celery_app.task(name="app.tasks.signal_tasks.generate_all_signals", bind=True)
+@celery_app.task(
+    name="app.tasks.signal_tasks.generate_all_signals",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.signal_tasks.generate_all_signals")
 def generate_all_signals(self, trade_date: str | None = None, concurrency: int | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else None
-    return asyncio.run(
+    result = asyncio.run(
         _run_tracked(
             "generate_all_signals",
             self.request.id,
             {"trade_date": run_date, "concurrency": concurrency},
-            lambda session: generate_all_signals_for_date(session, trade_date=run_date, concurrency=concurrency),
+            with_session(generate_all_signals_for_date, trade_date=run_date, concurrency=concurrency),
         )
     )
+    _publish_signal_batch(result)
+    return result
 
 
-@celery_app.task(name="app.tasks.signal_tasks.generate_intraday_position_signals", bind=True)
+@celery_app.task(
+    name="app.tasks.signal_tasks.generate_intraday_position_signals",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
 def generate_intraday_position_signals(self, trade_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else None
     return asyncio.run(
@@ -828,6 +877,6 @@ def generate_intraday_position_signals(self, trade_date: str | None = None) -> d
             "generate_intraday_position_signals",
             self.request.id,
             {"trade_date": run_date},
-            lambda session: generate_intraday_position_signals_for_date(session, trade_date=run_date),
+            with_session(generate_intraday_position_signals_for_date, trade_date=run_date),
         )
     )

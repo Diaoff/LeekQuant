@@ -196,12 +196,21 @@ def execute_strategy(
     ctx: Any,
     *,
     timeout_seconds: float | None = None,
-    allow_inline: bool = False,
+    allow_inline: bool | None = None,
 ) -> StrategyExecutionResult:
-    """Run strategy code in an isolated child process and return a structured result."""
+    """Run strategy code in an isolated child process and return a structured result.
+
+    `allow_inline`:
+        - True: execute in-process (no subprocess). Fast, but strategy bugs can crash the worker.
+        - False: spawn a child process with resource limits (default before P0-1).
+        - None (default): read from Settings.strategy_default_inline (production default True).
+    """
+    if allow_inline is None:
+        from app.core.config import get_settings
+        allow_inline = get_settings().strategy_default_inline
     options = _runtime_options(timeout_seconds)
     started = time.perf_counter()
-    if allow_inline:
+    if allow_inline or multiprocessing.current_process().daemon:
         return _execute_strategy_inline(source_code, ctx, options=options, started=started)
 
     proc_ctx = multiprocessing.get_context("spawn")
@@ -251,3 +260,28 @@ def execute_strategy(
         if process.is_alive():
             process.terminate()
             process.join(timeout=0.2)
+
+
+def execute_script_strategy(source_code: str, ctx: Any, *, allow_inline: bool = False) -> None:
+    """Execute an on_bar() callback for script strategy mode.
+
+    Runs in-process (assumes caller is already in a worker/daemon process).
+    """
+    import numpy as np
+    from app.libs import MyTT
+
+    namespace: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
+    namespace.update({name: getattr(MyTT, name) for name in dir(MyTT) if not name.startswith("_")})
+    namespace["np"] = np
+    namespace["numpy"] = np
+
+    try:
+        exec(compile(source_code, "<strategy>", "exec"), namespace)  # noqa: S102
+    except Exception as exc:
+        raise StrategyExecutionError(f"strategy compile error: {exc}") from exc
+
+    on_bar = namespace.get("on_bar")
+    if on_bar is None:
+        raise StrategyExecutionError("script strategy must define on_bar(ctx)")
+
+    on_bar(ctx)

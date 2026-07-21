@@ -160,12 +160,19 @@ def normalize_trade_calendar(row: Mapping[str, Any], source: str) -> TradeCalend
     )
 
 
-def normalize_daily_kline(row: Mapping[str, Any], source: str, ts_code: str | None = None) -> DailyKline:
+def normalize_daily_kline(
+    row: Mapping[str, Any],
+    source: str,
+    ts_code: str | None = None,
+    is_suspended: bool | None = None,
+) -> DailyKline:
     row_ts_code = ts_code or first_value(row, "ts_code", "code", "股票代码", "证券代码")
     normalized_code = normalize_ts_code(row_ts_code)
     trade_date = parse_date(first_value(row, "trade_date", "date", "日期", "交易日期"))
     if trade_date is None:
         raise ValueError("daily kline row is missing trade_date")
+
+    suspended_value = bool(is_suspended) if is_suspended is not None else False
 
     return DailyKline(
         ts_code=normalized_code,
@@ -179,6 +186,7 @@ def normalize_daily_kline(row: Mapping[str, Any], source: str, ts_code: str | No
         amount=parse_decimal(first_value(row, "amount", "成交额")),
         turnover_rate=parse_decimal(first_value(row, "turnover_rate", "换手率")),
         adj_factor=parse_decimal(first_value(row, "adj_factor", "复权因子")),
+        is_suspended=suspended_value,
         data_source=source,
         raw_payload=dict(row),
     )
@@ -190,6 +198,24 @@ def normalize_stock_fundamental(
     ts_code: str | None = None,
     report_date: date | None = None,
 ) -> StockFundamental:
+    """Normalize a stock fundamentals row.
+
+    Note on ``report_date``: in this codebase ``report_date`` represents the
+    *data snapshot date* (the date the fundamentals snapshot was taken),
+    NOT the formal earnings announcement date. Different providers fill it
+    differently:
+
+    * ``EastMoneyHttpProvider`` / ``TencentHttpProvider`` / ``AkShareProvider``
+      produce a single current snapshot and stamp it with the query
+      ``end_date``.
+    * ``BaostockProvider`` produces daily snapshots (each K-line row carries
+      PE/PB for that trading day) and stamps each row with its own K-line
+      date, preserving daily history.
+
+    Both semantics are valid "snapshot date"; the ``latest_fund`` CTE in
+    ``signal_tasks`` relies on ``ORDER BY report_date DESC`` to pick the
+    freshest snapshot, which works for both shapes.
+    """
     row_ts_code = ts_code or first_value(row, "ts_code", "code", "股票代码", "证券代码")
     normalized_code = normalize_ts_code(row_ts_code)
     parsed_report_date = report_date or parse_date(

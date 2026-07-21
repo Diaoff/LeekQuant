@@ -183,20 +183,20 @@ async def upsert_daily_kline(session: AsyncSession, records: list[DailyKline]) -
                 :data_source, CAST(:raw_payload AS JSONB), NOW()
             )
             ON CONFLICT (ts_code, trade_date) DO UPDATE SET
-                open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                pre_close = EXCLUDED.pre_close,
-                volume = EXCLUDED.volume,
-                amount = EXCLUDED.amount,
-                turnover_rate = EXCLUDED.turnover_rate,
+                open = COALESCE(EXCLUDED.open, daily_kline.open),
+                high = COALESCE(EXCLUDED.high, daily_kline.high),
+                low = COALESCE(EXCLUDED.low, daily_kline.low),
+                close = COALESCE(EXCLUDED.close, daily_kline.close),
+                pre_close = COALESCE(EXCLUDED.pre_close, daily_kline.pre_close),
+                volume = COALESCE(EXCLUDED.volume, daily_kline.volume),
+                amount = COALESCE(EXCLUDED.amount, daily_kline.amount),
+                turnover_rate = COALESCE(EXCLUDED.turnover_rate, daily_kline.turnover_rate),
                 adj_factor = COALESCE(EXCLUDED.adj_factor, daily_kline.adj_factor),
-                is_suspended = EXCLUDED.is_suspended,
-                is_limit_up = EXCLUDED.is_limit_up,
-                is_limit_down = EXCLUDED.is_limit_down,
-                data_source = EXCLUDED.data_source,
-                raw_payload = EXCLUDED.raw_payload,
+                is_suspended = COALESCE(EXCLUDED.is_suspended, daily_kline.is_suspended),
+                is_limit_up = COALESCE(EXCLUDED.is_limit_up, daily_kline.is_limit_up),
+                is_limit_down = COALESCE(EXCLUDED.is_limit_down, daily_kline.is_limit_down),
+                data_source = COALESCE(EXCLUDED.data_source, daily_kline.data_source),
+                raw_payload = COALESCE(EXCLUDED.raw_payload, daily_kline.raw_payload),
                 updated_at = NOW()
             """
         ),

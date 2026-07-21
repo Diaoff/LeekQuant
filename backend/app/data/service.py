@@ -252,7 +252,15 @@ async def sync_stock_basic(
     providers: list[DataProvider] | None = None,
 ) -> dict[str, Any]:
     provider_list = providers or stock_basic_providers()
-    source, records = fetch_with_fallback(provider_list, "fetch_stock_basic", proxy_url=get_data_proxy_url())
+    source, records = await asyncio.wait_for(
+        asyncio.to_thread(
+            fetch_with_fallback,
+            provider_list,
+            "fetch_stock_basic",
+            proxy_url=get_data_proxy_url(),
+        ),
+        timeout=120,
+    )
     valid_records = []
     invalid_records = []
     excluded_records = []
@@ -311,12 +319,16 @@ async def sync_trade_calendar(
     end_date: date,
     providers: list[DataProvider] | None = None,
 ) -> dict[str, Any]:
-    source, records = fetch_with_fallback(
-        providers or default_providers(),
-        "fetch_trade_calendar",
-        start_date,
-        end_date,
-        proxy_url=get_data_proxy_url(),
+    source, records = await asyncio.wait_for(
+        asyncio.to_thread(
+            fetch_with_fallback,
+            providers or default_providers(),
+            "fetch_trade_calendar",
+            start_date,
+            end_date,
+            proxy_url=get_data_proxy_url(),
+        ),
+        timeout=120,
     )
     for record in records:
         validate_trade_calendar(record)
@@ -376,14 +388,17 @@ async def sync_kline(
         if commit_each:
             async with per_stock_session_factory() as wk_session:
                 try:
-                    source, records = await asyncio.to_thread(
-                        fetch_with_fallback,
-                        providers or default_providers(),
-                        "fetch_daily_kline",
-                        ts_code,
-                        start_date,
-                        end_date,
-                        proxy_url=get_data_proxy_url(),
+                    source, records = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            fetch_with_fallback,
+                            providers or default_providers(),
+                            "fetch_daily_kline",
+                            ts_code,
+                            start_date,
+                            end_date,
+                            proxy_url=get_data_proxy_url(),
+                        ),
+                        timeout=120,
                     )
                     for record in records:
                         validate_daily_kline(record)
@@ -412,14 +427,17 @@ async def sync_kline(
                     return {"ts_code": ts_code, "error": message}
 
         try:
-            source, records = await asyncio.to_thread(
-                fetch_with_fallback,
-                provider_list,
-                "fetch_daily_kline",
-                ts_code,
-                start_date,
-                end_date,
-                proxy_url=get_data_proxy_url(),
+            source, records = await asyncio.wait_for(
+                asyncio.to_thread(
+                    fetch_with_fallback,
+                    provider_list,
+                    "fetch_daily_kline",
+                    ts_code,
+                    start_date,
+                    end_date,
+                    proxy_url=get_data_proxy_url(),
+                ),
+                timeout=120,
             )
             for record in records:
                 validate_daily_kline(record)

@@ -7,11 +7,13 @@ from decimal import Decimal, ROUND_HALF_UP
 from math import isfinite
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.factor.definitions import BUILTIN_FACTORS
+from app.factor.expression import FactorContext, evaluate_expression, validate_expression as _validate_expression
 from app.libs import MyTT
 
 FACTOR_QUANT = Decimal("0.00000001")
@@ -143,6 +145,148 @@ async def list_factor_definitions(session: AsyncSession, *, enabled_only: bool =
     return serialize_rows(list(result.mappings().all()))
 
 
+def validate_factor_expression(expr: str) -> tuple[bool, str | None]:
+    return _validate_expression(expr)
+
+
+async def create_factor_definition(
+    session: AsyncSession,
+    *,
+    name: str,
+    display_name: str,
+    category: str,
+    expression: str,
+    direction: int,
+    default_weight: float,
+    description: str,
+) -> dict[str, Any]:
+    existing = await session.execute(
+        text("SELECT name FROM factor_definitions WHERE name = :name"),
+        {"name": name},
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise ValueError(f"factor '{name}' already exists")
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO factor_definitions (
+                name, display_name, category, expression, direction,
+                default_weight, enabled, description
+            ) VALUES (
+                :name, :display_name, :category, :expression, :direction,
+                :default_weight, TRUE, :description
+            )
+            """
+        ),
+        {
+            "name": name,
+            "display_name": display_name,
+            "category": category,
+            "expression": expression,
+            "direction": direction,
+            "default_weight": default_weight,
+            "description": description,
+        },
+    )
+    await session.commit()
+    result = await session.execute(
+        text(
+            """
+            SELECT name, display_name, category, expression, direction,
+                   default_weight, enabled, description, created_at, updated_at
+            FROM factor_definitions WHERE name = :name
+            """
+        ),
+        {"name": name},
+    )
+    return dict(result.mappings().one())
+
+
+async def update_factor_definition(
+    session: AsyncSession,
+    *,
+    name: str,
+    display_name: str | None = None,
+    category: str | None = None,
+    expression: str | None = None,
+    direction: int | None = None,
+    default_weight: float | None = None,
+    enabled: bool | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    existing = await session.execute(
+        text("SELECT name FROM factor_definitions WHERE name = :name"),
+        {"name": name},
+    )
+    if existing.scalar_one_or_none() is None:
+        raise KeyError(f"factor '{name}' not found")
+
+    sets: list[str] = []
+    params: dict[str, Any] = {"name": name}
+    if display_name is not None:
+        sets.append("display_name = :display_name")
+        params["display_name"] = display_name
+    if category is not None:
+        sets.append("category = :category")
+        params["category"] = category
+    if expression is not None:
+        sets.append("expression = :expression")
+        params["expression"] = expression
+    if direction is not None:
+        sets.append("direction = :direction")
+        params["direction"] = direction
+    if default_weight is not None:
+        sets.append("default_weight = :default_weight")
+        params["default_weight"] = default_weight
+    if enabled is not None:
+        sets.append("enabled = :enabled")
+        params["enabled"] = enabled
+    if description is not None:
+        sets.append("description = :description")
+        params["description"] = description
+
+    if not sets:
+        raise ValueError("no fields to update")
+
+    sets.append("updated_at = NOW()")
+    await session.execute(
+        text(f"UPDATE factor_definitions SET {', '.join(sets)} WHERE name = :name"),
+        params,
+    )
+    await session.commit()
+
+    result = await session.execute(
+        text(
+            """
+            SELECT name, display_name, category, expression, direction,
+                   default_weight, enabled, description, created_at, updated_at
+            FROM factor_definitions WHERE name = :name
+            """
+        ),
+        {"name": name},
+    )
+    return dict(result.mappings().one())
+
+
+async def delete_factor_definition(session: AsyncSession, *, name: str) -> None:
+    if name in BUILTIN_FACTOR_NAMES:
+        raise ValueError(f"cannot delete builtin factor '{name}'")
+
+    existing = await session.execute(
+        text("SELECT name FROM factor_definitions WHERE name = :name"),
+        {"name": name},
+    )
+    if existing.scalar_one_or_none() is None:
+        raise KeyError(f"factor '{name}' not found")
+
+    await session.execute(
+        text("DELETE FROM factor_definitions WHERE name = :name"),
+        {"name": name},
+    )
+    await session.commit()
+
+
 async def _enabled_factor_definitions(session: AsyncSession) -> list[dict[str, Any]]:
     result = await session.execute(
         text(
@@ -232,17 +376,71 @@ async def _recent_kline_rows(session: AsyncSession, trade_date: date, lookback: 
 def _compute_raw_factor_values(
     fundamentals: dict[str, dict[str, Any]],
     kline_rows: list[dict[str, Any]],
+    definitions: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Decimal]]:
+    """Compute raw factor values for all stocks using expression-driven evaluation.
+
+    When definitions are provided, evaluates each factor's expression string.
+    Falls back to hardcoded builtin computation for backward compatibility
+    when no definitions are passed.
+    """
     raw: dict[str, dict[str, Decimal]] = defaultdict(dict)
+
+    by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in kline_rows:
+        by_code[row["ts_code"]].append(row)
+
+    ts_codes = sorted(set(by_code.keys()) | set(fundamentals.keys()))
+
+    if definitions is not None:
+        for defn in definitions:
+            factor_name = defn["name"]
+            expression = defn.get("expression", "")
+            if not expression:
+                continue
+            for ts_code in ts_codes:
+                rows = by_code.get(ts_code, [])
+                if not rows:
+                    continue
+                closes = np.array([_to_float(r.get("close")) or np.nan for r in rows], dtype=np.float64)
+                opens = np.array([_to_float(r.get("open")) or np.nan for r in rows], dtype=np.float64)
+                highs = np.array([_to_float(r.get("high")) or np.nan for r in rows], dtype=np.float64)
+                lows = np.array([_to_float(r.get("low")) or np.nan for r in rows], dtype=np.float64)
+                volumes = np.array([float(r.get("volume") or 0) for r in rows], dtype=np.float64)
+                amounts = np.array([_to_float(r.get("amount")) or 0.0 for r in rows], dtype=np.float64)
+
+                fund = fundamentals.get(ts_code, {})
+                ctx = FactorContext(
+                    kline={
+                        "$close": closes,
+                        "$open": opens,
+                        "$high": highs,
+                        "$low": lows,
+                        "$volume": volumes,
+                        "$amount": amounts,
+                    },
+                    fundamentals={
+                        "pe_ttm": _to_float(fund.get("pe_ttm")),
+                        "pb": _to_float(fund.get("pb")),
+                        "roe": _to_float(fund.get("roe")),
+                        "revenue_growth": _to_float(fund.get("revenue_growth")),
+                    },
+                    length=len(rows),
+                )
+                try:
+                    result = evaluate_expression(expression, ctx)
+                    last_val = float(result[-1]) if len(result) > 0 else np.nan
+                    if np.isfinite(last_val):
+                        raw[factor_name][ts_code] = _to_decimal(last_val)
+                except Exception:
+                    continue
+        return raw
+
     for ts_code, row in fundamentals.items():
         for factor_name in ("pe_ttm", "pb", "roe", "revenue_growth"):
             value = _to_decimal(row.get(factor_name))
             if value is not None:
                 raw[factor_name][ts_code] = value
-
-    by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in kline_rows:
-        by_code[row["ts_code"]].append(row)
 
     for ts_code, rows in by_code.items():
         closes = [_to_float(row.get("close")) for row in rows]
@@ -469,7 +667,7 @@ async def compute_factors_for_date(
     await _delete_factor_values_for_date(
         session,
         trade_date=run_date,
-        factor_names=[name for name in definition_by_name if name in BUILTIN_FACTOR_NAMES],
+        factor_names=[name for name in definition_by_name],
     )
     await _delete_scoring_rank_for_scope(
         session,
@@ -479,7 +677,7 @@ async def compute_factors_for_date(
     )
     fundamentals = await _latest_fundamentals(session, run_date)
     kline_rows = await _recent_kline_rows(session, run_date)
-    raw_values = _compute_raw_factor_values(fundamentals, kline_rows)
+    raw_values = _compute_raw_factor_values(fundamentals, kline_rows, definitions)
 
     factor_rows: list[dict[str, Any]] = []
     factor_counts: dict[str, int] = {}

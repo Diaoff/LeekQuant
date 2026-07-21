@@ -65,6 +65,27 @@ class TradeRecord:
     exit_reason: str = ""       # 卖出原因: "策略信号" / "止损" / "止盈" / "移动止盈" / "时间止损"
 
 
+@dataclass(slots=True)
+class _LotEntry:
+    ts_code: str
+    shares: int
+    cost: Decimal
+    entry_date: date
+
+
+@dataclass(slots=True)
+class _ClosedLot:
+    ts_code: str
+    shares: int
+    entry_price: Decimal
+    entry_date: date
+    exit_price: Decimal
+    exit_date: date
+    pnl: Decimal
+    holding_days: int
+    exit_reason: str
+
+
 class SellDirection(str):
     """Detailed sell label that remains compatible with legacy '卖出' checks."""
 
@@ -92,9 +113,11 @@ class BacktestConfig:
     trailing_stop_pct: float = 0.0
     trailing_activation_pct: float = 0.0
     time_stop_days: int = 0
+    slippage_pct: float = 0.001
 
     execution_timeframe: str = "1D"
     signal_timeframe: str = "1D"
+    strategy_mode: str = "signal"
     factor_scores_by_date: dict[date, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
 
@@ -109,6 +132,7 @@ class _SignalCandidate:
     buy_priority_source: str = "default"
     factor_score: Decimal | None = None
     factor_rank: int | None = None
+    fill_bar: KBar | None = None  # next day's bar for fill price (None = fallback)
 
 
 class BacktestContext:
@@ -156,6 +180,49 @@ class BacktestContext:
         self._current_position = value
 
 
+class ScriptContext:
+    """Context for on_bar() callback in script strategy mode."""
+
+    def __init__(self, runner: "BacktestRunner", ts_code: str, bar: KBar, total_asset: Decimal):
+        self._runner = runner
+        self._ts_code = ts_code
+        self._bar = bar
+        self._total_asset = total_asset
+        self._action_taken = False
+
+        self.ts_code = ts_code
+        self.date = bar.trade_date
+        self.open = float(bar.open)
+        self.high = float(bar.high)
+        self.low = float(bar.low)
+        self.close = float(bar.close)
+        self.volume = bar.volume
+
+        pos = runner.positions.get(ts_code)
+        self.position = float(pos.shares * bar.close / total_asset) if pos and total_asset > 0 else 0.0
+        self.shares = pos.shares if pos else 0
+        self.cash = float(runner.cash)
+        self.portfolio_value = float(total_asset)
+
+    def buy(self, pct: float = 1.0) -> None:
+        if self._action_taken:
+            return
+        self._action_taken = True
+        self._runner._script_pending_action = ("BUY", self._ts_code, pct, self._bar, "策略信号: buy")
+
+    def sell(self, pct: float = 0.0) -> None:
+        if self._action_taken:
+            return
+        self._action_taken = True
+        if pct <= 0 or self.shares <= 0:
+            self._runner._script_pending_action = ("SELL_ALL", self._ts_code, 0.0, self._bar, "策略信号: sell")
+        else:
+            self._runner._script_pending_action = ("SELL_PARTIAL", self._ts_code, pct, self._bar, "策略信号: sell")
+
+    def hold(self) -> None:
+        self._action_taken = True
+
+
 class BacktestRunner:
     """Day-by-day backtest engine using closing-price matching."""
 
@@ -172,6 +239,9 @@ class BacktestRunner:
         self._entry_prices: dict[str, Decimal] = {}
         self._highest_since_entry: dict[str, Decimal] = {}
         self._lowest_since_entry: dict[str, Decimal] = {}
+        self._open_lots: dict[str, list[_LotEntry]] = {}
+        self._closed_lots: list[_ClosedLot] = []
+        self._script_pending_action: tuple[str, str, float, KBar, str] | None = None
 
     @staticmethod
     def _infer_candle_path(open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> list[Decimal]:
@@ -214,7 +284,13 @@ class BacktestRunner:
             raise ValueError("no trading dates found in the specified range")
 
         lookback = 60
-        for td in trading_dates:
+        for i, td in enumerate(trading_dates):
+            # Next trading day's date — used to look up the fill bar so that
+            # orders generated "as of td" (using data through td-1) execute
+            # at td+1's open. This eliminates the lookahead bias where the
+            # strategy saw td's close and filled at td's intraday prices.
+            next_td = trading_dates[i + 1] if i + 1 < len(trading_dates) else None
+
             total_asset = self._calc_total_asset(all_klines, td)
             self.equity_curve.append({
                 "date": td.isoformat(),
@@ -225,13 +301,35 @@ class BacktestRunner:
             candidates: list[_SignalCandidate] = []
             for ts_code in self.config.stock_pool:
                 klines = all_klines.get(ts_code, [])
-                window = [k for k in klines if k.trade_date <= td][-lookback:]
-                if not window or window[-1].trade_date != td:
+                # bars_through_td: all bars up to and including td.
+                # bar = td's bar (used for A-share rule checks: suspension,
+                # limit_up, limit_down on the signal day).
+                bars_through_td = [k for k in klines if k.trade_date <= td]
+                if not bars_through_td or bars_through_td[-1].trade_date != td:
                     continue
 
-                bar = window[-1]
+                bar = bars_through_td[-1]
                 if bar.is_suspended:
                     continue
+
+                # Strategy window EXCLUDES td's bar to avoid lookahead bias.
+                # The strategy generates signals "as of start of td" using
+                # only data through td-1. Previously the strategy could see
+                # td's close (future information) and then "fill" at td's
+                # intraday prices — a half-day to full-day lookahead.
+                window = bars_through_td[-lookback:-1]
+                if not window:
+                    # Not enough history to generate a signal — skip this
+                    # stock on this day. (Need at least 1 bar before td.)
+                    continue
+
+                # Look up the fill bar (td+1's bar) for this stock. If td+1
+                # is not a trading day for this stock (e.g., suspended), or
+                # td is the last trading day, fill_bar is None and the
+                # fallback fill price (bar.close) is used.
+                fill_bar: KBar | None = None
+                if next_td is not None:
+                    fill_bar = next((k for k in klines if k.trade_date == next_td), None)
 
                 price_path = self._infer_candle_path(bar.open, bar.high, bar.low, bar.close)
 
@@ -250,7 +348,48 @@ class BacktestRunner:
                         action=exec_action,
                         signal=None,
                         exit_reason=exit_reason,
+                        fill_bar=fill_bar,
                     ))
+                    continue
+
+                if self.config.strategy_mode == "script":
+                    self._script_pending_action = None
+                    ctx = ScriptContext(self, ts_code, bar, total_asset)
+                    try:
+                        from app.backtest.strategy_runtime import execute_script_strategy
+                        execute_script_strategy(self.config.source_code, ctx)
+                    except Exception as exc:
+                        self.strategy_errors.append({
+                            "strategy_id": self.config.strategy_id,
+                            "ts_code": ts_code,
+                            "trade_date": td.isoformat(),
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        })
+                        continue
+                    if self._script_pending_action:
+                        action_type, code, pct, bar_ref, reason = self._script_pending_action
+                        if action_type == "BUY":
+                            exec_action = SignalOutput(action="BUY", target_position=min(pct, 1.0))
+                        elif action_type == "SELL_ALL":
+                            exec_action = SignalOutput(action="SELL_ALL", target_position=0.0)
+                        else:
+                            exec_action = SignalOutput(action="SELL_PARTIAL", target_position=pct)
+                        signal_data = {"signal_type": reason, "current_position": ctx.position, "target_position": pct}
+                        reason_text, blocked = self._apply_rules(exec_action, ts_code, bar, self.positions.get(ts_code), td)
+                        if blocked:
+                            self.signals.append({
+                                "ts_code": ts_code,
+                                "trade_date": td.isoformat(),
+                                "signal_type": reason,
+                                "action": "BLOCKED",
+                                "reason": reason_text,
+                            })
+                            continue
+                        candidates.append(_SignalCandidate(
+                            ts_code=ts_code, bar=bar, action=exec_action, signal=signal_data, exit_reason=None,
+                            fill_bar=fill_bar,
+                        ))
                     continue
 
                 ctx = BacktestContext(window, self.positions, total_asset)
@@ -286,7 +425,7 @@ class BacktestRunner:
                     })
                     continue
 
-                candidates.append(self._build_signal_candidate(ts_code, bar, action_info, signal, td))
+                candidates.append(self._build_signal_candidate(ts_code, bar, action_info, signal, td, fill_bar))
 
             for candidate in sorted(candidates, key=self._candidate_sort_key):
                 match_blocked_reason = self._execute_action(
@@ -296,6 +435,7 @@ class BacktestRunner:
                     total_asset,
                     candidate.signal,
                     exit_reason=candidate.exit_reason,
+                    fill_bar=candidate.fill_bar,
                 )
                 signal_record = self._candidate_signal_record(candidate)
                 if match_blocked_reason:
@@ -312,6 +452,7 @@ class BacktestRunner:
         action: SignalOutput,
         signal: dict[str, Any],
         td: date,
+        fill_bar: KBar | None = None,
     ) -> _SignalCandidate:
         priority_score = Decimal("0")
         priority_source = "default"
@@ -342,6 +483,7 @@ class BacktestRunner:
             buy_priority_source=priority_source,
             factor_score=factor_score,
             factor_rank=factor_rank,
+            fill_bar=fill_bar,
         )
 
     @staticmethod
@@ -397,6 +539,35 @@ class BacktestRunner:
                     dates.add(k.trade_date)
         return sorted(dates)
 
+    @staticmethod
+    def _adjust_price(price: Decimal, adj_factor: Decimal | None, mode: str) -> Decimal:
+        """Apply adjustment factor to price based on mode.
+
+        Providers fetch前复权 (qfq) prices by default (see BACKTEST_ADJUST_MODE
+        in app.core.config). When prices are already qfq-adjusted, adj_factor
+        is stored for audit/reference only — multiplying again would
+        double-adjust. The adj_factor field is plumbed through DB → KBar
+        for future use cases (e.g., converting between raw/adjusted prices
+        for display).
+
+        Args:
+            price: Raw or qfq price from KBar.
+            adj_factor: Cumulative adjustment factor (latest=1), or None
+                when provider does not expose it (AData/EastMoney).
+            mode: One of "qfq" (default, prices already adjusted),
+                "hfq" (后复权, future use), or "none" (no adjustment).
+
+        Returns:
+            Adjusted price. In qfq mode, returns price unchanged (already
+            adjusted by provider).
+        """
+        if mode == "none":
+            return price
+        # In qfq mode, providers already return前复权 prices; adj_factor is
+        # stored for audit only. Returning price unchanged avoids the
+        # double-adjustment bug (qfq_price * adj_factor would be wrong).
+        return price
+
     def _calc_total_asset(self, all_klines: dict[str, list[KBar]], td: date) -> Decimal:
         position_value = Decimal("0")
         for ts_code, pos in self.positions.items():
@@ -404,13 +575,28 @@ class BacktestRunner:
                 continue
             klines = all_klines.get(ts_code, [])
             price = None
+            adj_factor: Decimal | None = None
             for k in reversed(klines):
                 if k.trade_date <= td and k.close:
                     price = k.close
+                    adj_factor = k.adj_factor
                     break
             if price:
-                position_value += price * pos.shares
+                adjusted = self._adjust_price(price, adj_factor, self._adjust_mode())
+                position_value += adjusted * pos.shares
         return self.cash + position_value
+
+    def _adjust_mode(self) -> str:
+        """Read BACKTEST_ADJUST_MODE from settings, defaulting to 'qfq'.
+
+        Imported lazily to avoid creating asyncio primitives at module import
+        (mirrors the ws_producer pattern).
+        """
+        try:
+            from app.core.config import get_settings
+            return get_settings().backtest_adjust_mode
+        except Exception:
+            return "qfq"
 
     def _exec_strategy(self, ctx: BacktestContext, total_asset: Decimal) -> StrategyExecutionResult:
         try:
@@ -447,6 +633,17 @@ class BacktestRunner:
             pos = self.positions.get(ts_code)
             if not pos or pos.shares <= 0:
                 return "无持仓", True
+            # T+1 check at the lot level: a lot is sellable only if it was
+            # purchased on a strictly earlier trading day than td.
+            # Using _open_lots (FIFO list maintained on buy/sell) instead of
+            # the single _entry_dates (which gets overwritten on each buy and
+            # would incorrectly block partial sells after an add-on buy).
+            open_lots = self._open_lots.get(ts_code, [])
+            sellable_shares = sum(
+                lot.shares for lot in open_lots if lot.entry_date < td
+            )
+            if sellable_shares <= 0:
+                return "T+1 当日买入不可卖出", True
         return "", False
 
     def _execute_action(
@@ -457,17 +654,50 @@ class BacktestRunner:
         total_asset: Decimal,
         signal: dict | None = None,
         exit_reason: str | None = None,
+        fill_bar: KBar | None = None,
     ) -> str | None:
-        price_path = self._infer_candle_path(bar.open, bar.high, bar.low, bar.close)
+        # Apply adjustment factor to bar prices. In qfq mode (default), this
+        # is a no-op since providers already return前复权 prices; adj_factor
+        # is consulted for audit/future extensibility.
+        adjust_mode = self._adjust_mode()
+        adj_open = self._adjust_price(bar.open, bar.adj_factor, adjust_mode)
+        adj_high = self._adjust_price(bar.high, bar.adj_factor, adjust_mode)
+        adj_low = self._adjust_price(bar.low, bar.adj_factor, adjust_mode)
+        adj_close = self._adjust_price(bar.close, bar.adj_factor, adjust_mode)
 
-        # 选择买入时更优的价格（阳线取low，阴线取open）
-        buy_price = price_path[1] if bar.close >= bar.open else price_path[0]
-        sell_price = price_path[2] if bar.close >= bar.open else price_path[1]
+        # Determine fill price based on BACKTEST_FILL_PRICE_MODE.
+        # - "next_open" (default): fill at next day's open (fill_bar.open).
+        #   Eliminates lookahead bias — strategy decides using data through
+        #   td-1 and fills at td+1's open. Falls back to bar.close when
+        #   fill_bar is unavailable (e.g., last trading day).
+        # - "current_intraday": legacy behavior — simulate intraday fill on
+        #   signal day using candle-path inference. Retained for backward
+        #   compat with tests that don't pass fill_bar.
+        # - "current_close": fill at signal day's close.
+        fill_mode = self._fill_price_mode()
+        slippage = Decimal(str(self.config.slippage_pct))
+
+        if fill_mode == "next_open" and fill_bar is not None and fill_bar.open is not None:
+            fill_price = self._adjust_price(fill_bar.open, fill_bar.adj_factor, adjust_mode)
+            trade_date = fill_bar.trade_date
+        elif fill_mode == "current_close":
+            fill_price = adj_close
+            trade_date = bar.trade_date
+        else:
+            # Legacy "current_intraday" path or fill_bar unavailable.
+            price_path = self._infer_candle_path(adj_open, adj_high, adj_low, adj_close)
+            if action.action == "BUY":
+                fill_price = price_path[1] if adj_close >= adj_open else price_path[0]
+            elif action.action in ("SELL_ALL", "SELL_PARTIAL"):
+                fill_price = price_path[2] if adj_close >= adj_open else price_path[1]
+            else:
+                fill_price = adj_close
+            trade_date = bar.trade_date
 
         if action.action == "BUY":
             if bar.is_limit_up:
                 return "涨停不可买入"
-            price = buy_price
+            price = fill_price * (1 + slippage)
             target_value = total_asset * Decimal(str(action.target_position))
             current_value = Decimal("0")
             pos = self.positions.get(ts_code)
@@ -508,15 +738,23 @@ class BacktestRunner:
             balance_after = self._book_asset()
             pos_ratio_after = self._position_ratio(balance_after) if balance_after > 0 else 0
 
-            self._entry_dates[ts_code] = bar.trade_date
+            self._entry_dates[ts_code] = trade_date
             self._entry_prices[ts_code] = price
             self._highest_since_entry[ts_code] = bar.high
             self._lowest_since_entry[ts_code] = bar.low
+            if ts_code not in self._open_lots:
+                self._open_lots[ts_code] = []
+            self._open_lots[ts_code].append(_LotEntry(
+                ts_code=ts_code,
+                shares=volume,
+                cost=price,
+                entry_date=trade_date,
+            ))
             sig_reason = (signal.get("reason", "") if signal else "") or "信号触发: 买入"
 
             self.trades.append(TradeRecord(
                 ts_code=ts_code,
-                trade_date=bar.trade_date,
+                trade_date=trade_date,
                 direction="买入",
                 price=price,
                 volume=volume,
@@ -539,7 +777,7 @@ class BacktestRunner:
         elif action.action in ("SELL_ALL", "SELL_PARTIAL"):
             if bar.is_limit_down:
                 return "跌停不可卖出"
-            price = sell_price
+            price = fill_price * (1 - slippage)
             pos = self.positions.get(ts_code)
             if not pos or pos.shares <= 0:
                 return None
@@ -572,14 +810,37 @@ class BacktestRunner:
             balance_after = self._book_asset()
             pos_ratio_after = self._position_ratio(balance_after) if balance_after > 0 else 0
 
-            entry_date = self._entry_dates.get(ts_code, bar.trade_date)
-            holding_days = (bar.trade_date - entry_date).days
+            entry_date = self._entry_dates.get(ts_code, trade_date)
+            holding_days = (trade_date - entry_date).days
+
+            remaining_sell = volume
+            lots = self._open_lots.get(ts_code, [])
+            while remaining_sell > 0 and lots:
+                lot = lots[0]
+                lot_shares = min(remaining_sell, lot.shares)
+                lot_pnl = (price - lot.cost) * lot_shares - cost.total_fee * Decimal(str(lot_shares / volume)) if volume > 0 else Decimal("0")
+                self._closed_lots.append(_ClosedLot(
+                    ts_code=ts_code,
+                    shares=lot_shares,
+                    entry_price=lot.cost,
+                    entry_date=lot.entry_date,
+                    exit_price=price,
+                    exit_date=trade_date,
+                    pnl=lot_pnl,
+                    holding_days=(trade_date - lot.entry_date).days,
+                    exit_reason=exit_reason or "策略信号",
+                ))
+                lot.shares -= lot_shares
+                remaining_sell -= lot_shares
+                if lot.shares <= 0:
+                    lots.pop(0)
 
             if pos.shares <= 0:
                 self._entry_dates.pop(ts_code, None)
                 self._entry_prices.pop(ts_code, None)
                 self._highest_since_entry.pop(ts_code, None)
                 self._lowest_since_entry.pop(ts_code, None)
+                self._open_lots.pop(ts_code, None)
 
             reason = exit_reason or "策略信号"
             sig_type = signal.get("signal_type", "卖出") if signal else reason
@@ -590,7 +851,7 @@ class BacktestRunner:
             direction = "卖出"
             self.trades.append(TradeRecord(
                 ts_code=ts_code,
-                trade_date=bar.trade_date,
+                trade_date=trade_date,
                 direction=direction,
                 price=price,
                 volume=volume,
@@ -615,16 +876,38 @@ class BacktestRunner:
 
         return None
 
+    def _fill_price_mode(self) -> str:
+        """Read BACKTEST_FILL_PRICE_MODE from settings, defaulting to 'next_open'.
+
+        Imported lazily to avoid creating asyncio primitives at module import
+        (mirrors the ws_producer pattern).
+        """
+        try:
+            from app.core.config import get_settings
+            return get_settings().backtest_fill_price_mode
+        except Exception:
+            return "next_open"
+
     def _compute_results(self) -> dict[str, Any]:
         if not self.equity_curve:
             return {
                 "total_return": 0,
                 "annual_return": 0,
                 "sharpe_ratio": 0,
+                "sortino_ratio": 0,
+                "calmar_ratio": 0,
                 "max_drawdown": 0,
                 "annual_vol": 0,
                 "win_rate": 0,
+                "profit_factor": 0,
+                "avg_win": 0,
+                "avg_loss": 0,
+                "max_consecutive_losses": 0,
+                "avg_holding_days": 0,
+                "total_fees": 0,
                 "trade_count": 0,
+                "monthly_returns": {},
+                "daily_returns": [],
                 "performance": {},
                 "trade_records": [],
                 "equity_curve": [],
@@ -651,12 +934,18 @@ class BacktestRunner:
             annual_return = ((1 + total_return) ** (1 / years)) - 1
 
         sharpe = 0.0
+        sortino = 0.0
         if daily_returns:
             import statistics
             mean_r = statistics.mean(daily_returns)
             std_r = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
             if std_r > 0:
                 sharpe = mean_r / std_r * (252 ** 0.5)
+            downside = [r for r in daily_returns if r < 0]
+            if downside:
+                downside_std = (sum(r ** 2 for r in downside) / len(daily_returns)) ** 0.5
+                if downside_std > 0:
+                    sortino = mean_r / downside_std * (252 ** 0.5)
 
         max_dd = 0.0
         peak = values[0]
@@ -666,45 +955,98 @@ class BacktestRunner:
             dd = (peak - v) / peak if peak > 0 else 0
             max_dd = max(max_dd, dd)
 
+        calmar = annual_return / max_dd if max_dd > 0 else 0.0
+
         annual_vol = 0.0
         if daily_returns and len(daily_returns) > 1:
             import statistics
             annual_vol = statistics.stdev(daily_returns) * (252 ** 0.5)
 
-        buy_trades = [t for t in self.trades if t.direction == "买入"]
-        sell_trades = [t for t in self.trades if t.direction == "卖出"]
+        gross_profit = Decimal("0")
+        gross_loss = Decimal("0")
         win_count = 0
-        total_rounds = 0
-        for buy in buy_trades:
-            matching_sells = [
-                s for s in sell_trades
-                if s.ts_code == buy.ts_code and s.trade_date >= buy.trade_date
-            ]
-            if matching_sells:
-                total_rounds += 1
-                sell_price = matching_sells[0].price
-                if sell_price > buy.price:
-                    win_count += 1
+        total_closed = len(self._closed_lots)
+        pnl_list: list[Decimal] = []
+        holding_days_list: list[int] = []
+        for lot in self._closed_lots:
+            pnl_list.append(lot.pnl)
+            holding_days_list.append(lot.holding_days)
+            if lot.pnl > 0:
+                gross_profit += lot.pnl
+                win_count += 1
+            else:
+                gross_loss += lot.pnl
 
-        win_rate = win_count / total_rounds if total_rounds > 0 else 0
+        win_rate = win_count / total_closed if total_closed > 0 else 0
+        profit_factor = float(gross_profit / abs(gross_loss)) if gross_loss != 0 else float("inf") if gross_profit > 0 else 0
+        avg_win = float(gross_profit / win_count) if win_count > 0 else 0
+        avg_loss = float(gross_loss / (total_closed - win_count)) if total_closed - win_count > 0 else 0
+
+        max_consec_losses = 0
+        consec = 0
+        for lot in self._closed_lots:
+            if lot.pnl < 0:
+                consec += 1
+                max_consec_losses = max(max_consec_losses, consec)
+            else:
+                consec = 0
+
+        avg_holding = sum(holding_days_list) / len(holding_days_list) if holding_days_list else 0
+
+        total_fees = sum(
+            t.cost.total_fee for t in self.trades
+        )
+
+        monthly_returns: dict[str, float] = {}
+        if len(dates) >= 2:
+            from datetime import date as date_cls
+            month_start_val = values[0]
+            current_month = dates[0][:7]
+            for i, d in enumerate(dates):
+                month_key = d[:7]
+                if month_key != current_month:
+                    if month_start_val > 0:
+                        monthly_returns[current_month] = (values[i - 1] - month_start_val) / month_start_val
+                    month_start_val = values[i - 1]
+                    current_month = month_key
+            if month_start_val > 0 and values:
+                monthly_returns[current_month] = (values[-1] - month_start_val) / month_start_val
 
         return {
             "total_return": round(total_return, 8),
             "annual_return": round(annual_return, 8),
             "sharpe_ratio": round(sharpe, 8),
+            "sortino_ratio": round(sortino, 8),
+            "calmar_ratio": round(calmar, 8),
             "max_drawdown": round(max_dd, 8),
             "annual_vol": round(annual_vol, 8),
             "win_rate": round(win_rate, 8),
+            "profit_factor": round(profit_factor, 4),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "max_consecutive_losses": max_consec_losses,
+            "avg_holding_days": round(avg_holding, 1),
+            "total_fees": round(float(total_fees), 2),
             "trade_count": len(self.trades),
+            "monthly_returns": {k: round(v, 6) for k, v in monthly_returns.items()},
+            "daily_returns": [round(r, 6) for r in daily_returns],
             "performance": {
                 "initial_cash": float(initial),
                 "final_asset": final,
                 "total_return_pct": round(total_return * 100, 4),
                 "annual_return_pct": round(annual_return * 100, 4),
                 "sharpe_ratio": round(sharpe, 4),
+                "sortino_ratio": round(sortino, 4),
+                "calmar_ratio": round(calmar, 4),
                 "max_drawdown_pct": round(max_dd * 100, 4),
                 "annual_vol_pct": round(annual_vol * 100, 4),
                 "win_rate_pct": round(win_rate * 100, 4),
+                "profit_factor": round(profit_factor, 2),
+                "avg_win": round(avg_win, 2),
+                "avg_loss": round(avg_loss, 2),
+                "max_consecutive_losses": max_consec_losses,
+                "avg_holding_days": round(avg_holding, 1),
+                "total_fees": round(float(total_fees), 2),
                 "strategy_error_count": len(self.strategy_errors),
             },
             "trade_records": [
@@ -725,8 +1067,8 @@ class BacktestRunner:
                     "position_before": t.position_before,
                     "position_after": t.position_after,
                     "pnl": float(t.pnl),
-                    "balance_before": float(t.balance_before),
-                    "balance_after": float(t.balance_after),
+                    "balance_before": t.balance_before,
+                    "balance_after": t.balance_after,
                     "holding_days": t.holding_days,
                     "exit_reason": t.exit_reason,
                 }
@@ -739,6 +1081,7 @@ class BacktestRunner:
                 "execution_timeframe": self.config.execution_timeframe,
                 "signal_timeframe": self.config.signal_timeframe,
                 "price_path_simulation": True,
+                "slippage_pct": self.config.slippage_pct,
                 "stop_loss_pct": self.config.stop_loss_pct,
                 "take_profit_pct": self.config.take_profit_pct,
                 "trailing_stop_pct": self.config.trailing_stop_pct,

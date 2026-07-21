@@ -487,6 +487,53 @@ async def test_match_limit_mode_blocks_when_price_not_touched():
 
 
 @pytest.mark.asyncio
+async def test_match_limit_mode_uses_realtime_price_when_provided_for_sell():
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(direction="卖出", volume=600, frozen_amount=Decimal("0.0000"), user_id=1, config={}, price=Decimal("9.9900"))]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row(low=Decimal("9.5000"), high=Decimal("9.8000"), close=Decimal("9.7000"))]),
+            FakeResult([
+                {
+                    "id": 12,
+                    "order_id": 9,
+                    "account_id": 1,
+                    "ts_code": "000001.SZ",
+                    "direction": "卖出",
+                    "price": Decimal("9.9900"),
+                    "volume": 600,
+                    "amount": Decimal("5994.0000"),
+                    "stamp_tax": Decimal("2.9970"),
+                    "commission": Decimal("5.0000"),
+                    "transfer_fee": Decimal("0.0599"),
+                    "total_fee": Decimal("8.0569"),
+                    "trade_time": datetime(2026, 5, 21),
+                }
+            ]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+            FakeResult([]),
+        ]
+    )
+
+    result = await match_order(
+        session,
+        user_id=1,
+        order_id=9,
+        trade_date=date(2026, 5, 21),
+        match_mode="limit",
+        realtime_price=Decimal("10.0000"),
+    )
+
+    assert result["status"] == "全部成交"
+    assert result["match_mode_used"] == "limit"
+    assert session.params[3]["price"] == Decimal("9.9900")
+
+
+@pytest.mark.asyncio
 async def test_match_order_falls_back_to_order_price_when_daily_kline_missing():
     session = ScriptedSession(
         [
@@ -580,7 +627,7 @@ async def test_match_sell_charges_stamp_tax_only_on_sell():
     await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
     assert "current_price = CAST(:price AS NUMERIC)" in session.statements[4]
-    assert "market_value = (shares - :volume) * CAST(:price AS NUMERIC)" in session.statements[4]
+    assert "market_value = (shares - CAST(:volume AS INTEGER)) * CAST(:price AS NUMERIC)" in session.statements[4]
     assert session.params[3]["stamp_tax"] == Decimal("3.0000")
     sell_income_idx = find_statement_index(session, "available_cash = available_cash + :net_income")
     assert session.params[sell_income_idx]["net_income"] == Decimal("5991.9400")
@@ -622,8 +669,8 @@ async def test_match_full_sell_keeps_today_cleared_position():
 
     await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    sell_update_idx = find_statement_index(session, "SET shares = shares - :volume")
-    assert "WHEN shares - :volume <= 0" in session.statements[sell_update_idx]
+    sell_update_idx = find_statement_index(session, "SET shares = shares - CAST(:volume AS INTEGER)")
+    assert "WHEN shares - CAST(:volume AS INTEGER) <= 0" in session.statements[sell_update_idx]
     assert session.params[sell_update_idx]["amount"] == Decimal("10000.0000")
     assert session.params[sell_update_idx]["total_fee"] == Decimal("10.1000")
     assert all("DELETE FROM sim_positions" not in statement for statement in session.statements)
@@ -637,18 +684,29 @@ async def test_match_blocks_limit_up_buy():
             FakeResult([order_row(user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(is_limit_up=True)]),
-            FakeResult([]),
+            FakeResult([]),  # UPDATE sim_orders SET status='rejected'
+            FakeResult([]),  # UPDATE sim_accounts (unfreeze cash)
+            FakeResult([]),  # INSERT sim_cash_flow (解冻)
         ]
     )
 
     result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert result["status"] == "待成交"
+    # P1-C fix: BLOCKED now transitions to '已拒绝' (not '待成交')
+    assert result["status"] == "已拒绝"
     assert result["matched"] is False
     assert result["reason"] == "涨停不可买入"
     assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert result["order"]["status"] == "rejected"
     assert "UPDATE sim_orders" in session.statements[3]
+    assert "status = 'rejected'" in session.statements[3]
     assert session.params[3]["reason"] == "涨停不可买入"
+    # Unfreeze cash for BUY order
+    assert "UPDATE sim_accounts" in session.statements[4]
+    assert "frozen_cash = frozen_cash - :amount" in session.statements[4]
+    # Cash flow unfreeze record
+    assert "INSERT INTO sim_cash_flow" in session.statements[5]
+    assert "'解冻'" in session.statements[5]
     assert session.commits == 1
 
 
@@ -668,16 +726,19 @@ async def test_match_blocks_computed_limit_up_buy_by_market(market, ts_code, pre
             FakeResult([order_row(ts_code=ts_code, user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(ts_code=ts_code, market=market, pre_close=pre_close, close=close)]),
-            FakeResult([]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_accounts (unfreeze)
+            FakeResult([]),  # INSERT sim_cash_flow (解冻)
         ]
     )
 
     result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert result["status"] == "待成交"
+    assert result["status"] == "已拒绝"
     assert result["matched"] is False
     assert result["reason"] == "涨停不可买入"
     assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert result["order"]["status"] == "rejected"
     assert session.params[3]["reason"] == "涨停不可买入"
     assert session.commits == 1
 
@@ -689,16 +750,19 @@ async def test_match_blocks_computed_st_limit_up_buy():
             FakeResult([order_row(user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(pre_close=Decimal("10.0000"), close=Decimal("10.5000"), is_st=True)]),
-            FakeResult([]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_accounts (unfreeze)
+            FakeResult([]),  # INSERT sim_cash_flow (解冻)
         ]
     )
 
     result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert result["status"] == "待成交"
+    assert result["status"] == "已拒绝"
     assert result["matched"] is False
     assert result["reason"] == "涨停不可买入"
     assert result["order"]["reject_reason"] == "涨停不可买入"
+    assert result["order"]["status"] == "rejected"
     assert session.params[3]["reason"] == "涨停不可买入"
     assert session.commits == 1
 
@@ -719,18 +783,156 @@ async def test_match_blocks_computed_limit_down_sell_by_market(market, ts_code, 
             FakeResult([order_row(direction="卖出", ts_code=ts_code, volume=600, frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
             FakeResult([calendar_row()]),
             FakeResult([kline_row(ts_code=ts_code, market=market, pre_close=pre_close, close=close)]),
-            FakeResult([]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_positions (unfreeze shares)
         ]
     )
 
     result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
 
-    assert result["status"] == "待成交"
+    assert result["status"] == "已拒绝"
     assert result["matched"] is False
     assert result["reason"] == "跌停不可卖出"
     assert result["order"]["reject_reason"] == "跌停不可卖出"
+    assert result["order"]["status"] == "rejected"
     assert session.params[3]["reason"] == "跌停不可卖出"
     assert session.commits == 1
+
+
+# ---------------------------------------------------------------------------
+# P1-C: BLOCKED order transitions to 'rejected' + unfreezes resources
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blocked_order_transitions_to_rejected():
+    """BLOCKED must set sim_orders.status='rejected' (not leave at '待成交').
+
+    Verifies the core P1-C fix: status field is updated alongside
+    reject_reason, and the returned status string is '已拒绝'.
+    """
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(user_id=1, config={})]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row(is_limit_up=True)]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_accounts
+            FakeResult([]),  # INSERT sim_cash_flow
+        ]
+    )
+
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+
+    # Status must be '已拒绝' (not '待成交')
+    assert result["status"] == "已拒绝"
+    # Serialized order must reflect the new status
+    assert result["order"]["status"] == "rejected"
+    # The UPDATE statement must set status='rejected'
+    update_stmt = session.statements[3]
+    assert "status = 'rejected'" in update_stmt
+    assert "reject_reason = :reason" in update_stmt
+
+
+@pytest.mark.asyncio
+async def test_blocked_buy_order_unfreezes_cash():
+    """BLOCKED BUY order must unfreeze the originally-frozen cash.
+
+    Setup: BUY order with frozen_amount=99025.74.
+    Expected:
+    - sim_accounts.available_cash += 99025.74
+    - sim_accounts.frozen_cash -= 99025.74
+    - sim_cash_flow record with flow_type='解冻', amount=99025.74
+    """
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(frozen_amount=Decimal("99025.7400"), user_id=1, config={})]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row(is_limit_up=True)]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_accounts
+            FakeResult([]),  # INSERT sim_cash_flow
+        ]
+    )
+
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+
+    assert result["status"] == "已拒绝"
+
+    # UPDATE sim_accounts: unfreeze cash
+    acct_update_idx = find_statement_index(session, "UPDATE sim_accounts", start=4)
+    acct_params = session.params[acct_update_idx]
+    assert acct_params["amount"] == Decimal("99025.7400")
+    assert acct_params["account_id"] == 1
+    # Verify SQL unfreezes (not freezes)
+    assert "available_cash = available_cash + :amount" in session.statements[acct_update_idx]
+    assert "frozen_cash = frozen_cash - :amount" in session.statements[acct_update_idx]
+
+    # INSERT sim_cash_flow: 解冻 record
+    flow_idx = find_statement_index(session, "INSERT INTO sim_cash_flow", start=5)
+    flow_params = session.params[flow_idx]
+    assert flow_params["account_id"] == 1
+    assert flow_params["amount"] == Decimal("99025.7400")
+    assert "解冻" in session.statements[flow_idx]
+    assert "BLOCKED 解冻" in flow_params["remark"]
+    assert "order_id=9" in flow_params["remark"]
+
+
+@pytest.mark.asyncio
+async def test_blocked_sell_order_unfreezes_shares():
+    """BLOCKED SELL order must unfreeze the originally-frozen shares.
+
+    Setup: SELL order with volume=600.
+    Expected:
+    - sim_positions.available_shares += 600
+    - sim_positions.frozen_shares -= 600
+    """
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(direction="卖出", volume=600, frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row(is_limit_down=True)]),
+            FakeResult([]),  # UPDATE sim_orders
+            FakeResult([]),  # UPDATE sim_positions
+        ]
+    )
+
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+
+    assert result["status"] == "已拒绝"
+    assert result["reason"] == "跌停不可卖出"
+
+    # UPDATE sim_positions: unfreeze shares
+    pos_update_idx = find_statement_index(session, "UPDATE sim_positions", start=4)
+    pos_params = session.params[pos_update_idx]
+    assert pos_params["volume"] == 600
+    assert pos_params["account_id"] == 1
+    assert "available_shares = available_shares + :volume" in session.statements[pos_update_idx]
+    assert "frozen_shares = frozen_shares - :volume" in session.statements[pos_update_idx]
+
+
+@pytest.mark.asyncio
+async def test_blocked_buy_with_zero_frozen_amount_skips_unfreeze():
+    """Edge case: BUY order with frozen_amount=0 should skip the unfreeze
+    UPDATE on sim_accounts (no-op). Still writes the order UPDATE."""
+    session = ScriptedSession(
+        [
+            FakeResult([order_row(frozen_amount=Decimal("0.0000"), user_id=1, config={})]),
+            FakeResult([calendar_row()]),
+            FakeResult([kline_row(is_limit_up=True)]),
+            FakeResult([]),  # UPDATE sim_orders
+            # NO UPDATE sim_accounts (frozen_amount=0, skip)
+            # NO INSERT sim_cash_flow
+        ]
+    )
+
+    result = await match_order(session, user_id=1, order_id=9, trade_date=date(2026, 5, 21))
+
+    assert result["status"] == "已拒绝"
+    # Only 4 statements: SELECT order, SELECT calendar, SELECT kline, UPDATE sim_orders
+    assert len(session.statements) == 4
+    assert "UPDATE sim_accounts" not in "".join(session.statements)
+    assert "INSERT INTO sim_cash_flow" not in "".join(session.statements)
 
 
 @pytest.mark.asyncio
@@ -995,7 +1197,7 @@ def test_realtime_risk_guard_aggressive_sell_price_uses_bid1_minus_one_cent():
 
 
 @pytest.mark.asyncio
-async def test_realtime_risk_guard_does_not_duplicate_pending_sell_order():
+async def test_realtime_risk_guard_matches_existing_pending_sell_order():
     trade_date = date(2026, 5, 22)
     position = {
         "id": 3,
@@ -1015,7 +1217,8 @@ async def test_realtime_risk_guard_does_not_duplicate_pending_sell_order():
             FakeResult([calendar_row(cal_date=trade_date, pretrade_date=date(2026, 5, 21))]),
             FakeResult([position]),
             FakeResult([kline_row(trade_date=trade_date, pre_close=Decimal("10.0000"), close=Decimal("11.0000"), is_limit_up=True)]),
-            FakeResult([{"id": 99}]),
+            FakeResult([order_row(id=99, direction="卖出", price=Decimal("10.9800"), volume=1000, frozen_amount=Decimal("0.0000"))]),
+            *sell_match_results(price=Decimal("10.9800"), volume=1000, trade_date=trade_date),
         ]
     )
 
@@ -1039,6 +1242,9 @@ async def test_realtime_risk_guard_does_not_duplicate_pending_sell_order():
     assert result is not None
     assert result["action"] == "HOLD"
     assert result["reason"] == "已有待成交卖出委托"
+    assert result["order"]["id"] == 99
+    assert result["order"]["direction"] == "卖出"
+    assert result["match"]["status"] == "全部成交"
     assert not any("INSERT INTO sim_orders" in statement for statement in session.statements)
 
 
@@ -1520,8 +1726,8 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
     unlock_idx = find_statement_index(session, "WITH today_buys")
     assert session.params[unlock_idx]["trade_date"] == sell_trade_date
     sell_income_idx = find_statement_index(session, "available_cash = available_cash + :net_income")
-    sell_position_update_idx = find_statement_index(session, "SET shares = shares - :volume", start=unlock_idx)
-    assert "WHEN shares - :volume <= 0" in session.statements[sell_position_update_idx]
+    sell_position_update_idx = find_statement_index(session, "SET shares = shares - CAST(:volume AS INTEGER)", start=unlock_idx)
+    assert "WHEN shares - CAST(:volume AS INTEGER) <= 0" in session.statements[sell_position_update_idx]
     assert session.params[sell_income_idx]["net_income"] == Decimal("100903.2552")
     nav_refresh_idx = find_statement_index(session, "FROM daily_kline dk", start=sell_income_idx)
     nav_upsert_idx = find_statement_index(session, "INSERT INTO sim_daily_nav", start=nav_refresh_idx)

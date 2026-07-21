@@ -9,6 +9,30 @@ from app.tasks.tracking import _run_tracked
 from app.tasks.trading_tasks import _is_realtime_trading_time, _is_open_trade_day, _snapshot_nav_daily
 
 
+class _FakeFactory:
+    """Wraps a session so it can be passed as ``session_factory`` to fn.
+
+    Mimics ``async_session_factory()`` returning an async context manager
+    that yields ``session``. Optionally closes the session on exit to mirror
+    real session lifecycle (used by tests that assert ``session.closed``).
+    """
+
+    def __init__(self, session, *, close_on_exit: bool = True):
+        self._session = session
+        self._close_on_exit = close_on_exit
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._close_on_exit and hasattr(self._session, "close"):
+            await self._session.close()
+        return False
+
+
 def test_celery_app_registers_data_tasks() -> None:
     celery_app.loader.import_default_modules()
 
@@ -42,7 +66,7 @@ def test_sync_fundamentals_task_defaults_to_all_codes_and_reports_progress(monke
 
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["tracked"] = {"task_name": task_name, "task_id": task_id, "payload": payload}
-        return await fn(fake_session)
+        return await fn(_FakeFactory(fake_session))
 
     async def fake_select_all_stock_codes(session):
         captured["select_session"] = session
@@ -112,7 +136,7 @@ def test_sync_fundamentals_task_honors_explicit_concurrency(monkeypatch) -> None
 
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["payload"] = payload
-        return await fn(FakeSession())
+        return await fn(_FakeFactory(FakeSession()))
 
     async def fake_select_all_stock_codes(session):
         return ["000001.SZ"]
@@ -150,9 +174,13 @@ def test_sync_sample_kline_task_honors_concurrency(monkeypatch) -> None:
 
     captured = {}
 
+    class _NullSession:
+        async def close(self):
+            return None
+
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["payload"] = payload
-        return await fn(object())
+        return await fn(_FakeFactory(_NullSession()))
 
     async def fake_sync_kline(
         session,
@@ -193,7 +221,7 @@ def test_incremental_kline_update_uses_default_concurrency(monkeypatch) -> None:
 
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["payload"] = payload
-        return await fn(FakeSession())
+        return await fn(_FakeFactory(FakeSession()))
 
     async def fake_infer_incremental_kline_ranges(session):
         return [
@@ -260,7 +288,7 @@ def test_incremental_kline_update_groups_per_stock_ranges_and_reports_progress(m
     sync_calls = []
 
     async def fake_run_tracked(_task_name, _task_id, _payload, fn):
-        return await fn(FakeSession())
+        return await fn(_FakeFactory(FakeSession()))
 
     async def fake_infer_incremental_kline_ranges(_session):
         return [
@@ -343,7 +371,7 @@ def test_incremental_kline_update_skips_when_no_per_stock_gaps(monkeypatch) -> N
     fake_session = FakeSession()
 
     async def fake_run_tracked(_task_name, _task_id, _payload, fn):
-        return await fn(fake_session)
+        return await fn(_FakeFactory(fake_session))
 
     async def fake_infer_incremental_kline_ranges(_session):
         return []
@@ -379,7 +407,7 @@ def test_sync_all_kline_task_uses_default_concurrency_and_tracks_payload(monkeyp
 
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["tracked"] = {"task_name": task_name, "task_id": task_id, "payload": payload}
-        return await fn(fake_session)
+        return await fn(_FakeFactory(fake_session))
 
     async def fake_select_all_stock_codes(session):
         captured["select_session"] = session
@@ -441,7 +469,7 @@ def test_sync_all_kline_task_honors_explicit_concurrency(monkeypatch) -> None:
 
     async def fake_run_tracked(task_name, task_id, payload, fn):
         captured["payload"] = payload
-        return await fn(fake_session)
+        return await fn(_FakeFactory(fake_session))
 
     async def fake_select_all_stock_codes(session):
         return ["000001.SZ"]
@@ -570,8 +598,9 @@ def test_run_tracked_rolls_back_before_recording_failed_status(monkeypatch) -> N
     monkeypatch.setattr(tracking, "async_session_factory", lambda: factory)
 
     async def run():
-        async def fail(session):
-            await session.execute(text("SELECT broken_business_sql"))
+        async def fail(session_factory):
+            async with session_factory() as session:
+                await session.execute(text("SELECT broken_business_sql"))
             return {"ok": True}
 
         return await _run_tracked("compute_daily_factors", "task-failed", {}, fail)

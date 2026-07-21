@@ -6,8 +6,10 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-leek_quant}
       POSTGRES_USER: ${POSTGRES_USER:-leek_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      # POSTGRES_PASSWORD is required — no default. Set in .env or environment.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       TZ: ${TZ:-Asia/Shanghai}
+    command: ["postgres", "-c", "max_connections=120"]
     ports:
       - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
     volumes:
@@ -17,6 +19,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
     networks:
       - leek-quant-network
 
@@ -24,14 +31,21 @@ services:
     image: ${IMAGE_PREFIX:-}redis:7-alpine
     container_name: leek-quant-redis
     restart: unless-stopped
-    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru", "--appendonly", "yes"]
     ports:
       - "${REDIS_PORT:-127.0.0.1:6379}:6379"
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
     networks:
       - leek-quant-network
 
@@ -42,6 +56,8 @@ services:
       args:
         BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
         BUILD_REGION: ${BUILD_REGION:-cn}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        RUNTIME_REGION: ${BUILD_REGION:-cn}
     container_name: leek-quant-backend
     restart: unless-stopped
     depends_on:
@@ -52,16 +68,22 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-leek_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-leek_quant}}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "${BACKEND_PORT:-127.0.0.1:8000}:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
     networks:
       - leek-quant-network
 
@@ -72,6 +94,8 @@ services:
       args:
         BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
         BUILD_REGION: ${BUILD_REGION:-cn}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        RUNTIME_REGION: ${BUILD_REGION:-cn}
     container_name: leek-quant-celery-worker
     restart: unless-stopped
     depends_on:
@@ -82,10 +106,15 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-leek_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-leek_quant}}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "default,data,backtest,factor,trading"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
     networks:
       - leek-quant-network
 
@@ -96,6 +125,8 @@ services:
       args:
         BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
         BUILD_REGION: ${BUILD_REGION:-cn}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        RUNTIME_REGION: ${BUILD_REGION:-cn}
     container_name: leek-quant-celery-beat
     restart: unless-stopped
     depends_on:
@@ -106,10 +137,15 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-leek_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-leek_quant}}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["celery", "-A", "app.tasks.celery_app:celery_app", "beat", "--loglevel=INFO"]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
     networks:
       - leek-quant-network
 
@@ -120,6 +156,8 @@ services:
       args:
         BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
         BUILD_REGION: ${BUILD_REGION:-cn}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        RUNTIME_REGION: ${BUILD_REGION:-cn}
     container_name: leek-quant-realtime-risk-guard
     restart: unless-stopped
     depends_on:
@@ -130,9 +168,56 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-local}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://leek_user:change-me@postgres:5432/leek_quant}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-leek_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-leek_quant}}
       TZ: ${TZ:-Asia/Shanghai}
     command: ["python", "-m", "app.realtime.risk_guard", "--mode", "${REALTIME_RISK_GUARD_MODE:-snapshot}", "--refresh-interval", "${REALTIME_RISK_GUARD_INTERVAL:-15}"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, redis; r = redis.from_url(os.environ['REDIS_URL']); print('ok' if r.ping() else 'fail')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    networks:
+      - leek-quant-network
+
+  realtime_ws:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        BUILD_REGION: ${BUILD_REGION:-cn}
+        RUNTIME_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        RUNTIME_REGION: ${BUILD_REGION:-cn}
+    container_name: leek-quant-realtime-ws
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DATABASE_URL: ${CONTAINER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-leek_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-leek_quant}}
+      TZ: ${TZ:-Asia/Shanghai}
+    command: ["python", "-m", "app.realtime.ws_producer", "--dynamic", "--reload-interval", "${WS_RELOAD_INTERVAL:-300}"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os, redis; r = redis.from_url(os.environ['REDIS_URL']); print('ok' if r.ping() else 'fail')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
     networks:
       - leek-quant-network
 
@@ -151,6 +236,11 @@ services:
         condition: service_healthy
     ports:
       - "${FRONTEND_PORT:-8080}:80"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
     networks:
       - leek-quant-network
 
@@ -160,3 +250,4 @@ networks:
 
 volumes:
   postgres-data:
+  redis-data:

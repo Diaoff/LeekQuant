@@ -114,6 +114,8 @@ const defaultRankFilters = {
 
 const today = new Date().toISOString().slice(0, 10)
 
+const BUILTIN_NAMES = new Set(['pe_ttm', 'pb', 'roe', 'revenue_growth', 'mom_20d', 'mom_60d', 'rsi6', 'vol_20d'])
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -297,6 +299,10 @@ export default function FactorPage() {
   const [loadingAnalysis, setLoadingAnalysis] = React.useState(false)
   const [loadingValues, setLoadingValues] = React.useState(false)
   const [activeTask, setActiveTask] = React.useState<TaskKind | null>(null)
+  const [factorModal, setFactorModal] = React.useState<{ open: boolean; mode: 'create' | 'edit'; factor?: FactorDefinition }>({ open: false, mode: 'create' })
+  const [factorForm, setFactorForm] = React.useState({ name: '', display_name: '', category: 'custom', expression: '', direction: '1', default_weight: '1.0', description: '' })
+  const [factorFormError, setFactorFormError] = React.useState<string | null>(null)
+  const [factorFormSaving, setFactorFormSaving] = React.useState(false)
   const [taskNotice, setTaskNotice] = React.useState<TaskNotice | null>(null)
   const [notice, setNotice] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
@@ -494,6 +500,84 @@ export default function FactorPage() {
       setError(caught instanceof Error ? caught.message : String(caught))
     }
   }, [analyzeForm])
+
+  const openCreateModal = React.useCallback(() => {
+    setFactorForm({ name: '', display_name: '', category: 'custom', expression: '', direction: '1', default_weight: '1.0', description: '' })
+    setFactorFormError(null)
+    setFactorModal({ open: true, mode: 'create' })
+  }, [])
+
+  const openEditModal = React.useCallback((factor: FactorDefinition) => {
+    setFactorForm({
+      name: factor.name,
+      display_name: factor.display_name ?? factor.name,
+      category: factor.category,
+      expression: factor.expression,
+      direction: String(factor.direction),
+      default_weight: String(factor.default_weight),
+      description: factor.description ?? '',
+    })
+    setFactorFormError(null)
+    setFactorModal({ open: true, mode: 'edit', factor })
+  }, [])
+
+  const closeFactorModal = React.useCallback(() => {
+    setFactorModal({ open: false, mode: 'create' })
+    setFactorFormError(null)
+  }, [])
+
+  const submitFactorForm = React.useCallback(async () => {
+    setFactorFormError(null)
+    setFactorFormSaving(true)
+    try {
+      if (factorModal.mode === 'create') {
+        await fetchJson<FactorDefinition>('/api/factors', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: factorForm.name.trim(),
+            display_name: factorForm.display_name.trim() || factorForm.name.trim(),
+            category: factorForm.category.trim() || 'custom',
+            expression: factorForm.expression.trim(),
+            direction: Number(factorForm.direction),
+            default_weight: Number(factorForm.default_weight),
+            description: factorForm.description.trim(),
+          }),
+        })
+        setNotice(`因子 ${factorForm.name} 创建成功`)
+      } else {
+        await fetchJson<FactorDefinition>(`/api/factors/${factorModal.factor?.name}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            display_name: factorForm.display_name.trim() || undefined,
+            category: factorForm.category.trim() || undefined,
+            expression: factorForm.expression.trim() || undefined,
+            direction: Number(factorForm.direction),
+            default_weight: Number(factorForm.default_weight),
+            description: factorForm.description.trim() || undefined,
+          }),
+        })
+        setNotice(`因子 ${factorModal.factor?.name} 更新成功`)
+      }
+      closeFactorModal()
+      await loadStaticData()
+    } catch (caught) {
+      const msg = caught instanceof Error ? caught.message : String(caught)
+      setFactorFormError(msg.includes('invalid expression') ? `表达式错误：${msg.split('invalid expression: ')[1] ?? msg}` : msg)
+    } finally {
+      setFactorFormSaving(false)
+    }
+  }, [factorForm, factorModal, closeFactorModal, loadStaticData])
+
+  const deleteFactor = React.useCallback(async (name: string) => {
+    if (!window.confirm(`确定删除因子 ${name}？`)) return
+    try {
+      await fetch(`/api/factors/${name}`, { method: 'DELETE' })
+      setNotice(`因子 ${name} 已删除`)
+      await loadStaticData()
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    }
+  }, [loadStaticData])
 
   const allBusy = loadingInitial || loadingRank || loadingAnalysis || loadingValues || activeTask !== null
   const watchlistScopeBlocked = rankFilters.scope_type === 'watchlist_group' && !rankFilters.scope_value.trim()
@@ -696,7 +780,22 @@ export default function FactorPage() {
         </section>
 
         <section className="rounded-lg border border-line bg-panel p-4">
-          <SectionHeader icon={<Layers3 className="h-4 w-4 text-muted" aria-hidden="true" />} title="因子库" meta={`${definitions.length} 个`} />
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-semibold text-ink">
+              <Layers3 className="h-4 w-4 text-muted" aria-hidden="true" />
+              <span>因子库</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs tabular-nums text-muted">{definitions.length} 个</span>
+              <button
+                type="button"
+                onClick={openCreateModal}
+                className="inline-flex h-7 items-center justify-center gap-1 rounded border border-line bg-surface px-2 text-xs font-medium text-ink hover:bg-rowHover"
+              >
+                + 新建
+              </button>
+            </div>
+          </div>
           {loadingInitial ? (
             <Skeleton.Table rows={6} columns={4} />
           ) : (
@@ -709,11 +808,12 @@ export default function FactorPage() {
                   <th className="px-4 py-3 text-right">权重</th>
                   <th className="px-4 py-3">状态</th>
                   <th className="px-4 py-3">表达式</th>
+                  <th className="px-4 py-3">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-line bg-panel">
                 {definitions.length === 0 ? (
-                  <EmptyRow colSpan={6} message="暂无因子定义" />
+                  <EmptyRow colSpan={7} message="暂无因子定义" />
                 ) : (
                   definitions.map((factor) => (
                     <tr key={factor.name} className="hover:bg-rowHover">
@@ -731,6 +831,26 @@ export default function FactorPage() {
                       </td>
                       <td className="max-w-[18rem] px-4 py-3">
                         <code className="block truncate text-xs text-muted" title={factor.expression}>{factor.expression}</code>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => openEditModal(factor)}
+                            className="rounded border border-line px-2 py-0.5 text-xs text-ink hover:bg-rowHover"
+                          >
+                            编辑
+                          </button>
+                          {!BUILTIN_NAMES.has(factor.name) && (
+                            <button
+                              type="button"
+                              onClick={() => void deleteFactor(factor.name)}
+                              className="rounded border border-red-200 px-2 py-0.5 text-xs text-red-600 hover:bg-red-50"
+                            >
+                              删除
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))

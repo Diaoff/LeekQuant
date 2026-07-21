@@ -7,10 +7,12 @@ from typing import Any
 
 from sqlalchemy import text
 
+from app.data.providers import DataProviderError
 from app.realtime.risk_guard import RealtimeRiskGuard
 from app.sim.service import match_order, snapshot_daily_nav, unlock_t1_positions
+from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
-from app.tasks.tracking import _run_tracked
+from app.tasks.tracking import _run_tracked, with_session
 
 A_SHARE_REALTIME_WINDOWS = (
     (time(9, 25), time(11, 30)),
@@ -33,7 +35,16 @@ async def _is_open_trade_day(session, run_date: date) -> bool:
     return bool(row and row["is_open"])
 
 
-@celery_app.task(name="app.tasks.trading_tasks.unlock_t1_daily", bind=True)
+@celery_app.task(
+    name="app.tasks.trading_tasks.unlock_t1_daily",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.trading_tasks.unlock_t1_daily")
 def unlock_t1_daily(self, trade_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else date.today()
     return asyncio.run(
@@ -41,7 +52,7 @@ def unlock_t1_daily(self, trade_date: str | None = None) -> dict[str, Any]:
             "unlock_t1_daily",
             self.request.id,
             {"trade_date": run_date},
-            lambda session: _unlock_t1_daily(session, run_date),
+            with_session(_unlock_t1_daily, run_date),
         )
     )
 
@@ -51,7 +62,16 @@ async def _unlock_t1_daily(session, run_date: date) -> dict[str, Any]:
     return {"trade_date": run_date.isoformat(), "positions_updated": updated}
 
 
-@celery_app.task(name="app.tasks.trading_tasks.snapshot_nav_daily", bind=True)
+@celery_app.task(
+    name="app.tasks.trading_tasks.snapshot_nav_daily",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.trading_tasks.snapshot_nav_daily")
 def snapshot_nav_daily(self, nav_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(nav_date) if nav_date else date.today()
     return asyncio.run(
@@ -59,7 +79,7 @@ def snapshot_nav_daily(self, nav_date: str | None = None) -> dict[str, Any]:
             "snapshot_nav_daily",
             self.request.id,
             {"nav_date": run_date},
-            lambda session: _snapshot_nav_daily(session, run_date),
+            with_session(_snapshot_nav_daily, run_date),
         )
     )
 
@@ -83,7 +103,16 @@ async def _snapshot_nav_daily(session, run_date: date) -> dict[str, Any]:
     return {"nav_date": run_date.isoformat(), "snapshot_count": len(snapshots)}
 
 
-@celery_app.task(name="app.tasks.trading_tasks.match_pending_orders", bind=True)
+@celery_app.task(
+    name="app.tasks.trading_tasks.match_pending_orders",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.trading_tasks.match_pending_orders")
 def match_pending_orders(self, trade_date: str | None = None, match_mode: str = "close") -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else date.today()
     return asyncio.run(
@@ -91,7 +120,7 @@ def match_pending_orders(self, trade_date: str | None = None, match_mode: str = 
             "match_pending_orders",
             self.request.id,
             {"trade_date": run_date, "match_mode": match_mode},
-            lambda session: _match_pending_orders(session, run_date, match_mode),
+            with_session(_match_pending_orders, run_date, match_mode),
         )
     )
 
@@ -130,7 +159,12 @@ async def _match_pending_orders(session, run_date: date, match_mode: str = "clos
     return {"trade_date": run_date.isoformat(), "match_mode": match_mode, "matched": matched, "pending": pending, "failed": failed}
 
 
-@celery_app.task(name="app.tasks.trading_tasks.realtime_risk_guard", bind=True)
+@celery_app.task(
+    name="app.tasks.trading_tasks.realtime_risk_guard",
+    bind=True,
+    task_time_limit=None,
+    task_soft_time_limit=None,
+)
 def realtime_risk_guard(
     self,
     trade_date: str | None = None,

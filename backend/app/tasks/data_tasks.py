@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from app.core.config import get_settings
+from app.data.providers import DataProviderError
 from app.data.service import (
     default_kline_window,
     infer_incremental_kline_ranges,
@@ -14,8 +16,9 @@ from app.data.service import (
     sync_trade_calendar,
 )
 from app.data.stock_service import sync_fundamentals
+from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
-from app.tasks.tracking import _run_tracked
+from app.tasks.tracking import _run_tracked, with_session
 
 
 def _effective_data_sync_concurrency(concurrency: int | None) -> int:
@@ -25,19 +28,37 @@ def _effective_data_sync_concurrency(concurrency: int | None) -> int:
     return effective_concurrency
 
 
-@celery_app.task(name="app.tasks.data_tasks.update_stock_basic", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.update_stock_basic",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.data_tasks.update_stock_basic")
 def update_stock_basic(self) -> dict[str, Any]:
     return asyncio.run(
         _run_tracked(
             "update_stock_basic",
             self.request.id,
             {},
-            lambda session: sync_stock_basic(session),
+            with_session(sync_stock_basic),
         )
     )
 
 
-@celery_app.task(name="app.tasks.data_tasks.update_trade_calendar", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.update_trade_calendar",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.data_tasks.update_trade_calendar")
 def update_trade_calendar(self, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
     today = datetime.now(tz=UTC).date()
     start = date.fromisoformat(start_date) if start_date else today - timedelta(days=370)
@@ -47,12 +68,20 @@ def update_trade_calendar(self, start_date: str | None = None, end_date: str | N
             "update_trade_calendar",
             self.request.id,
             {"start_date": start, "end_date": end},
-            lambda session: sync_trade_calendar(session, start, end),
+            with_session(sync_trade_calendar, start, end),
         )
     )
 
 
-@celery_app.task(name="app.tasks.data_tasks.sync_sample_kline", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.sync_sample_kline",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
 def sync_sample_kline(
     self,
     ts_codes: list[str] | None = None,
@@ -69,8 +98,8 @@ def sync_sample_kline(
             "sync_sample_kline",
             self.request.id,
             {"ts_codes": ts_codes, "start_date": start, "end_date": end, "concurrency": effective_concurrency},
-            lambda session: sync_kline(
-                session,
+            with_session(
+                sync_kline,
                 ts_codes,
                 start,
                 end,
@@ -81,7 +110,16 @@ def sync_sample_kline(
     )
 
 
-@celery_app.task(name="app.tasks.data_tasks.sync_fundamentals", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.sync_fundamentals",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.data_tasks.sync_fundamentals")
 def sync_fundamentals_task(
     self,
     ts_codes: list[str] | None = None,
@@ -95,9 +133,10 @@ def sync_fundamentals_task(
     effective_concurrency = _effective_data_sync_concurrency(concurrency)
     payload = {"ts_codes": ts_codes, "start_date": start, "end_date": end, "concurrency": effective_concurrency}
 
-    async def run(session) -> dict[str, Any]:
-        all_codes = [*ts_codes] if ts_codes is not None else await select_all_stock_codes(session)
-        await session.close()
+    async def run(session_factory) -> dict[str, Any]:
+        async with session_factory() as session:
+            all_codes = [*ts_codes] if ts_codes is not None else await select_all_stock_codes(session)
+        # session closed by context manager; remaining work uses no session.
         total = len(all_codes)
 
         def progress(i: int, _total: int, code: str) -> None:
@@ -129,14 +168,24 @@ def sync_fundamentals_task(
     )
 
 
-@celery_app.task(name="app.tasks.data_tasks.incremental_kline_update", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.incremental_kline_update",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.data_tasks.incremental_kline_update")
 def incremental_kline_update(self, concurrency: int | None = None) -> dict[str, Any]:
     effective_concurrency = _effective_data_sync_concurrency(concurrency)
 
-    async def run(session) -> dict[str, Any]:
-        ranges = await infer_incremental_kline_ranges(session)
-        all_codes = await select_all_stock_codes(session)
-        await session.close()
+    async def run(session_factory) -> dict[str, Any]:
+        async with session_factory() as session:
+            ranges = await infer_incremental_kline_ranges(session)
+            all_codes = await select_all_stock_codes(session)
+        # session closed by context manager; remaining work uses no session.
         if not ranges:
             return {
                 "skipped": True,
@@ -205,7 +254,15 @@ def incremental_kline_update(self, concurrency: int | None = None) -> dict[str, 
     )
 
 
-@celery_app.task(name="app.tasks.data_tasks.sync_all_kline", bind=True)
+@celery_app.task(
+    name="app.tasks.data_tasks.sync_all_kline",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
 def sync_all_kline(
     self,
     start_date: str | None = None,
@@ -217,9 +274,10 @@ def sync_all_kline(
     end = date.fromisoformat(end_date) if end_date else default_end
     effective_concurrency = _effective_data_sync_concurrency(concurrency)
 
-    async def run(session) -> dict[str, Any]:
-        all_codes = await select_all_stock_codes(session)
-        await session.close()
+    async def run(session_factory) -> dict[str, Any]:
+        async with session_factory() as session:
+            all_codes = await select_all_stock_codes(session)
+        # session closed by context manager; remaining work uses no session.
         total = len(all_codes)
 
         def progress(i: int, _total: int, code: str) -> None:
@@ -249,3 +307,38 @@ def sync_all_kline(
             run,
         )
     )
+
+
+@celery_app.task(
+    name="app.tasks.data_tasks.cleanup_stale_task_runs",
+    bind=False,
+    max_retries=0,
+)
+@with_beat_lock("app.tasks.data_tasks.cleanup_stale_task_runs")
+def cleanup_stale_task_runs() -> dict[str, Any]:
+    """Periodically mark zombie task_runs (status=running, stale) as failed.
+
+    Runs every hour via Celery beat. Reuses repository.mark_stale_running_task_runs.
+    Stale threshold is configurable via STALE_TASK_RUN_HOURS (default: 2h).
+    """
+    from app.data.repository import mark_stale_running_task_runs
+    from app.db.session import async_session_factory
+
+    stale_hours = get_settings().stale_task_run_hours
+
+    async def run() -> int:
+        async with async_session_factory() as session:
+            return await mark_stale_running_task_runs(
+                session,
+                older_than=timedelta(hours=stale_hours),
+                error_message="stale running task after periodic cleanup",
+            )
+
+    cleaned = asyncio.run(run())
+    if cleaned:
+        logging.getLogger(__name__).warning(
+            "cleanup_stale_task_runs marked %s stale record(s) as failed (threshold=%dh)",
+            cleaned,
+            stale_hours,
+        )
+    return {"cleaned": cleaned, "stale_hours": stale_hours}

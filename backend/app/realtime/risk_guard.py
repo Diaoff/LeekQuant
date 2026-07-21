@@ -311,6 +311,26 @@ async def trigger_realtime_stop_order(
     tick: RealtimeTick,
     trade_date: date,
 ) -> dict[str, Any] | None:
+    if tick.price is None or tick.price <= 0:
+        logger.warning(
+            "realtime risk guard skipped: invalid tick price",
+            extra={
+                "account_id": position.account_id,
+                "ts_code": position.ts_code,
+                "tick_price": str(tick.price) if tick.price is not None else "None",
+            },
+        )
+        return None
+    if position.avg_cost <= 0:
+        logger.warning(
+            "realtime risk guard skipped: non-positive avg_cost",
+            extra={
+                "account_id": position.account_id,
+                "ts_code": position.ts_code,
+                "avg_cost": str(position.avg_cost),
+            },
+        )
+        return None
     if position.available_shares < 100:
         logger.info(
             "realtime risk guard skipped: insufficient sellable shares",
@@ -391,6 +411,7 @@ async def trigger_realtime_stop_order(
             order_id=int(order["id"]),
             trade_date=trade_date,
             match_mode="limit",
+            realtime_price=tick.price,
         )
         result["match"] = match_result
         logger.info(

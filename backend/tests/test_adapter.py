@@ -20,6 +20,7 @@ from app.backtest.adapter import (
     KBar,
     Position,
     TradeRecord,
+    _LotEntry,
 )
 from app.backtest.strategy_runtime import StrategyExecutionResult
 from app.libs import MyTT
@@ -258,6 +259,12 @@ def generate_signal(ctx):
         config = sample_backtest_config(source_code=sell_strategy, initial_cash=Decimal("100000"))
         runner = BacktestRunner(config)
         runner.positions["000001.SZ"] = Position(ts_code="000001.SZ", shares=1000, avg_cost=Decimal("10"))
+        # T+1 check now uses _open_lots (FIFO) instead of _entry_dates; set up
+        # an entry_date prior to the first kline date so the sell is unlocked.
+        runner._open_lots["000001.SZ"] = [
+            _LotEntry(ts_code="000001.SZ", shares=1000, cost=Decimal("10"), entry_date=date(2026, 4, 30)),
+        ]
+        runner._entry_dates["000001.SZ"] = date(2026, 4, 30)
         klines = generate_klines(is_limit_down=True, days=10)
         result = runner.run({"000001.SZ": klines})
 
@@ -494,7 +501,9 @@ def generate_signal(ctx):
         should_not_raise = lambda: runner.run({"000001.SZ": klines})
         result = should_not_raise()
         assert result["trade_count"] == 0
-        assert result["performance"]["strategy_error_count"] == 10
+        # Step 5 (lookahead fix): window[:-1] is empty on day 1, so the
+        # strategy is only invoked on days 2..10 (9 calls, each raising).
+        assert result["performance"]["strategy_error_count"] == 9
         assert result["strategy_errors"][0]["error_type"] == "RuntimeError"
         assert result["strategy_errors"][0]["error_message"] == "strategy error"
 
@@ -646,9 +655,11 @@ def generate_signal(ctx):
             initial_cash=Decimal("20000"),
         )
         runner = BacktestRunner(config)
+        # Step 5 (lookahead fix): need >=2 days so window[:-1] is non-empty
+        # on td=May 2. Strategy then sees bar1.close in ctx.close[-1].
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
-            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2),
         })
 
         assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
@@ -661,7 +672,9 @@ def generate_signal(ctx):
 def generate_signal(ctx):
     return {"signal_type": "买入", "target_position": 0.4}
 '''
-        trade_date = date(2026, 5, 1)
+        # Step 5: signal generates on td=May 2 (window=[bar1]), so
+        # factor_scores_by_date must be keyed by May 2.
+        trade_date = date(2026, 5, 2)
         config = sample_backtest_config(
             source_code=strategy,
             stock_pool=["000001.SZ", "000002.SZ"],
@@ -675,8 +688,8 @@ def generate_signal(ctx):
         )
         runner = BacktestRunner(config)
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=1),
-            "000002.SZ": generate_klines("000002.SZ", days=1),
+            "000001.SZ": generate_klines("000001.SZ", days=2),
+            "000002.SZ": generate_klines("000002.SZ", days=2),
         })
 
         assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
@@ -689,7 +702,8 @@ def generate_signal(ctx):
         return {"signal_type": "买入", "target_position": 0.4}
     return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.10}
 '''
-        trade_date = date(2026, 5, 1)
+        # Step 5: signal generates on td=May 2 (window=[bar1]).
+        trade_date = date(2026, 5, 2)
         config = sample_backtest_config(
             source_code=strategy,
             stock_pool=["000001.SZ", "000002.SZ"],
@@ -702,8 +716,8 @@ def generate_signal(ctx):
         )
         runner = BacktestRunner(config)
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
-            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2),
         })
 
         assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
@@ -723,9 +737,13 @@ def generate_signal(ctx):
         runner = BacktestRunner(config)
         runner.positions["000001.SZ"] = Position(ts_code="000001.SZ", shares=1000, avg_cost=Decimal("10"))
         runner._entry_dates["000001.SZ"] = date(2026, 4, 30)
+        # T+1 check now uses _open_lots (FIFO) instead of _entry_dates.
+        runner._open_lots["000001.SZ"] = [
+            _LotEntry(ts_code="000001.SZ", shares=1000, cost=Decimal("10"), entry_date=date(2026, 4, 30)),
+        ]
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
-            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1),
+            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2),
         })
 
         assert [t["direction"] for t in result["trade_records"][:2]] == ["全部卖出", "买入"]
@@ -745,9 +763,9 @@ def generate_signal(ctx):
         )
         runner = BacktestRunner(config)
         result = runner.run({
-            "000002.SZ": generate_klines("000002.SZ", days=1, base_price=10.2),
-            "000001.SZ": generate_klines("000001.SZ", days=1, base_price=10.1),
-            "000003.SZ": generate_klines("000003.SZ", days=1, base_price=10.3),
+            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1),
+            "000003.SZ": generate_klines("000003.SZ", days=2, base_price=10.3),
         })
 
         assert [t["ts_code"] for t in result["trade_records"]] == ["000003.SZ", "000001.SZ", "000002.SZ"]
@@ -790,12 +808,19 @@ class TestCandlePathInference:
         """买入使用更优价格（阳线取low，阴线取open）"""
         config = sample_backtest_config(source_code=ALWAYS_BUY_STRATEGY)
         runner = BacktestRunner(config)
+        # Step 5: default fill_price_mode is next_open, which uses the
+        # next day's open. To keep this test focused on candle-path
+        # inference (its original intent), force current_intraday mode.
+        runner._fill_price_mode = lambda: "current_intraday"
         klines = generate_klines(base_price=10.0, days=5)
         result = runner.run({"000001.SZ": klines})
 
         if result["trade_count"] > 0:
             trade = result["trade_records"][0]
-            bar = klines[0]
+            # Step 5: first trade happens on td=May 2 (window=[bar1] for
+            # strategy, fill on bar2 via current_intraday candle-path).
+            # Use bar2 (klines[1]) — the bar whose OHLC drives the fill.
+            bar = klines[1]
             if bar.close >= bar.open:
                 assert trade["price"] <= bar.close
             else:

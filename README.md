@@ -67,7 +67,7 @@
 
 ### 🐳 Docker 一键部署
 ```bash
-docker compose up -d   # 7个服务一键启动
+docker compose up -d   # 8个服务一键启动
 ```
 
 ---
@@ -137,7 +137,7 @@ cp .env.example .env
 ```bash
 docker compose up -d
 ```
-这将启动 7 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`frontend`、`realtime_risk_guard`。
+这将启动 8 个服务：`postgres`、`redis`、`backend`、`celery_worker`、`celery_beat`、`realtime_risk_guard`、`realtime_ws`、`frontend`。
 
 模拟盘实时止盈/止损依赖 `realtime_risk_guard` 后台进程。使用本地脚本启动时请带上 Celery 组件：
 
@@ -171,38 +171,69 @@ leek-quant/
 │   │   │   ├── strategies.py    # 策略 CRUD
 │   │   │   ├── backtests.py     # 回测任务
 │   │   │   ├── watchlist.py     # 自选股管理
-│   │   │   └── factors.py       # M5: 因子定义/值/排行榜/ICIR查询
+│   │   │   ├── factors.py       # 因子定义/值/排行榜/ICIR查询
+│   │   │   ├── signals.py       # 五档信号查询
+│   │   │   ├── sim.py           # 模拟交易 API
+│   │   │   ├── realtime.py      # 实时行情 WS/HTTP
+│   │   │   ├── system.py        # 系统管理/告警
+│   │   │   └── preferences.py   # 用户偏好
 │   │   ├── backtest/            # M3: 回测引擎
 │   │   │   ├── adapter.py       # Python-native 回测引擎
 │   │   │   ├── cost.py          # A股费用计算
-│   │   │   └── signals.py       # 五档信号状态机
+│   │   │   ├── signals.py       # 五档信号状态机
+│   │   │   └── strategy_runtime.py # 策略沙箱执行
 │   │   ├── data/                # M1/M2: 数据层
 │   │   │   ├── providers.py     # 三层数据源
+│   │   │   ├── fetcher.py       # 统一数据拉取
 │   │   │   ├── normalizers.py   # 数据标准化
 │   │   │   └── validators.py    # 数据校验
-│   │   ├── factor/              # M5: 多因子计算、标准化、ICIR分析
+│   │   ├── factor/              # M5: 多因子计算、表达式、ICIR分析
+│   │   │   ├── service.py       # 因子计算与ICIR
+│   │   │   ├── expression.py    # 动态表达式引擎
+│   │   │   └── definitions.py   # 内置因子定义
+│   │   ├── realtime/            # M6: 实时行情
+│   │   │   ├── eastmoney_ws.py  # 东方财富WS解析
+│   │   │   ├── bus.py           # Redis Pub/Sub
+│   │   │   ├── risk_guard.py    # 实时风控
+│   │   │   └── ws_producer.py   # WS生产者服务
+│   │   ├── sim/                 # M4: 模拟交易
+│   │   │   └── service.py       # 委托/成交/持仓/净值
 │   │   ├── core/                # 配置与工具
 │   │   ├── libs/                # 第三方库
 │   │   │   └── MyTT.py          # 指标库(28函数)
 │   │   └── tasks/               # Celery 异步任务
 │   │       ├── celery_app.py    # Celery 应用配置
 │   │       ├── data_tasks.py    # 数据拉取任务
-│   │       └── factor_tasks.py  # M5: 因子计算/分析任务
+│   │       ├── factor_tasks.py  # 因子计算/分析任务
+│   │       ├── signal_tasks.py  # 信号生成任务
+│   │       └── trading_tasks.py # 模拟交易任务
 │   ├── alembic/                 # 数据库迁移
 │   │   └── versions/            # 迁移版本(M0-M5)
-│   ├── tests/                   # 测试套件
+│   ├── tests/                   # 测试套件 (~40个文件)
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── frontend/                     # React 前端
 │   └── src/
 │       ├── pages/               # 页面组件
+│       │   ├── DashboardPage.tsx # 仪表盘首页
 │       │   ├── MarketPage.tsx   # 股票池页面
-│       │   ├── StrategyPage.tsx # 策略编辑器
-│       │   ├── BacktestPage.tsx # 回测结果
-│       │   └── WatchlistPage.tsx# 自选股
+│       │   ├── WatchlistPage.tsx # 自选股
+│       │   ├── StrategyPage.tsx # 策略编辑器(Monaco)
+│       │   ├── BacktestPage.tsx # 回测结果与对比
+│       │   ├── SimulationPage.tsx # 模拟交易
+│       │   ├── SignalsPage.tsx  # 信号日志
+│       │   ├── FactorPage.tsx   # 因子研究与ICIR
+│       │   ├── StatusPage.tsx   # 数据同步与任务
+│       │   └── PreferencesPage.tsx # 偏好设置
+│       ├── hooks/               # 自定义 Hooks
+│       │   ├── useRealtimeTicks.ts # 实时行情
+│       │   ├── useWebSocket.ts    # WS连接管理
+│       │   ├── useTaskEvents.ts   # 任务事件
+│       │   └── useSignalEvents.ts # 信号事件
 │       └── App.tsx              # 路由配置
-├── docs/                         # 设计文档
-│   └── finally-design.md         # 完整技术架构
+├── docs/                         # 设计文档与用户手册
+│   ├── finally-design.md         # 完整技术架构
+│   └── strategy-guide.md         # 策略编写指南
 ├── docker-compose.yml            # 服务编排(7个服务)
 ├── .env.example                  # 环境变量模板
 └── README.md                     # 本文件
@@ -218,10 +249,11 @@ leek-quant/
 | **M1 数据基座** | ✅ 完成 | 股票列表 + 日K线(年分区) + 交易日历 + 三层回退 |
 | **M2 股票池与自选股** | ✅ 完成 | 动态筛选(ST/退市/行业) + 分组管理 + 基础前端 |
 | **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Python-native异步回测 |
-| **M4 信号与模拟交易** | 🚧 开发中 | 五档信号状态机 + 6表闭环 + T+1解锁 |
+| **M4 信号与模拟交易** | ✅ 完成 | 五档信号状态机 + 6表闭环 + T+1解锁 + 费用精确计算 |
 | **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR MVP/API/任务 + 前端因子页 MVP |
-| **M6 实时行情** | 📋 规划中 | 东方财富WebSocket + Redis广播 |
-| **M7 优化完善** | 📋 规划中 | 监控告警 + 参数敏感性 + 完整因子研究图表 + 动态因子表达式 + 文档完善 |
+| **M6a 实时快照** | ✅ 完成 | 东方财富HTTP快照 + Redis Pub/Sub + WebSocket订阅 + 前端实时刷新 |
+| **M6b WebSocket流式** | ✅ 完成 | 东方财富WS自建解析 + 指数退避重连 + 任务/信号WS推送 + 风险守卫 |
+| **M7 优化完善** | 📋 规划中 | 认证系统 + 周/月K线 + CI/CD + 文档完善 |
 
 ---
 
@@ -325,7 +357,7 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 | 实时风控 | GET | `/api/realtime/risk-guard/status` | 实时止盈/止损守护状态 |
 | 系统 | GET | `/api/system/alerts` | 告警列表 |
 | WebSocket | WS | `/ws/realtime` | 实时行情订阅 |
-| WebSocket | WS | `/ws/tasks` | 任务状态推送（M6b 待实现） |
+| WebSocket | WS | `/ws/tasks` | 任务状态推送 |
 
 ---
 

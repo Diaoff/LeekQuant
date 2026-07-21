@@ -392,14 +392,23 @@ async def submit_batch_backtest(
 async def list_backtests(
     req: Request,
     strategy_id: int | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     user_id = _extract_user_id(req)
     clauses = ["b.user_id = :user_id"]
-    params: dict[str, Any] = {"user_id": user_id}
+    params: dict[str, Any] = {"user_id": user_id, "limit": limit, "offset": offset}
     if strategy_id:
         clauses.append("b.strategy_id = :strategy_id")
         params["strategy_id"] = strategy_id
+
+    where_sql = " AND ".join(clauses)
+    count_result = await session.execute(
+        text(f"SELECT COUNT(*) FROM backtest_results b WHERE {where_sql}"),
+        params,
+    )
+    total = int(count_result.scalar_one())
 
     result = await session.execute(
         text(
@@ -412,14 +421,15 @@ async def list_backtests(
                    s.name AS strategy_name
             FROM backtest_results b
             LEFT JOIN strategies s ON s.id = b.strategy_id
-            WHERE {" AND ".join(clauses)}
+            WHERE {where_sql}
             ORDER BY b.created_at DESC
-            LIMIT 50
+            LIMIT :limit OFFSET :offset
             """
         ),
         params,
     )
-    return [_with_target_fields(dict(row)) for row in result.mappings().all()]
+    items = [_with_target_fields(dict(row)) for row in result.mappings().all()]
+    return {"items": items, "total": total, "page": offset // limit + 1, "page_size": limit}
 
 
 @router.get("/{backtest_id}")
@@ -542,3 +552,58 @@ async def backtest_status(backtest_id: str) -> dict[str, Any]:
         else:
             payload["result"] = async_result.result
     return payload
+
+
+@router.post("/{backtest_id}/cancel", status_code=202)
+async def cancel_backtest(
+    backtest_id: str,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Cancel a running backtest by revoking the Celery task.
+
+    - Looks up the DB record by `celery_task_id` (column name `task_id`)
+      and transitions `status` from `running` to `cancelled`.
+    - Calls `celery_app.control.revoke(task_id, terminate=True, signal='SIGTERM')`
+      to abort the worker process.
+    - Returns 404 if no backtest found with the given id, or 409 if it is already
+      in a terminal state (success/failed/cancelled).
+    """
+    # `backtest_id` here is the Celery task_id (string), per the /status endpoint convention
+    task_id = backtest_id
+    user_id = _extract_user_id(req)
+
+    row = (await session.execute(
+        text(
+            "SELECT id, status, user_id FROM backtest_results "
+            "WHERE task_id = :task_id AND user_id = :user_id"
+        ),
+        {"task_id": task_id, "user_id": user_id},
+    )).first()
+
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
+    if row.status in ("success", "failed", "cancelled"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"backtest already in terminal state: {row.status}",
+        )
+
+    # Revoke the Celery task — terminate=True sends SIGTERM to the worker process
+    try:
+        celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+    except Exception as exc:
+        # Fall through to mark DB as cancelled even if revoke failed (e.g. broker down)
+        pass
+
+    await session.execute(
+        text(
+            "UPDATE backtest_results "
+            "SET status = 'cancelled', finished_at = NOW(), updated_at = NOW() "
+            "WHERE id = :id AND status = 'running'"
+        ),
+        {"id": row.id},
+    )
+    await session.commit()
+
+    return {"status": "cancelled", "task_id": task_id}

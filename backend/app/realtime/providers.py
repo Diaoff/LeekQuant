@@ -129,5 +129,11 @@ class EastMoneyRealtimeProvider:
         return [tick for tick in ticks if tick.ts_code in set(self.ts_codes)]
 
     async def stream(self) -> AsyncIterator[RealtimeTick]:
-        raise NotImplementedError("EastMoney realtime protocol adapter is not implemented in M6 minimal loop")
-        yield  # pragma: no cover
+        from app.realtime.eastmoney_ws import EastMoneyWSClient
+
+        client = EastMoneyWSClient(self.ts_codes)
+        try:
+            async for tick in client.stream():
+                yield tick
+        finally:
+            await client.close()

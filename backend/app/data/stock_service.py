@@ -601,6 +601,103 @@ async def add_watchlist_item(
     return dict(result.mappings().one())
 
 
+async def add_watchlist_items_batch(
+    session: AsyncSession,
+    *,
+    ts_codes: list[str],
+    group_name: str,
+    note: str | None = None,
+    user_id: int = LOCAL_USER_ID,
+) -> dict[str, Any]:
+    name = group_name.strip()
+    if not name:
+        raise ValueError("group_name is required")
+
+    codes: list[str] = []
+    seen: set[str] = set()
+    errors: list[dict[str, str]] = []
+    for raw_code in ts_codes:
+        if not str(raw_code).strip():
+            errors.append({"ts_code": str(raw_code), "error": "empty ts_code"})
+            continue
+        code = normalize_ts_code(raw_code)
+        if code in seen:
+            continue
+        seen.add(code)
+        codes.append(code)
+
+    if not codes:
+        raise ValueError("ts_codes is required")
+
+    params = {"user_id": user_id, "group_name": name}
+    code_params: dict[str, Any] = {}
+    placeholders: list[str] = []
+    for index, code in enumerate(codes):
+        key = f"ts_code_{index}"
+        code_params[key] = code
+        placeholders.append(f":{key}")
+
+    existing_result = await session.execute(
+        text(
+            f"""
+            SELECT ts_code
+            FROM stock_basic
+            WHERE ts_code IN ({", ".join(placeholders)})
+            """
+        ),
+        code_params,
+    )
+    existing_codes = {row["ts_code"] for row in existing_result.mappings().all()}
+    valid_codes = [code for code in codes if code in existing_codes]
+    for code in codes:
+        if code not in existing_codes:
+            errors.append({"ts_code": code, "error": "unknown ts_code"})
+
+    await session.execute(
+        text(
+            """
+            INSERT INTO watchlist_groups (user_id, group_name, updated_at)
+            VALUES (:user_id, :group_name, NOW())
+            ON CONFLICT (user_id, group_name) DO NOTHING
+            """
+        ),
+        params,
+    )
+
+    items: list[dict[str, Any]] = []
+    for sort_order, code in enumerate(valid_codes):
+        result = await session.execute(
+            text(
+                """
+                INSERT INTO watchlist (user_id, group_name, ts_code, note, sort_order, updated_at)
+                VALUES (:user_id, :group_name, :ts_code, :note, :sort_order, NOW())
+                ON CONFLICT (user_id, group_name, ts_code) DO UPDATE SET
+                    note = EXCLUDED.note,
+                    sort_order = EXCLUDED.sort_order,
+                    updated_at = NOW()
+                RETURNING id, group_name, ts_code, note, sort_order, added_at
+                """
+            ),
+            {
+                "user_id": user_id,
+                "group_name": name,
+                "ts_code": code,
+                "note": note,
+                "sort_order": sort_order,
+            },
+        )
+        items.append(dict(result.mappings().one()))
+
+    await session.commit()
+    return {
+        "group_name": name,
+        "added_count": len(items),
+        "skipped_count": len(errors),
+        "items": items,
+        "errors": errors,
+    }
+
+
 async def update_watchlist_item(
     session: AsyncSession,
     item_id: int,

@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.stock_service import (
+    add_watchlist_items_batch,
     add_watchlist_item,
     create_watchlist_group,
     delete_watchlist_group,
@@ -33,6 +34,12 @@ class WatchlistUpdateRequest(BaseModel):
     group_name: str | None = Field(default=None, max_length=64)
     note: str | None = None
     sort_order: int | None = None
+
+
+class WatchlistBatchCreateRequest(BaseModel):
+    ts_codes: list[str] = Field(min_length=1)
+    group_name: str = Field(min_length=1, max_length=64)
+    note: str | None = None
 
 
 class WatchlistGroupCreateRequest(BaseModel):
@@ -63,6 +70,23 @@ async def add_watchlist(
             group_name=request.group_name,
             note=request.note,
             sort_order=request.sort_order,
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.post("/batch")
+async def add_watchlist_batch(
+    request: WatchlistBatchCreateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        return await add_watchlist_items_batch(
+            session,
+            ts_codes=request.ts_codes,
+            group_name=request.group_name,
+            note=request.note,
         )
     except ValueError as exc:
         await session.rollback()

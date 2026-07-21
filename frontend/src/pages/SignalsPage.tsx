@@ -1,5 +1,5 @@
 import React from 'react'
-import { AlertTriangle, Filter, RefreshCw, Search, SlidersHorizontal, Trash2, Zap } from 'lucide-react'
+import { AlertTriangle, Filter, Loader2, Plus, RefreshCw, Search, SlidersHorizontal, Trash2, X, Zap } from 'lucide-react'
 import { fetchJson, formatDate, formatDateTime, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
 
@@ -36,7 +36,21 @@ interface SignalSummary {
   blocked_count: number
 }
 
+interface WatchlistGroupOption {
+  group_name: string
+  item_count: number
+}
+
+interface WatchlistBatchResponse {
+  group_name: string
+  added_count: number
+  skipped_count: number
+  items: { ts_code: string }[]
+  errors: { ts_code: string; error: string }[]
+}
+
 const signalTypes = ['', '买入', '增持', '减仓', '卖出', '观望']
+const DEFAULT_GROUP_NAME = '默认'
 
 function signalTone(type: string) {
   if (type === '买入' || type === '增持') return 'bg-red-50 text-red-700 border-red-200'
@@ -68,6 +82,16 @@ export default function SignalsPage() {
   const [triggering, setTriggering] = React.useState(false)
   const [triggerMsg, setTriggerMsg] = React.useState<string | null>(null)
   const [clearing, setClearing] = React.useState(false)
+  const [selectedTsCodes, setSelectedTsCodes] = React.useState<Set<string>>(() => new Set())
+  const [watchlistGroups, setWatchlistGroups] = React.useState<WatchlistGroupOption[]>([
+    { group_name: DEFAULT_GROUP_NAME, item_count: 0 },
+  ])
+  const [watchlistModalOpen, setWatchlistModalOpen] = React.useState(false)
+  const [watchlistGroupName, setWatchlistGroupName] = React.useState(DEFAULT_GROUP_NAME)
+  const [newWatchlistGroupName, setNewWatchlistGroupName] = React.useState('')
+  const [watchlistBusy, setWatchlistBusy] = React.useState(false)
+  const [watchlistMessage, setWatchlistMessage] = React.useState<string | null>(null)
+  const [watchlistError, setWatchlistError] = React.useState<string | null>(null)
 
   const [strategies, setStrategies] = React.useState<{ id: number; name: string }[]>([])
 
@@ -83,6 +107,33 @@ export default function SignalsPage() {
     strategy_id: '',
   })
 
+  const loadGroups = React.useCallback(async () => {
+    try {
+      const data = await fetchJson<WatchlistGroupOption[]>('/api/watchlist/groups')
+      const nextGroups = data.length > 0 ? data : [{ group_name: DEFAULT_GROUP_NAME, item_count: 0 }]
+      setWatchlistGroups(nextGroups)
+      setWatchlistGroupName((current) => nextGroups.some((group) => group.group_name === current) ? current : DEFAULT_GROUP_NAME)
+    } catch {
+      setWatchlistGroups([{ group_name: DEFAULT_GROUP_NAME, item_count: 0 }])
+      setWatchlistGroupName(DEFAULT_GROUP_NAME)
+    }
+  }, [])
+
+  const visibleTsCodes = React.useMemo(() => {
+    const codes: string[] = []
+    const seen = new Set<string>()
+    signals.forEach((signal) => {
+      if (!seen.has(signal.ts_code)) {
+        seen.add(signal.ts_code)
+        codes.push(signal.ts_code)
+      }
+    })
+    return codes
+  }, [signals])
+
+  const selectedCount = selectedTsCodes.size
+  const allVisibleSelected = visibleTsCodes.length > 0 && visibleTsCodes.every((code) => selectedTsCodes.has(code))
+
   const loadSignals = React.useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -95,7 +146,9 @@ export default function SignalsPage() {
       setSignals(data.items)
       setTotal(data.total)
       setSummary(data.summary)
-      setSelected((current) => current ?? data.items[0] ?? null)
+      setSelected((current) => data.items.find((item) => item.id === current?.id) ?? data.items[0] ?? null)
+      const visibleCodes = new Set(data.items.map((item) => item.ts_code))
+      setSelectedTsCodes((current) => new Set([...current].filter((code) => visibleCodes.has(code))))
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
     } finally {
@@ -133,6 +186,70 @@ export default function SignalsPage() {
   React.useEffect(() => {
     void loadSignals()
   }, [loadSignals])
+
+  React.useEffect(() => {
+    void loadGroups()
+  }, [loadGroups])
+
+  const toggleTsCode = React.useCallback((tsCode: string) => {
+    setSelectedTsCodes((current) => {
+      const next = new Set(current)
+      if (next.has(tsCode)) next.delete(tsCode)
+      else next.add(tsCode)
+      return next
+    })
+  }, [])
+
+  const toggleVisibleTsCodes = React.useCallback(() => {
+    setSelectedTsCodes((current) => {
+      const next = new Set(current)
+      if (visibleTsCodes.length > 0 && visibleTsCodes.every((code) => next.has(code))) {
+        visibleTsCodes.forEach((code) => next.delete(code))
+      } else {
+        visibleTsCodes.forEach((code) => next.add(code))
+      }
+      return next
+    })
+  }, [visibleTsCodes])
+
+  const openWatchlistModal = React.useCallback(() => {
+    if (selectedCount === 0) return
+    setWatchlistMessage(null)
+    setWatchlistError(null)
+    setNewWatchlistGroupName('')
+    setWatchlistModalOpen(true)
+  }, [selectedCount])
+
+  const closeWatchlistModal = React.useCallback(() => {
+    if (watchlistBusy) return
+    setWatchlistModalOpen(false)
+    setWatchlistError(null)
+  }, [watchlistBusy])
+
+  const addSelectedToWatchlist = React.useCallback(async () => {
+    const groupName = newWatchlistGroupName.trim() || watchlistGroupName.trim()
+    if (!groupName || selectedTsCodes.size === 0) return
+    setWatchlistBusy(true)
+    setWatchlistError(null)
+    setWatchlistMessage(null)
+    try {
+      const result = await fetchJson<WatchlistBatchResponse>('/api/watchlist/batch', {
+        method: 'POST',
+        body: JSON.stringify({ ts_codes: [...selectedTsCodes], group_name: groupName }),
+      })
+      const skippedText = result.skipped_count > 0 ? `，${formatNumber(result.skipped_count)} 只未加入` : ''
+      setWatchlistMessage(`已加入 ${formatNumber(result.added_count)} 只股票到 ${result.group_name}${skippedText}`)
+      setSelectedTsCodes(new Set())
+      setWatchlistModalOpen(false)
+      setNewWatchlistGroupName('')
+      setWatchlistGroupName(result.group_name)
+      await loadGroups()
+    } catch (caught) {
+      setWatchlistError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setWatchlistBusy(false)
+    }
+  }, [loadGroups, newWatchlistGroupName, selectedTsCodes, watchlistGroupName])
 
   return (
     <div className="space-y-5">
@@ -249,6 +366,12 @@ export default function SignalsPage() {
         </section>
       )}
 
+      {watchlistMessage && (
+        <section className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800">
+          {watchlistMessage}
+        </section>
+      )}
+
       <section className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
         {[
           { label: '买入', value: summary.buy_count, tone: 'text-red-600' },
@@ -267,22 +390,49 @@ export default function SignalsPage() {
 
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
         <div className="overflow-hidden rounded-lg border border-line bg-panel">
-          <div className="flex items-center justify-between border-b border-line px-4 py-3">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              <Filter className="h-4 w-4 text-muted" />
-              信号列表
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-3">
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Filter className="h-4 w-4 text-muted" />
+                信号列表
+              </div>
+              {selectedCount > 0 && (
+                <span className="rounded-md bg-accent/10 px-2 py-1 text-xs font-medium text-accent">
+                  已选 {formatNumber(selectedCount)} 只股票
+                </span>
+              )}
             </div>
-            <span className="text-xs text-muted">{formatNumber(total)} 条</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted">{formatNumber(total)} 条</span>
+              <button
+                type="button"
+                onClick={openWatchlistModal}
+                disabled={selectedCount === 0}
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent px-3 text-sm font-semibold text-accent hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <Plus className="h-4 w-4" />
+                加入自选
+              </button>
+            </div>
           </div>
           {loading ? (
-            <div className="p-4"><Skeleton.Table rows={8} columns={7} /></div>
+            <div className="p-4"><Skeleton.Table rows={8} columns={8} /></div>
           ) : signals.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted">暂无信号</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[920px] w-full text-left text-sm">
+              <table className="min-w-[980px] w-full text-left text-sm">
                 <thead className="bg-tableHead text-xs text-muted">
                   <tr>
+                    <th className="w-12 px-4 py-3 font-medium">
+                      <input
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        onChange={toggleVisibleTsCodes}
+                        aria-label="选择当前页全部股票"
+                        className="h-4 w-4 rounded border-line accent-accent"
+                      />
+                    </th>
                     <th className="px-4 py-3 font-medium">日期</th>
                     <th className="px-4 py-3 font-medium">股票</th>
                     <th className="px-4 py-3 font-medium">信号</th>
@@ -299,6 +449,16 @@ export default function SignalsPage() {
                       onClick={() => setSelected(signal)}
                       className={`cursor-pointer border-t border-line hover:bg-rowHover ${selected?.id === signal.id ? 'bg-rowAlt' : ''}`}
                     >
+                      <td className="px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={selectedTsCodes.has(signal.ts_code)}
+                          onChange={() => toggleTsCode(signal.ts_code)}
+                          onClick={(event) => event.stopPropagation()}
+                          aria-label={`选择 ${signal.ts_code}`}
+                          className="h-4 w-4 rounded border-line accent-accent"
+                        />
+                      </td>
                       <td className="px-4 py-3 text-muted">{formatDate(signal.trade_date)}</td>
                       <td className="px-4 py-3">
                         <div className="font-medium text-ink">{signal.ts_code}</div>
@@ -350,6 +510,83 @@ export default function SignalsPage() {
           )}
         </aside>
       </section>
+
+      {watchlistModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4 py-6" role="dialog" aria-modal="true" aria-labelledby="signals-watchlist-title" onMouseDown={closeWatchlistModal}>
+          <div className="w-full max-w-md rounded-lg border border-line bg-panel shadow-2xl" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="flex items-start justify-between gap-4 border-b border-line px-6 py-5">
+              <div className="min-w-0">
+                <h2 id="signals-watchlist-title" className="text-lg font-bold text-ink">加入自选</h2>
+                <p className="mt-1 text-sm text-muted">已选择 {formatNumber(selectedCount)} 只股票</p>
+              </div>
+              <button
+                type="button"
+                onClick={closeWatchlistModal}
+                disabled={watchlistBusy}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted hover:bg-rowHover hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+                aria-label="关闭"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4 px-6 py-5">
+              <label className="block space-y-1 text-sm text-muted">
+                目标分组
+                <select
+                  value={watchlistGroupName}
+                  onChange={(event) => setWatchlistGroupName(event.target.value)}
+                  disabled={watchlistBusy || newWatchlistGroupName.trim().length > 0}
+                  className="h-10 w-full rounded-md border border-line bg-surface px-3 text-sm text-ink outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {watchlistGroups.map((group) => (
+                    <option key={group.group_name} value={group.group_name}>
+                      {group.group_name}（{formatNumber(group.item_count)}）
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="block space-y-1 text-sm text-muted">
+                新建分组
+                <input
+                  value={newWatchlistGroupName}
+                  onChange={(event) => setNewWatchlistGroupName(event.target.value)}
+                  disabled={watchlistBusy}
+                  placeholder="输入后优先加入新分组"
+                  className="h-10 w-full rounded-md border border-line bg-surface px-3 text-sm text-ink outline-none focus:ring-2 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-50"
+                />
+              </label>
+
+              {watchlistError && (
+                <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+                  {watchlistError}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-line px-6 py-4">
+              <button
+                type="button"
+                onClick={closeWatchlistModal}
+                disabled={watchlistBusy}
+                className="h-9 rounded-md border border-line px-3 text-sm font-semibold text-ink hover:bg-rowHover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void addSelectedToWatchlist()}
+                disabled={watchlistBusy || selectedCount === 0 || !(newWatchlistGroupName.trim() || watchlistGroupName.trim())}
+                className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-accent bg-accent px-3 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {watchlistBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                {watchlistBusy ? '加入中...' : '确认加入'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

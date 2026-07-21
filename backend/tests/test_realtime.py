@@ -135,6 +135,12 @@ async def test_redis_bus_publishes_tick_to_code_channel() -> None:
             calls.append((channel, payload))
             return 2
 
+        async def xadd(self, *_args, **_kwargs) -> str:
+            return "0-0"
+
+        async def xtrim(self, *_args, **_kwargs) -> int:
+            return 0
+
     bus = RedisRealtimeBus(redis_url="redis://test")
     bus._client = FakeRedis()  # type: ignore[assignment]
 
@@ -228,7 +234,7 @@ class FakeBus:
         self.subscription.scripted_ticks.append(tick)
         return 1
 
-    async def open_subscription(self) -> FakeSubscription:
+    async def open_subscription(self, replay_from: str | None = None) -> FakeSubscription:
         return self.subscription
 
 
@@ -323,6 +329,55 @@ async def test_realtime_safe_send_serializes_concurrent_sends() -> None:
     assert {payload["type"] for payload in websocket.payloads} == {"first", "second"}
 
 
+@pytest.mark.asyncio
+async def test_safe_send_json_swallows_connection_reset_error() -> None:
+    """ConnectionResetError should not propagate; return False to caller."""
+    class ResetWebSocket:
+        async def send_json(self, _payload: dict[str, Any]) -> None:
+            raise ConnectionResetError("peer reset")
+
+    assert await _safe_send_json(ResetWebSocket(), {"type": "tick"}) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_safe_send_json_swallows_broken_pipe_error() -> None:
+    """BrokenPipeError should not propagate; return False to caller."""
+    class BrokenPipeWebSocket:
+        async def send_json(self, _payload: dict[str, Any]) -> None:
+            raise BrokenPipeError("broken pipe")
+
+    assert await _safe_send_json(BrokenPipeWebSocket(), {"type": "tick"}) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_safe_send_json_reraises_cancelled_error() -> None:
+    """asyncio.CancelledError must propagate, not be swallowed."""
+    class CancelledWebSocket:
+        async def send_json(self, _payload: dict[str, Any]) -> None:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await _safe_send_json(CancelledWebSocket(), {"type": "tick"})  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_safe_send_json_swallows_unknown_exception_with_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unknown exceptions should be caught, logged, and return False (not propagate)."""
+    class WeirdErrorWebSocket:
+        async def send_json(self, _payload: dict[str, Any]) -> None:
+            raise AttributeError("missing attribute")
+
+    with caplog.at_level("ERROR", logger="app.api.realtime"):
+        result = await _safe_send_json(WeirdErrorWebSocket(), {"type": "tick"})  # type: ignore[arg-type]
+
+    assert result is False
+    assert any(
+        "unexpected websocket send failure" in record.message for record in caplog.records
+    ), "expected logger.exception call for unknown send failure"
+
+
 def test_realtime_websocket_closes_subscription_when_client_disconnects() -> None:
     fake_bus = FakeBus()
 
@@ -347,7 +402,7 @@ def test_realtime_websocket_reports_redis_unavailable() -> None:
         async def publish(self, tick: RealtimeTick) -> int:
             return 0
 
-        async def open_subscription(self) -> FakeSubscription:
+        async def open_subscription(self, replay_from: str | None = None) -> FakeSubscription:
             raise RealtimeUnavailable("redis down")
 
     async def override_bus() -> DownBus:
@@ -491,3 +546,99 @@ async def test_eastmoney_snapshot_maps_quote_price_not_previous_close(monkeypatc
     assert tick.change_pct == Decimal("-0.19")
     assert tick.price != Decimal("10.70")
     assert requested_urls == [EastMoneyRealtimeProvider.SNAPSHOT_URLS[0]]
+
+
+def test_ws_tasks_subscribe_and_receive_events() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/tasks") as websocket:
+            websocket.send_json({"action": "subscribe"})
+            response = websocket.receive_json()
+            assert response["type"] == "subscribed"
+            assert response["channel"] == "celery:task_events"
+
+
+def test_ws_tasks_unsubscribe() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/tasks") as websocket:
+            websocket.send_json({"action": "subscribe"})
+            assert websocket.receive_json()["type"] == "subscribed"
+
+            websocket.send_json({"action": "unsubscribe"})
+            response = websocket.receive_json()
+            assert response["type"] == "unsubscribed"
+            assert response["channel"] == "celery:task_events"
+
+
+def test_ws_tasks_reports_invalid_messages() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/tasks") as websocket:
+            websocket.send_json("not a dict")
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "JSON object" in response["detail"]
+
+
+def test_ws_tasks_reports_unknown_action() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/tasks") as websocket:
+            websocket.send_json({"action": "unknown"})
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "subscribe or unsubscribe" in response["detail"]
+
+
+def test_ws_signals_subscribe_and_receive_events() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/signals") as websocket:
+            websocket.send_json({"action": "subscribe"})
+            response = websocket.receive_json()
+            assert response["type"] == "subscribed"
+            assert response["channel"] == "signal:new"
+
+
+def test_ws_signals_unsubscribe() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/signals") as websocket:
+            websocket.send_json({"action": "subscribe"})
+            assert websocket.receive_json()["type"] == "subscribed"
+
+            websocket.send_json({"action": "unsubscribe"})
+            response = websocket.receive_json()
+            assert response["type"] == "unsubscribed"
+            assert response["channel"] == "signal:new"
+
+
+def test_ws_signals_reports_invalid_messages() -> None:
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/signals") as websocket:
+            websocket.send_json("not a dict")
+            response = websocket.receive_json()
+            assert response["type"] == "error"
+            assert "JSON object" in response["detail"]
+
+
+def test_eastmoney_stream_method_delegates_to_ws_client(monkeypatch) -> None:
+    from app.realtime import providers
+
+    class FakeWSClient:
+        def __init__(self, ts_codes):
+            self.ts_codes = ts_codes
+
+        async def stream(self):
+            yield RealtimeTick(ts_code="000001.SZ", price="10.5")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("app.realtime.eastmoney_ws.EastMoneyWSClient", FakeWSClient)
+
+    async def run_test():
+        provider = EastMoneyRealtimeProvider(["000001.SZ"])
+        ticks = []
+        async for tick in provider.stream():
+            ticks.append(tick)
+        return ticks
+
+    ticks = asyncio.get_event_loop().run_until_complete(run_test())
+    assert len(ticks) == 1
+    assert ticks[0].ts_code == "000001.SZ"

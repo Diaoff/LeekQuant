@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -9,8 +10,10 @@ from typing import TypeAlias
 
 import redis as redis_mod
 from requests.exceptions import ConnectionError as ReqConnectionError
+from urllib.error import URLError
 
 from app.core.config import get_settings
+from app.data.circuit_breaker import CircuitBreaker
 from app.data.providers import (
     DataProvider,
     DataProviderError,
@@ -28,13 +31,31 @@ __all__ = [
 
 ProviderList: TypeAlias = Iterable[DataProvider]
 
-_RETRYABLE = (ReqConnectionError, TimeoutError, OSError)
+# Retryable errors — expanded to include URLError so transient network errors
+# (which _http_json previously wrapped as non-retryable DataProviderError) are retried.
+_RETRYABLE = (ReqConnectionError, TimeoutError, OSError, URLError)
 _PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 _REDIS_CONFIG_KEY = "leek:provider_order"
 _PROVIDER_ORDER: list[str] = [
     cls.name for cls in sorted(PROVIDER_REGISTRY.values(), key=lambda provider_cls: provider_cls.priority_default)
 ]
 _REDIS_CLIENT: redis_mod.Redis | None = None
+
+# Module-level circuit breaker singleton (lazy-initialized)
+_BREAKER: CircuitBreaker | None = None
+
+
+def _get_breaker() -> CircuitBreaker:
+    global _BREAKER
+    if _BREAKER is None:
+        _BREAKER = CircuitBreaker()
+    return _BREAKER
+
+
+def reset_breaker_for_tests() -> None:
+    """Test helper — clear the cached circuit breaker singleton."""
+    global _BREAKER
+    _BREAKER = None
 
 
 def _get_redis() -> redis_mod.Redis | None:
@@ -73,7 +94,17 @@ def configure_providers(ordered_names: list[str]) -> None:
 
 def default_providers() -> list[DataProvider]:
     order = _load_order_from_redis() or _PROVIDER_ORDER
-    return [PROVIDER_REGISTRY[n]() for n in order if n in PROVIDER_REGISTRY]
+    seen = set()
+    result = []
+    for n in order:
+        if n in PROVIDER_REGISTRY and n not in seen:
+            result.append(PROVIDER_REGISTRY[n]())
+            seen.add(n)
+    for n, cls in PROVIDER_REGISTRY.items():
+        if n not in seen:
+            result.append(cls())
+            seen.add(n)
+    return result
 
 
 def providers_for_capability(capability: str) -> list[DataProvider]:
@@ -125,7 +156,26 @@ def fetch_with_fallback(
     method_name: str,
     *args,
     proxy_url: str | None = None,
+    data_type: str | None = None,
+    session=None,
 ) -> tuple[str, list]:
+    """Fetch with provider fallback, retry, and circuit breaker.
+
+    Args:
+        providers: Ordered list of providers (primary first).
+        method_name: Provider method to call (e.g. "fetch_kline").
+        *args: Positional args passed to the provider method.
+        proxy_url: Optional HTTP proxy URL for Chinese data sources.
+        data_type: If provided (and session too), enables circuit-breaker checks
+            against `data_update_state.failure_count` for each provider.
+        session: AsyncSession for circuit-breaker lookups. If None, breaker is bypassed.
+
+    Returns:
+        (provider_name, records) tuple from the first successful provider.
+
+    Raises:
+        DataProviderError: All providers failed or returned empty.
+    """
     errors: list[str] = []
     capability = METHOD_CAPABILITIES.get(method_name)
     provider_list = [
@@ -133,9 +183,24 @@ def fetch_with_fallback(
     ]
     if not provider_list:
         raise DataProviderError(f"no enabled providers support {capability or method_name}")
+
+    breaker = _get_breaker() if data_type else None
+    settings = get_settings()
+    max_retries = settings.data_max_retries
+
     with _data_proxy_ctx(proxy_url):
         for provider in provider_list:
-            for attempt in range(3):
+            # Circuit breaker check — skip provider if open
+            if breaker is not None and session is not None and data_type:
+                try:
+                    is_open = _breaker_sync_check(breaker, session, data_type, provider.name)
+                except Exception:
+                    is_open = False  # fail-open on breaker errors
+                if is_open:
+                    errors.append(f"{provider.name}: circuit open (skipped)")
+                    continue
+
+            for attempt in range(max_retries):
                 try:
                     records = _try_once(provider, method_name, args)
                     if records:
@@ -144,8 +209,10 @@ def fetch_with_fallback(
                     break
                 except _RETRYABLE as exc:
                     msg = f"{provider.name}: {exc}"
-                    if attempt < 2:
-                        time.sleep(1 + attempt)
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with full jitter: 2^attempt + [0, 1)
+                        backoff = (2 ** attempt) + random.random()
+                        time.sleep(min(backoff, 30.0))
                         continue
                     errors.append(msg)
                     break
@@ -153,3 +220,20 @@ def fetch_with_fallback(
                     errors.append(f"{provider.name}: {exc}")
                     break
     raise DataProviderError("; ".join(errors) or "all providers failed")
+
+
+def _breaker_sync_check(breaker: CircuitBreaker, session, data_type: str, source: str) -> bool:
+    """Synchronous wrapper for breaker.is_open — runs the coroutine via asyncio.
+
+    Returns False on any error (fail-open).
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're inside an async context — caller should pass an async-friendly session
+            # Fall back to fail-open rather than blocking the event loop
+            return False
+        return loop.run_until_complete(breaker.is_open(session, data_type, source))
+    except Exception:
+        return False

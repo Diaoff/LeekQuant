@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
+from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,76 @@ RISK_CONFIG_FIELDS = (
 
 MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
 MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
+
+
+async def _fetch_benchmark_klines(session: AsyncSession, benchmark_code: str, start_date: date, end_date: date) -> list[dict[str, Any]]:
+    result = await session.execute(
+        text(
+            """
+            SELECT trade_date, close
+            FROM daily_kline
+            WHERE ts_code = :code
+              AND trade_date BETWEEN :start AND :end
+              AND close IS NOT NULL
+            ORDER BY trade_date
+            """
+        ),
+        {"code": benchmark_code, "start": start_date, "end": end_date},
+    )
+    return [dict(row) for row in result.mappings().all()]
+
+
+def _compute_benchmark_metrics(
+    strategy_values: list[float],
+    strategy_dates: list[str],
+    benchmark_rows: list[dict[str, Any]],
+    benchmark_code: str = "",
+) -> dict[str, Any]:
+    if not benchmark_rows or len(strategy_values) < 2:
+        return {}
+
+    bm_dates = {str(r["trade_date"]): float(r["close"]) for r in benchmark_rows}
+    bm_values = [bm_dates.get(d) for d in strategy_dates]
+    bm_values = [v for v in bm_values if v is not None]
+
+    if len(bm_values) < 2 or bm_values[0] <= 0:
+        return {}
+
+    bm_returns = [(bm_values[i] - bm_values[i - 1]) / bm_values[i - 1] for i in range(1, len(bm_values))]
+    bm_total_return = (bm_values[-1] / bm_values[0]) - 1
+
+    from datetime import date as date_cls
+    d0 = date_cls.fromisoformat(strategy_dates[0])
+    d1 = date_cls.fromisoformat(strategy_dates[-1])
+    years = max((d1 - d0).days / 365.25, 0.01)
+    bm_annual_return = ((1 + bm_total_return) ** (1 / years)) - 1
+
+    strategy_total = (strategy_values[-1] / strategy_values[0]) - 1 if strategy_values[0] > 0 else 0
+    strategy_annual = ((1 + strategy_total) ** (1 / years)) - 1
+    alpha = strategy_annual - bm_annual_return
+
+    import statistics
+    min_len = min(len(strategy_values), len(bm_values))
+    s_returns = [(strategy_values[i] - strategy_values[i - 1]) / strategy_values[i - 1] for i in range(1, min_len)]
+    b_returns = bm_returns[:min_len - 1] if len(bm_returns) >= min_len - 1 else bm_returns
+
+    if len(s_returns) == len(b_returns) and len(s_returns) > 1:
+        excess = [s - b for s, b in zip(s_returns, b_returns, strict=False)]
+        tracking_error = statistics.stdev(excess) * (252 ** 0.5)
+        information_ratio = (strategy_annual - bm_annual_return) / tracking_error if tracking_error > 0 else 0
+    else:
+        tracking_error = 0
+        information_ratio = 0
+
+    return {
+        "benchmark_code": benchmark_code,
+        "benchmark_total_return": round(bm_total_return, 8),
+        "benchmark_annual_return": round(bm_annual_return, 8),
+        "alpha": round(alpha, 8),
+        "tracking_error": round(tracking_error, 8),
+        "information_ratio": round(information_ratio, 4),
+        "benchmark_curve": [{"date": d, "value": v} for d, v in zip(strategy_dates, bm_values, strict=False)],
+    }
 
 
 def _decode_json_dict(value: Any) -> dict[str, Any]:
@@ -401,12 +472,25 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0.0)),
                 trailing_activation_pct=float(risk_cfg.get("trailing_activation_pct", 0.0)),
                 time_stop_days=int(risk_cfg.get("time_stop_days", 0)),
+                slippage_pct=float(risk_cfg.get("slippage_pct", 0.001)),
                 factor_scores_by_date=factor_scores,
             )
 
             try:
                 runner = BacktestRunner(config)
                 results = runner.run(all_klines)
+
+                benchmark_code = bt_row.get("benchmark_code")
+                if benchmark_code:
+                    bm_rows = await _fetch_benchmark_klines(session, benchmark_code, bt_row["start_date"], bt_row["end_date"])
+                    if bm_rows:
+                        strategy_dates = [e["date"] for e in results.get("equity_curve", [])]
+                        strategy_values = [e["total_asset"] for e in results.get("equity_curve", [])]
+                        bm_metrics = _compute_benchmark_metrics(strategy_values, strategy_dates, bm_rows, benchmark_code)
+                        if bm_metrics:
+                            results["benchmark_metrics"] = bm_metrics
+                            if "performance" in results:
+                                results["performance"]["benchmark"] = bm_metrics
 
                 engine = "python_native"
                 results["engine"] = engine
@@ -482,6 +566,31 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
 
     try:
         return asyncio.run(_run())
+    except SoftTimeLimitExceeded:
+        # Soft time limit (task_soft_time_limit=1500s) exceeded — graceful cleanup.
+        # Mark DB record as failed with explicit reason. Without this handler, Celery
+        # would be hard-killed at task_time_limit=1800s leaving status='running'.
+        import asyncio as _asyncio
+
+        async def _mark_timeout() -> None:
+            async with async_session_factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE backtest_results "
+                        "SET status = 'failed', "
+                        "    error_message = 'soft time limit exceeded (task_soft_time_limit=1500s)', "
+                        "    finished_at = NOW() "
+                        "WHERE id = :id AND status = 'running'"
+                    ),
+                    {"id": backtest_id},
+                )
+                await session.commit()
+
+        try:
+            _asyncio.run(_mark_timeout())
+        except Exception:
+            pass
+        return {"error": f"backtest {backtest_id} timed out (soft time limit exceeded)"}
     except Exception as exc:
         import traceback
         return {"error": f"unhandled exception in backtest {backtest_id}: {traceback.format_exc()}"}

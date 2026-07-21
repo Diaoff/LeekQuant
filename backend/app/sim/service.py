@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal, ROUND_FLOOR
@@ -16,6 +17,8 @@ from app.backtest.signals import SignalInput, apply_cn_rules, map_signal_to_acti
 from app.data.providers import DataProviderError
 from app.realtime.models import RealtimeTick
 from app.realtime.providers import EastMoneyRealtimeProvider
+
+logger = logging.getLogger(__name__)
 
 LOT_SIZE = 100
 MONEY_QUANT = Decimal("0.0001")
@@ -339,10 +342,17 @@ async def list_positions_with_realtime_valuation(
     return serialized
 
 
-async def get_account_or_404(session: AsyncSession, account_id: int, user_id: int) -> dict[str, Any]:
+async def get_account_or_404(
+    session: AsyncSession,
+    account_id: int,
+    user_id: int,
+    *,
+    for_update: bool = False,
+) -> dict[str, Any]:
+    suffix = " FOR UPDATE OF a" if for_update else ""
     result = await session.execute(
         text(
-            """
+            f"""
             SELECT a.id, a.user_id, a.strategy_id, a.name, a.initial_cash, a.available_cash,
                    a.frozen_cash, a.total_asset, a.status, a.config, a.created_at, a.updated_at,
                    p.value AS user_trading_fee_config
@@ -350,6 +360,7 @@ async def get_account_or_404(session: AsyncSession, account_id: int, user_id: in
             LEFT JOIN user_preferences p
               ON p.user_id = a.user_id AND p.key = 'trading_fee'
             WHERE a.id = :id AND a.user_id = :user_id
+            {suffix}
             """
         ),
         {"id": account_id, "user_id": user_id},
@@ -571,16 +582,29 @@ async def _get_latest_kline_before_or_on(session: AsyncSession, ts_code: str, tr
     return dict(row) if row else None
 
 
-async def _get_position(session: AsyncSession, account_id: int, ts_code: str) -> dict[str, Any] | None:
+async def _get_position(
+    session: AsyncSession,
+    account_id: int,
+    ts_code: str,
+    *,
+    for_update: bool = False,
+) -> dict[str, Any] | None:
+    suffix = " FOR UPDATE" if for_update else ""
     result = await session.execute(
-        text("SELECT * FROM sim_positions WHERE account_id = :account_id AND ts_code = :ts_code"),
+        text(f"SELECT * FROM sim_positions WHERE account_id = :account_id AND ts_code = :ts_code{suffix}"),
         {"account_id": account_id, "ts_code": ts_code},
     )
     row = result.mappings().one_or_none()
     return dict(row) if row else None
 
 
-def _resolve_match_price(order: dict[str, Any], kline: dict[str, Any], match_mode: str) -> Decimal:
+def _resolve_match_price(
+    order: dict[str, Any],
+    kline: dict[str, Any],
+    match_mode: str,
+    *,
+    realtime_price: Decimal | None = None,
+) -> Decimal:
     if match_mode == "open":
         if kline.get("open") is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="daily open price not found")
@@ -591,6 +615,15 @@ def _resolve_match_price(order: dict[str, Any], kline: dict[str, Any], match_mod
         return _dec(kline["close"])
 
     order_price = _dec(order.get("price"))
+    if realtime_price is not None:
+        tick_price = _dec(realtime_price)
+        direction = str(order.get("direction") or "")
+        if direction == "买入" and order_price < tick_price:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="限价未触达")
+        if direction == "卖出" and order_price > tick_price:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="限价未触达")
+        return order_price
+
     low = _dec(kline.get("low")) if kline.get("low") is not None else None
     high = _dec(kline.get("high")) if kline.get("high") is not None else None
     if low is None or high is None:
@@ -700,7 +733,7 @@ async def generate_order_from_signal(
     auto_match: bool = False,
     auto_match_mode: str = "close",
 ) -> dict[str, Any]:
-    account = await get_account_or_404(session, account_id, user_id)
+    account = await get_account_or_404(session, account_id, user_id, for_update=True)
     if account["status"] != "active":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="account is not active")
 
@@ -708,7 +741,7 @@ async def generate_order_from_signal(
         request = replace(request, reason=exit_reason_override)
 
     calendar = await _get_trade_calendar(session, request.trade_date)
-    position = await _get_position(session, account_id, request.ts_code)
+    position = await _get_position(session, account_id, request.ts_code, for_update=True)
     shares = int(position["shares"]) if position else 0
     market_value = _dec(position["market_value"]) if position else Decimal("0")
     total_asset = _dec(account["total_asset"])
@@ -876,7 +909,7 @@ async def generate_order_from_signal(
         pending_result = await session.execute(
             text(
                 """
-                SELECT id
+                SELECT *
                 FROM sim_orders
                 WHERE account_id = :account_id
                   AND ts_code = :ts_code
@@ -939,18 +972,23 @@ async def generate_order_from_signal(
     order = dict(result.mappings().one())
 
     if direction == "买入":
-        await session.execute(
+        result = await session.execute(
             text(
                 """
                 UPDATE sim_accounts
                 SET available_cash = available_cash - :frozen_amount,
                     frozen_cash = frozen_cash + :frozen_amount,
                     updated_at = NOW()
-                WHERE id = :account_id
+                WHERE id = :account_id AND available_cash >= :frozen_amount
                 """
             ),
             {"account_id": account_id, "frozen_amount": frozen_amount},
         )
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="insufficient available cash (concurrent order may have consumed funds)",
+            )
         await session.execute(
             text(
                 """
@@ -965,7 +1003,7 @@ async def generate_order_from_signal(
             {"account_id": account_id, "amount": frozen_amount, "remark": f"买入委托冻结 {request.ts_code}"},
         )
     else:
-        await session.execute(
+        result = await session.execute(
             text(
                 """
                 UPDATE sim_positions
@@ -973,10 +1011,16 @@ async def generate_order_from_signal(
                     frozen_shares = frozen_shares + :volume,
                     updated_at = NOW()
                 WHERE account_id = :account_id AND ts_code = :ts_code
+                  AND available_shares >= :volume
                 """
             ),
             {"account_id": account_id, "ts_code": request.ts_code, "volume": volume},
         )
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="insufficient available shares (concurrent order may have consumed shares)",
+            )
 
     match_result: dict[str, Any] | None = None
     if auto_match:
@@ -1003,6 +1047,7 @@ async def match_order(
     order_id: int,
     trade_date: date | None = None,
     match_mode: str = "close",
+    realtime_price: Decimal | None = None,
     auto_commit: bool = True,
 ) -> dict[str, Any]:
     if match_mode not in {"close", "open", "limit"}:
@@ -1046,29 +1091,81 @@ async def match_order(
             is_limit_down=is_limit_down,
         )
         if action == "BLOCKED":
+            # P1-C fix: transition pending order to 'rejected' on BLOCKED
+            # so it no longer lingers in '待成交' status with funds/shares
+            # frozen. Mirror cancel_order's unfreeze logic so account
+            # balances are restored immediately.
             await session.execute(
                 text(
                     """
                     UPDATE sim_orders
-                    SET reject_reason = :reason,
+                    SET status = 'rejected',
+                        reject_reason = :reason,
                         update_time = NOW()
                     WHERE id = :order_id
                     """
                 ),
                 {"order_id": order_id, "reason": reason},
             )
+            account_id = int(order["account_id"])
+            if order["direction"] == "买入":
+                frozen_amount = _dec(order.get("frozen_amount"))
+                if frozen_amount > 0:
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE sim_accounts
+                            SET available_cash = available_cash + :amount,
+                                frozen_cash = frozen_cash - :amount,
+                                updated_at = NOW()
+                            WHERE id = :account_id
+                            """
+                        ),
+                        {"account_id": account_id, "amount": frozen_amount},
+                    )
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO sim_cash_flow (account_id, flow_type, amount, balance_after, remark)
+                            VALUES (
+                                :account_id, '解冻', CAST(:amount AS NUMERIC),
+                                (SELECT available_cash FROM sim_accounts WHERE id = :account_id),
+                                :remark
+                            )
+                            """
+                        ),
+                        {
+                            "account_id": account_id,
+                            "amount": frozen_amount,
+                            "remark": f"BLOCKED 解冻 {order['ts_code']} (order_id={order_id})",
+                        },
+                    )
+            else:  # 卖出
+                await session.execute(
+                    text(
+                        """
+                        UPDATE sim_positions
+                        SET available_shares = available_shares + :volume,
+                            frozen_shares = frozen_shares - :volume,
+                            updated_at = NOW()
+                        WHERE account_id = :account_id AND ts_code = :ts_code
+                        """
+                    ),
+                    {"account_id": account_id, "ts_code": order["ts_code"], "volume": int(order["volume"])},
+                )
             if auto_commit:
                 await session.commit()
             pending_order = dict(order)
+            pending_order["status"] = "rejected"
             pending_order["reject_reason"] = reason
             return {
                 "order": _serialize_row(pending_order),
-                "status": "待成交",
+                "status": "已拒绝",
                 "matched": False,
                 "reason": reason,
                 "match_mode_used": match_mode,
             }
-        price = _resolve_match_price(order, kline, match_mode)
+        price = _resolve_match_price(order, kline, match_mode, realtime_price=realtime_price)
 
     account_id = int(order["account_id"])
     ts_code = str(order["ts_code"])
@@ -1168,22 +1265,23 @@ async def match_order(
             text(
                 """
                 UPDATE sim_positions
-                SET shares = shares - :volume,
-                    frozen_shares = frozen_shares - :volume,
+                SET shares = shares - CAST(:volume AS INTEGER),
+                    frozen_shares = frozen_shares - CAST(:volume AS INTEGER),
                     current_price = CAST(:price AS NUMERIC),
-                    market_value = (shares - :volume) * CAST(:price AS NUMERIC),
+                    market_value = (shares - CAST(:volume AS INTEGER)) * CAST(:price AS NUMERIC),
                     unrealized_pnl = CASE
-                        WHEN shares - :volume <= 0
-                            THEN (:amount - :total_fee) - (avg_cost * :volume)
-                        ELSE (CAST(:price AS NUMERIC) - avg_cost) * (shares - :volume)
+                        WHEN shares - CAST(:volume AS INTEGER) <= 0
+                            THEN 0
+                        ELSE (CAST(:price AS NUMERIC) - avg_cost) * (shares - CAST(:volume AS INTEGER))
                     END,
                     profit_rate = CASE
-                        WHEN avg_cost <= 0 THEN 0
-                        WHEN shares - :volume <= 0
-                            THEN (((:amount - :total_fee) / :volume) - avg_cost) / avg_cost
+                        WHEN shares - CAST(:volume AS INTEGER) <= 0
+                            THEN 0
+                        WHEN avg_cost <= 0
+                            THEN 0
                         ELSE (CAST(:price AS NUMERIC) - avg_cost) / avg_cost
                     END,
-                    available_shares = LEAST(available_shares, shares - :volume),
+                    available_shares = LEAST(available_shares, shares - CAST(:volume AS INTEGER)),
                     updated_at = NOW()
                 WHERE account_id = :account_id AND ts_code = :ts_code
                 """
@@ -1439,8 +1537,13 @@ async def check_stop_conditions(session: AsyncSession, *, account_id: int, nav_d
 
 async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int:
     calendar = await _get_trade_calendar(session, trade_date)
-    if not calendar or not calendar["is_open"]:
+    if calendar and not calendar["is_open"]:
         return 0
+    if not calendar:
+        logger.warning(
+            "trade_calendar missing date %s — proceeding anyway (today_buys will be empty, unlocking all eligible positions)",
+            trade_date,
+        )
     result = await session.execute(
         text(
             """

@@ -95,7 +95,7 @@ export default function DashboardPage() {
       fetchJson<{ status: string }>('/health'),
       fetchJson<{ result: number }>('/api/health/db'),
       fetchJson<DataMetrics>('/api/data/status'),
-      fetchJson<BacktestSummary[]>('/api/backtests?limit=5'),
+      fetchJson<{ items: BacktestSummary[]; total: number } | BacktestSummary[]>('/api/backtests?limit=5'),
       fetchJson<WatchlistSummary>('/api/watchlist/summary'),
     ])
     if (apiResult.status === 'fulfilled') setApiHealth({ state: 'ok', message: `服务状态：${apiResult.value.status}` })
@@ -104,7 +104,10 @@ export default function DashboardPage() {
     else setDbHealth({ state: 'error', message: `数据库检查失败：${dbResult.reason.message}` })
     if (dataResult.status === 'fulfilled') setMetrics(dataResult.value)
     else setError(`数据状态加载失败：${dataResult.reason.message}`)
-    if (backtestsResult.status === 'fulfilled') setRecentBacktests(backtestsResult.value)
+    if (backtestsResult.status === 'fulfilled') {
+      const raw = backtestsResult.value
+      setRecentBacktests(Array.isArray(raw) ? raw : (raw.items ?? []))
+    }
     if (watchlistResult.status === 'fulfilled') setWatchlistSummary(watchlistResult.value)
     setLoading(false)
   }, [])

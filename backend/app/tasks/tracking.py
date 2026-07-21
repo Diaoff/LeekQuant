@@ -5,6 +5,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from decimal import Decimal
+from functools import wraps
 from time import perf_counter
 from typing import Any
 
@@ -27,6 +28,28 @@ def _jsonable(value: Any) -> Any:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(_jsonable(value), ensure_ascii=False, default=str)
+
+
+def with_session(
+    fn: Callable[..., Awaitable[Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> Callable[[Any], Awaitable[Any]]:
+    """Wrap an async fn(session, *args, **kwargs) so it accepts a session_factory.
+
+    The wrapper opens a fresh session via ``async with session_factory() as session:``
+    and forwards it to ``fn``. This decouples the task body's session from
+    the tracker_session used by ``_run_tracked`` for status bookkeeping,
+    so calling ``session.close()`` inside the task body no longer breaks
+    the final ``_finish_task_run`` call.
+    """
+
+    @wraps(fn)
+    async def wrapper(session_factory: Any) -> Any:
+        async with session_factory() as session:
+            return await fn(session, *args, **kwargs)
+
+    return wrapper
 
 
 async def _claim_task_run(session, task_name: str, task_id: str | None, payload: dict[str, Any]) -> int:
@@ -115,22 +138,33 @@ async def _run_tracked(
     payload: dict[str, Any],
     fn: Callable[[Any], Awaitable[dict[str, Any]]],
 ) -> dict[str, Any]:
+    """Run a tracked Celery task body with status bookkeeping.
+
+    The tracker_session is reserved exclusively for ``_claim_task_run`` /
+    ``_finish_task_run``. ``fn`` receives ``async_session_factory`` (a
+    callable returning an async context manager) and is expected to open
+    its own session via ``async with session_factory() as session:``.
+    This decouples the task body's session lifecycle from the tracker
+    session — previously, calling ``session.close()`` inside the task body
+    would invalidate the same session used by ``_finish_task_run``,
+    leaving task_runs stuck in ``running`` status.
+    """
     started = perf_counter()
-    async with async_session_factory() as session:
-        run_id = await _claim_task_run(session, task_name, task_id, payload)
+    async with async_session_factory() as tracker_session:
+        run_id = await _claim_task_run(tracker_session, task_name, task_id, payload)
         try:
-            result = await fn(session)
+            result = await fn(async_session_factory)
         except Exception as exc:
             duration_ms = int((perf_counter() - started) * 1000)
             try:
-                await session.rollback()
+                await tracker_session.rollback()
             except Exception as rollback_exc:  # pragma: no cover - original failure is more actionable.
                 exc.add_note(f"Failed to rollback task session: {rollback_exc}")
             try:
-                await _finish_task_run(session, run_id, "failed", duration_ms, error_message=str(exc))
+                await _finish_task_run(tracker_session, run_id, "failed", duration_ms, error_message=str(exc))
             except Exception as finish_exc:
                 exc.add_note(f"Failed to record task failure: {finish_exc}")
             raise
         duration_ms = int((perf_counter() - started) * 1000)
-        await _finish_task_run(session, run_id, "success", duration_ms, result=result)
+        await _finish_task_run(tracker_session, run_id, "success", duration_ms, result=result)
         return _jsonable(result)
