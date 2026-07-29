@@ -14,8 +14,6 @@ from app.data.fetcher import DataProvider, DataProviderError, default_providers,
 from app.data.normalizers import normalize_ts_code
 from app.data.repository import (
     create_alert,
-    record_update_failure,
-    record_update_success,
     upsert_stock_fundamentals,
 )
 from app.data.stock_scope import supported_stock_sql_condition
@@ -821,8 +819,6 @@ async def sync_fundamentals(
                             proxy_url=get_data_proxy_url(),
                         )
                         count = await upsert_stock_fundamentals(wk_session, records)
-                        latest = max((record.report_date for record in records), default=None)
-                        await record_update_success(wk_session, "fundamentals", source, ts_code=code, last_trade_date=latest)
                         await wk_session.commit()
                         return {"ts_code": code, "source": source, "count": count}
                     except Exception as exc:
@@ -831,7 +827,6 @@ async def sync_fundamentals(
                             await wk_session.rollback()
                         except Exception:
                             pass
-                        await record_update_failure(wk_session, "fundamentals", "fallback", message, ts_code=code)
                         await wk_session.commit()
                         return {"ts_code": code, "error": message}
 
@@ -855,13 +850,10 @@ async def sync_fundamentals(
             )
             assert session is not None
             count = await upsert_stock_fundamentals(session, records)
-            latest = max((record.report_date for record in records), default=None)
-            await record_update_success(session, "fundamentals", source, ts_code=code, last_trade_date=latest)
             return {"ts_code": code, "source": source, "count": count}
         except Exception as exc:
             message = str(exc)
             assert session is not None
-            await record_update_failure(session, "fundamentals", "fallback", message, ts_code=code)
             return {"ts_code": code, "error": message}
 
     if commit_each and concurrency > 1:

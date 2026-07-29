@@ -123,7 +123,6 @@ async def test_get_sync_progress_builds_scope_query_for_ts_codes() -> None:
         "total": 1,
         "caught_up": 1,
         "remaining": 0,
-        "failed": 0,
         "not_caught_up_codes": [],
     }
     session = ResultCaptureSession(row)
@@ -131,19 +130,23 @@ async def test_get_sync_progress_builds_scope_query_for_ts_codes() -> None:
     progress = await get_sync_progress(session, ts_codes=["000001.SZ"])
 
     sql = str(session.statement)
-    # The four CTEs that define the progress snapshot must all be present.
-    assert "latest" in sql and "scope" in sql and "dk" in sql and "dus" in sql
+    # The three CTEs that define the progress snapshot must all be present.
+    # NOTE: progress is based on daily_kline truth only — the old dus
+    # (data_update_state) CTE is gone by design, and so is the failed count.
+    assert "latest" in sql and "scope" in sql and "dk" in sql
+    assert "data_update_state" not in sql
+    # Scope must exclude delisted stocks.
+    assert "is_delisted = FALSE" in sql
     # ts_codes scope: flag on, codes bound, watchlist flag off.
     assert session.params["has_ts_codes"] is True
     assert session.params["ts_codes"] == ["000001.SZ"]
     assert session.params["has_watchlist"] is False
-    # Returned shape is the contract the API serializes.
+    # Returned shape is the contract the API serializes (no failed field).
     assert progress == {
         "latest_open_day": date(2026, 5, 31),
         "total": 1,
         "caught_up": 1,
         "remaining": 0,
-        "failed": 0,
         "not_caught_up_codes": [],
     }
 
@@ -154,7 +157,6 @@ async def test_get_sync_progress_builds_scope_query_for_watchlist() -> None:
         "total": 3,
         "caught_up": 2,
         "remaining": 1,
-        "failed": 0,
         "not_caught_up_codes": ["600000.SH"],
     }
     session = ResultCaptureSession(row)

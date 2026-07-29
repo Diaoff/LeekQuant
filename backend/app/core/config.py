@@ -39,8 +39,6 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_format: str = Field(default="json", alias="LOG_FORMAT")
     metrics_enabled: bool = Field(default=True, alias="METRICS_ENABLED")
-    circuit_breaker_threshold: int = Field(default=50, alias="CIRCUIT_BREAKER_THRESHOLD")
-    circuit_breaker_cooldown_seconds: int = Field(default=300, alias="CIRCUIT_BREAKER_COOLDOWN_SECONDS")
     data_max_retries: int = Field(default=3, alias="DATA_MAX_RETRIES")
     # Celery task time limits (seconds). The app-wide defaults bound any task
     # that does not set its own limit.

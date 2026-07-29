@@ -22,20 +22,21 @@ from app.data.repository import (
     mark_task_run_failed,
     mark_stale_running_task_runs,
     mark_task_run_queue_failed,
-    reset_failed_items_for_retry,
 )
 from app.db.session import get_session
 from app.preferences.service import get_full_kline_sync_concurrency
 from app.tasks.beat_lock import get_beat_lock
 from app.tasks.celery_app import celery_app
-from app.tasks.data_tasks import kline_sync_dispatch, kline_sync_worker, sync_fundamentals_task, sync_sample_kline
+from app.tasks.data_tasks import kline_sync_dispatch, sync_fundamentals_task, sync_sample_kline
 from app.tasks.factor_tasks import analyze_factor_icir_task, compute_daily_factors
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
 logger = logging.getLogger(__name__)
 
-INCREMENTAL_KLINE_TASK_NAME = "incremental_kline_update"
+# task_runs rows for the DB-queue dispatch are created by _run_tracked with
+# this name (the legacy "incremental_kline_update" batch task no longer exists).
+INCREMENTAL_KLINE_TASK_NAME = "kline_sync_dispatch"
 FULL_FUNDAMENTALS_TASK_NAME = "sync_fundamentals"
 KLINE_SYNC_DISPATCH_BEAT_LOCK = "app.tasks.data_tasks.kline_sync_dispatch"
 FULL_FUNDAMENTALS_STALE_AFTER = timedelta(hours=24)
@@ -258,42 +259,6 @@ async def start_sample_kline_task(
     return {"task_id": task_id, "status": "pending"}
 
 
-async def _find_latest_kline_sync_job(session: AsyncSession, *, job_type: str) -> int | None:
-    """Return the id of the most recent ``kline_sync_jobs`` row for ``job_type``."""
-    result = await session.execute(
-        text(
-            "SELECT id FROM kline_sync_jobs WHERE job_type = :job_type "
-            "ORDER BY created_at DESC, id DESC LIMIT 1"
-        ),
-        {"job_type": job_type},
-    )
-    row = result.first()
-    return int(row[0]) if row else None
-
-
-async def _retry_kline_sync_job(session: AsyncSession, *, job_id: int) -> dict[str, Any]:
-    """Reset permanently_failed items for a job and dispatch a fresh worker.
-
-    Shared by the incremental and full retry endpoints.
-    """
-    reset_count = await reset_failed_items_for_retry(session, job_id=job_id)
-    if reset_count == 0:
-        return {
-            "reset_count": 0,
-            "job_id": job_id,
-            "status": "noop",
-            "reason": "no permanently failed items to retry",
-        }
-    try:
-        kline_sync_worker.apply_async(kwargs={"job_id": job_id})
-    except OperationalError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"task queue unavailable: {exc}",
-        ) from exc
-    return {"reset_count": reset_count, "job_id": job_id, "status": "retrying"}
-
-
 @router.post("/data/sync-all-kline")
 async def start_sync_all_kline_task(
     request: FullKlineTaskRequest = Body(default_factory=FullKlineTaskRequest),
@@ -375,44 +340,6 @@ async def start_incremental_kline_catchup(
             detail=f"task queue unavailable: {exc}",
         ) from exc
     return {"task_id": result.id, "status": "dispatched", "codes": active}
-
-
-@router.post("/data/incremental-kline/retry")
-async def retry_failed_incremental_kline(
-    session: AsyncSession = Depends(get_session),
-) -> dict[str, Any]:
-    """Retry permanently-failed items from the latest incremental kline sync job.
-
-    Finds the most recent ``kline_sync_jobs`` row with ``job_type='incremental'``,
-    resets its permanently_failed items back to pending (attempts=0), and starts
-    a fresh ``kline_sync_worker`` to re-process them.
-    """
-    job_id = await _find_latest_kline_sync_job(session, job_type="incremental")
-    if job_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="no previous incremental kline sync job found to retry",
-        )
-    return await _retry_kline_sync_job(session, job_id=job_id)
-
-
-@router.post("/data/sync-all-kline/retry")
-async def retry_failed_full_kline(
-    session: AsyncSession = Depends(get_session),
-) -> dict[str, Any]:
-    """Retry permanently-failed items from the latest full kline sync job.
-
-    Finds the most recent ``kline_sync_jobs`` row with ``job_type='full'``,
-    resets its permanently_failed items back to pending (attempts=0), and starts
-    a fresh ``kline_sync_worker`` to re-process them.
-    """
-    job_id = await _find_latest_kline_sync_job(session, job_type="full")
-    if job_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="no previous full kline sync job found to retry",
-        )
-    return await _retry_kline_sync_job(session, job_id=job_id)
 
 
 @router.get("/data/sync-progress")

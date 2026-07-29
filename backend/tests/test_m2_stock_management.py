@@ -384,24 +384,16 @@ async def test_sync_fundamentals_allows_partial_failures(monkeypatch) -> None:
                 raise RuntimeError("offline")
             return [StockFundamental(ts_code=ts_codes[0], report_date=start_date, pe_ttm=Decimal("9"))]
 
-    calls = {"upsert": 0, "success": 0, "failure": 0, "alerts": 0}
+    calls = {"upsert": 0, "alerts": 0}
 
     async def fake_upsert(_session, records):
         calls["upsert"] += len(records)
         return len(records)
 
-    async def fake_success(*_args, **_kwargs):
-        calls["success"] += 1
-
-    async def fake_failure(*_args, **_kwargs):
-        calls["failure"] += 1
-
     async def fake_alert(*_args, **_kwargs):
         calls["alerts"] += 1
 
     monkeypatch.setattr(service, "upsert_stock_fundamentals", fake_upsert)
-    monkeypatch.setattr(service, "record_update_success", fake_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_failure)
     monkeypatch.setattr(service, "create_alert", fake_alert)
 
     result = await sync_fundamentals(
@@ -414,7 +406,7 @@ async def test_sync_fundamentals_allows_partial_failures(monkeypatch) -> None:
 
     assert result["inserted_or_updated"] == 1
     assert result["failures"][0]["ts_code"] == "600000.SH"
-    assert calls == {"upsert": 1, "success": 1, "failure": 1, "alerts": 1}
+    assert calls == {"upsert": 1, "alerts": 1}
 
 
 @pytest.mark.asyncio
@@ -448,26 +440,18 @@ async def test_sync_fundamentals_commit_each_uses_per_stock_sessions(monkeypatch
             return Context()
 
     session_factory = SessionFactory()
-    calls = {"upsert": 0, "success": 0, "failure": 0, "alerts": 0}
+    calls = {"upsert": 0, "alerts": 0}
     progress: list[tuple[int, int, str]] = []
 
     async def fake_upsert(_session, records):
         calls["upsert"] += len(records)
         return len(records)
 
-    async def fake_success(*_args, **_kwargs):
-        calls["success"] += 1
-
-    async def fake_failure(*_args, **_kwargs):
-        calls["failure"] += 1
-
     async def fake_alert(*_args, **_kwargs):
         calls["alerts"] += 1
 
     monkeypatch.setattr(service, "async_session_factory", session_factory)
     monkeypatch.setattr(service, "upsert_stock_fundamentals", fake_upsert)
-    monkeypatch.setattr(service, "record_update_success", fake_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_failure)
     monkeypatch.setattr(service, "create_alert", fake_alert)
 
     result = await sync_fundamentals(
@@ -484,7 +468,7 @@ async def test_sync_fundamentals_commit_each_uses_per_stock_sessions(monkeypatch
     assert result["requested_symbols"] == 2
     assert result["inserted_or_updated"] == 1
     assert result["failures"] == [{"ts_code": "600000.SH", "error": "eastmoney: offline"}]
-    assert calls == {"upsert": 1, "success": 1, "failure": 1, "alerts": 1}
+    assert calls == {"upsert": 1, "alerts": 1}
     assert progress == [(1, 2, "000001.SZ"), (2, 2, "600000.SH")]
     assert [session.commits for session in session_factory.sessions] == [1, 1, 1]
 

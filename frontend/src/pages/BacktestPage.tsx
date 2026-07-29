@@ -292,15 +292,19 @@ export default function BacktestPage() {
 
   const runningIdsRef = React.useRef<number[]>([])
   React.useEffect(() => {
-    const currentRunningIds = results.filter(r => r.status === 'running').map(r => r.id)
+    const currentActiveIds = results
+      .filter(r => r.status === 'pending' || r.status === 'running')
+      .map(r => r.id)
     const prev = JSON.stringify(runningIdsRef.current)
-    const curr = JSON.stringify(currentRunningIds)
+    const curr = JSON.stringify(currentActiveIds)
     if (prev === curr && runningIdsRef.current.length > 0) return
-    runningIdsRef.current = currentRunningIds
-    if (currentRunningIds.length === 0) return
+    runningIdsRef.current = currentActiveIds
+    if (currentActiveIds.length === 0) return
     const interval = window.setInterval(async () => {
       try {
-        const updated = await Promise.all(currentRunningIds.map(id => fetchJson<BacktestResult>(`/api/backtests/${id}/status`)))
+        const updated = await Promise.all(
+          currentActiveIds.map(id => fetchJson<BacktestResult>(`/api/backtests/${id}/status`)),
+        )
         setResults(prev => prev.map(r => {
           const u = updated.find(u => u.id === r.id)
           return u ? { ...r, status: u.status, total_return: u.total_return, error_message: u.error_message } : r

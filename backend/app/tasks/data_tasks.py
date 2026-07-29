@@ -30,7 +30,6 @@ from app.data.repository import (
     mark_item_failed,
     mark_stale_running_task_runs,
     recover_stuck_items,
-    record_update_failure,
 )
 from app.data.service import (
     default_kline_window,
@@ -96,11 +95,7 @@ def kline_sync_dispatch(
     async def run(session_factory) -> dict[str, Any]:
         # --- Provider health check (independent session) ---
         # Test each provider with a single stock before creating the job.
-        # Dead providers are recorded in data_update_state so the circuit
-        # breaker filters them out for the per-stock loop. Uses a separate
-        # session to avoid transaction pollution: if the health check SQL
-        # fails (e.g. record_update_failure on a missing table), the main
-        # session is not affected.
+        # Uses a separate session to avoid transaction pollution.
         kline_providers = providers_for_method("fetch_daily_kline")
         async with session_factory() as ping_session:
             alive = await ping_providers(ping_session, kline_providers, "daily_kline")

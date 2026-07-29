@@ -31,7 +31,6 @@ from app.data.repository import (
     mark_item_done,
     mark_item_failed,
     recover_stuck_items,
-    reset_failed_items_for_retry,
 )
 
 
@@ -478,56 +477,3 @@ async def test_get_job_progress(session, job_id):
     assert progress["done"] == 1
     assert progress["permanently_failed"] == 1
     assert progress["status"] == "running"
-
-
-# ---------------------------------------------------------------------------
-# reset_failed_items_for_retry
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@requires_real_db
-async def test_reset_failed_for_retry(session, job_id):
-    await _insert_items(
-        session, job_id=job_id, codes=["000001.SZ", "000002.SZ"]
-    )
-    # Mark both items as permanently_failed with attempts = 3
-    await session.execute(
-        text(
-            "UPDATE kline_sync_items SET status = 'permanently_failed', attempts = 3 "
-            "WHERE job_id = :jid"
-        ),
-        {"jid": job_id},
-    )
-    # Set job scope_failed and permanent_failure_codes
-    await session.execute(
-        text(
-            "UPDATE kline_sync_jobs SET scope_failed = 2, "
-            "permanent_failure_codes = ARRAY['000001.SZ', '000002.SZ'] WHERE id = :id"
-        ),
-        {"id": job_id},
-    )
-    await session.commit()
-
-    reset_count = await reset_failed_items_for_retry(session, job_id=job_id)
-    assert reset_count == 2
-
-    result = await session.execute(
-        text("SELECT status, attempts FROM kline_sync_items WHERE job_id = :jid"),
-        {"jid": job_id},
-    )
-    for row in result.mappings().all():
-        assert row["status"] == "pending"
-        assert row["attempts"] == 0
-
-    jrow = (
-        await session.execute(
-            text(
-                "SELECT scope_failed, permanent_failure_codes "
-                "FROM kline_sync_jobs WHERE id = :id"
-            ),
-            {"id": job_id},
-        )
-    ).mappings().one()
-    assert jrow["scope_failed"] == 0
-    assert jrow["permanent_failure_codes"] == []

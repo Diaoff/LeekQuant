@@ -56,7 +56,6 @@ interface SyncProgress {
   total: number
   caught_up: number
   remaining: number
-  failed: number
   not_caught_up_codes: string[]
   scope: {
     ts_codes: string[] | null
@@ -263,7 +262,6 @@ export default function StatusPage() {
   const [subtasksError, setSubtasksError] = React.useState<string | null>(null)
   const [syncProgress, setSyncProgress] = React.useState<SyncProgress | null>(null)
   const [syncProgressError, setSyncProgressError] = React.useState<string | null>(null)
-  const [isRetrying, setIsRetrying] = React.useState<Partial<Record<'incremental' | 'full', boolean>>>({})
 
   const refreshStatus = React.useCallback(async () => {
     setIsRefreshing(true)
@@ -386,7 +384,7 @@ export default function StatusPage() {
   }, [refreshStatus])
 
   // Lightweight, always-on poll of the TRUE sync progress (source of truth from
-  // daily_kline / data_update_state, independent of any Celery task status).
+  // daily_kline, independent of any Celery task status).
   React.useEffect(() => {
     let cancelled = false
     let retryCount = 0
@@ -444,33 +442,6 @@ export default function StatusPage() {
     }, 5000)
     return () => clearInterval(interval)
   }, [expandedTaskId, subtasks, loadSubtasks, refreshStatus])
-
-  const retrySync = React.useCallback(
-    async (kind: 'incremental' | 'full') => {
-      if (isRetrying[kind]) return
-      setIsRetrying((prev) => ({ ...prev, [kind]: true }))
-      setError(null)
-      try {
-        const endpoint = kind === 'incremental' ? '/api/tasks/data/incremental-kline/retry' : '/api/tasks/data/sync-all-kline/retry'
-        const result = await fetchJson<{ task_id: string | null; status: string; retried_codes?: string[] }>(endpoint, {
-          method: 'POST',
-          body: JSON.stringify({}),
-        })
-        if (result.status === 'noop') {
-          setNotice(kind === 'incremental' ? '增量同步：上一轮没有失败批次需要重试' : '全量同步：上一轮没有失败批次需要重试')
-        } else {
-          setNotice(
-            `${kind === 'incremental' ? '增量' : '全量'}重试已提交（${result.retried_codes?.length ?? 0} 只），任务 ${result.task_id}`,
-          )
-        }
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught))
-      } finally {
-        setIsRetrying((prev) => ({ ...prev, [kind]: false }))
-      }
-    },
-    [isRetrying],
-  )
 
   React.useEffect(() => {
     if (!progressTaskId) return
@@ -566,27 +537,7 @@ export default function StatusPage() {
           <div className="flex items-center gap-2">
             <Layers className="h-4 w-4 text-accent" aria-hidden="true" />
             <h2 className="text-base font-semibold text-ink">K 线同步真值进度</h2>
-            <span className="text-xs text-muted">（数据源：daily_kline / data_update_state，非任务状态）</span>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => void retrySync('incremental')}
-              disabled={isRetrying.incremental}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-medium text-ink transition hover:bg-surface focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isRetrying.incremental ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="h-4 w-4" aria-hidden="true" />}
-              重试失败批次（增量）
-            </button>
-            <button
-              type="button"
-              onClick={() => void retrySync('full')}
-              disabled={isRetrying.full}
-              className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-panel px-3 text-sm font-medium text-ink transition hover:bg-surface focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isRetrying.full ? <RefreshCw className="h-4 w-4 animate-spin" aria-hidden="true" /> : <RefreshCw className="h-4 w-4" aria-hidden="true" />}
-              重试失败批次（全量）
-            </button>
+            <span className="text-xs text-muted">（数据源：daily_kline，非任务状态）</span>
           </div>
         </div>
         {syncProgress == null ? (
@@ -597,9 +548,9 @@ export default function StatusPage() {
           )
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="grid grid-cols-3 gap-3">
               <div className="rounded-md border border-line bg-surface p-3">
-                <p className="text-xs text-muted">总数</p>
+                <p className="text-xs text-muted">总数（不含退市）</p>
                 <p className="mt-1 text-xl font-semibold tabular-nums text-ink">{formatNumber(syncProgress.total)}</p>
               </div>
               <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3">
@@ -607,12 +558,8 @@ export default function StatusPage() {
                 <p className="mt-1 text-xl font-semibold tabular-nums text-emerald-800">{formatNumber(syncProgress.caught_up)}</p>
               </div>
               <div className="rounded-md border border-amber-200 bg-amber-50 p-3">
-                <p className="text-xs text-amber-700">未完成</p>
+                <p className="text-xs text-amber-700">未追上</p>
                 <p className="mt-1 text-xl font-semibold tabular-nums text-amber-800">{formatNumber(syncProgress.remaining)}</p>
-              </div>
-              <div className="rounded-md border border-red-200 bg-red-50 p-3">
-                <p className="text-xs text-red-700">失败</p>
-                <p className="mt-1 text-xl font-semibold tabular-nums text-red-800">{formatNumber(syncProgress.failed)}</p>
               </div>
             </div>
             <div className="mt-4 h-2.5 w-full overflow-hidden rounded-full bg-amber-200">
@@ -624,7 +571,7 @@ export default function StatusPage() {
             <p className="mt-2 text-xs text-muted">
               最新交易日 {formatDate(syncProgress.latest_open_day)} · 进度{' '}
               {syncProgress.total > 0 ? Math.round((syncProgress.caught_up / syncProgress.total) * 100) : 0}%
-              {syncProgress.remaining === 0 && syncProgress.failed === 0 && ' · 已全部追上 ✅'}
+              {syncProgress.remaining === 0 && ' · 已全部追上 ✅'}
             </p>
           </>
         )}

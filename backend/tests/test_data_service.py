@@ -141,7 +141,6 @@ async def test_sync_kline_bootstraps_stock_basic_when_sample_is_empty(monkeypatc
 
     monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
 
     result = await sync_kline(
         FakeSession(),
@@ -189,7 +188,6 @@ async def test_sync_kline_reports_progress_on_completion(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
 
     progress = []
     result = await sync_kline(
@@ -233,7 +231,6 @@ async def test_sync_kline_keeps_serial_transaction_when_commit_each_is_false(mon
         return None
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
 
     session = TwoCodeSession()
     result = await sync_kline(
@@ -283,7 +280,6 @@ async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatc
         captured.update(kwargs)
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     result = await sync_kline(
@@ -333,7 +329,6 @@ async def test_sync_kline_writes_quality_alert_for_abnormal_price_change(monkeyp
         alerts.append(kwargs)
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     await sync_kline(
@@ -395,7 +390,6 @@ async def test_sync_kline_skips_quality_alert_for_suspended_or_missing_pre_close
         calls["alerts"] += 1
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     await sync_kline(
@@ -457,14 +451,12 @@ async def test_infer_incremental_kline_ranges_returns_only_symbols_with_tail_gap
             "ts_code": "000001.SZ",
             "last_trade_date": date(2026, 5, 29),
             "start_date": None,
-            "end_date": date(2026, 5, 29),
-        },
+            "end_date": date(2026, 5, 29)},
         {
             "ts_code": "600000.SH",
             "last_trade_date": date(2026, 5, 15),
             "start_date": date(2026, 5, 18),
-            "end_date": date(2026, 5, 29),
-        },
+            "end_date": date(2026, 5, 29)},
     ]
 
     ranges = await infer_incremental_kline_ranges(IncrementalRangeSession(rows))
@@ -474,8 +466,7 @@ async def test_infer_incremental_kline_ranges_returns_only_symbols_with_tail_gap
             "ts_code": "600000.SH",
             "last_trade_date": date(2026, 5, 15),
             "start_date": date(2026, 5, 18),
-            "end_date": date(2026, 5, 29),
-        }
+            "end_date": date(2026, 5, 29)}
     ]
 
 
@@ -497,8 +488,7 @@ async def test_infer_incremental_kline_ranges_starts_new_stock_from_list_date_op
             "ts_code": "001234.SZ",
             "last_trade_date": None,
             "start_date": date(2026, 5, 20),
-            "end_date": date(2026, 5, 29),
-        }
+            "end_date": date(2026, 5, 29)}
     ]
 
     ranges = await infer_incremental_kline_ranges(IncrementalRangeSession(rows))
@@ -548,7 +538,7 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
                 StockBasic(ts_code="000002.SZ", symbol="000002", name=""),
             ]
 
-    calls = {"stock": 0, "alerts": 0, "success": 0}
+    calls = {"stock": 0, "alerts": 0}
 
     async def fake_upsert_stock_basic(_session, records):
         calls["stock"] += len(records)
@@ -571,7 +561,6 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
     monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
     monkeypatch.setattr(service, "backfill_stock_basic_market", fake_backfill_stock_basic_market)
     monkeypatch.setattr(service, "delete_unsupported_stock_data", fake_delete_unsupported_stock_data)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     result = await sync_stock_basic(FakeSession(), providers=[MixedProvider()])
@@ -583,9 +572,8 @@ async def test_sync_stock_basic_skips_invalid_rows(monkeypatch) -> None:
         "skipped": 1,
         "skipped_invalid": 1,
         "skipped_excluded": 0,
-        "deleted_unsupported": {"stock_basic": 0},
-    }
-    assert calls == {"stock": 1, "alerts": 1, "success": 1, "backfill": 1, "delete": 1}
+        "deleted_unsupported": {"stock_basic": 0}}
+    assert calls == {"stock": 1, "alerts": 1, "backfill": 1, "delete": 1}
 
 
 async def test_sync_stock_basic_skips_excluded_markets(monkeypatch) -> None:
@@ -621,7 +609,6 @@ async def test_sync_stock_basic_skips_excluded_markets(monkeypatch) -> None:
     monkeypatch.setattr(service, "upsert_stock_basic", fake_upsert_stock_basic)
     monkeypatch.setattr(service, "backfill_stock_basic_market", fake_backfill_stock_basic_market)
     monkeypatch.setattr(service, "delete_unsupported_stock_data", fake_delete_unsupported_stock_data)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
 
     result = await sync_stock_basic(FakeSession(), providers=[MixedMarketProvider()])
 
@@ -644,7 +631,7 @@ async def test_sync_stock_basic_fails_when_all_rows_are_invalid(monkeypatch) -> 
                 StockBasic(ts_code="000002.SZ", symbol="000002", name=""),
             ]
 
-    calls = {"failure": 0, "alerts": 0}
+    calls = { "alerts": 0}
 
     async def fake_record_update_failure(*_args, **_kwargs):
         calls["failure"] += 1
@@ -652,13 +639,12 @@ async def test_sync_stock_basic_fails_when_all_rows_are_invalid(monkeypatch) -> 
     async def fake_create_alert(*_args, **_kwargs):
         calls["alerts"] += 1
 
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
     with pytest.raises(ValueError, match="no valid records"):
         await sync_stock_basic(FakeSession(), providers=[BadProvider()])
 
-    assert calls == {"failure": 1, "alerts": 1}
+    assert calls == { "alerts": 1}
 
 
 async def test_sync_kline_commit_each_uses_fresh_session_for_alert_when_main_session_closed(monkeypatch) -> None:
@@ -741,8 +727,6 @@ async def test_sync_kline_commit_each_uses_fresh_session_for_alert_when_main_ses
         return list(providers)
 
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
 
     # Use the closed-connection main session + fresh factory for per-stock work
@@ -775,8 +759,6 @@ async def test_sync_kline_commit_each_uses_fresh_session_for_alert_when_main_ses
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
 
     closed_session = ClosedConnectionSession()
@@ -851,8 +833,6 @@ async def test_sync_kline_commit_each_false_still_uses_main_session_for_alert(mo
         return len(records)
 
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
 
@@ -885,8 +865,7 @@ async def test_split_kline_ranges_by_year_keeps_single_year_range() -> None:
         {
             "ts_code": "X",
             "start_date": date(2026, 3, 1),
-            "end_date": date(2026, 7, 21),
-        }
+            "end_date": date(2026, 7, 21)}
     ]
 
     split = split_kline_ranges_by_year(ranges)
@@ -901,8 +880,7 @@ async def test_split_kline_ranges_by_year_splits_multi_year_range() -> None:
         {
             "ts_code": "X",
             "start_date": date(2024, 3, 15),
-            "end_date": date(2026, 7, 21),
-        }
+            "end_date": date(2026, 7, 21)}
     ]
 
     split = split_kline_ranges_by_year(ranges)
@@ -928,8 +906,7 @@ async def test_split_kline_ranges_by_year_preserves_other_fields() -> None:
             "ts_code": "X",
             "start_date": date(2024, 3, 15),
             "end_date": date(2026, 7, 21),
-            "last_trade_date": date(2024, 3, 14),
-        }
+            "last_trade_date": date(2024, 3, 14)}
     ]
 
     split = split_kline_ranges_by_year(ranges)
@@ -938,91 +915,6 @@ async def test_split_kline_ranges_by_year_preserves_other_fields() -> None:
     for sub in split:
         assert sub["last_trade_date"] == date(2024, 3, 14)
         assert sub["ts_code"] == "X"
-
-
-# ---------------------------------------------------------------------------
-# sync_kline — consecutive-failure skip
-# ---------------------------------------------------------------------------
-
-
-async def test_sync_kline_skips_stock_with_prior_failures(monkeypatch) -> None:
-    """A ts_code whose data_update_state.failure_count >= 50 (the
-    ``kline_permanent_failure_threshold``) is skipped entirely (no fetch,
-    no upsert) and the result carries ``skipped: True``."""
-    import app.data.service as service
-
-    class _FailureCountRow:
-        def __init__(self, ts_code, failure_count):
-            self.ts_code = ts_code
-            self.failure_count = failure_count
-
-    class FailureAwareSession(StAwareSession):
-        """Returns failure_count=50 for 000001.SZ (→ skipped at the
-        permanent-failure threshold) and 0 for 600000.SH (→ processed
-        normally)."""
-
-        async def execute(self, statement, params=None):
-            sql = str(statement)
-            if "MAX(failure_count)" in sql:
-                ts_codes = (params or {}).get("ts_codes", [])
-                rows = [
-                    _FailureCountRow(code, 50 if code == "000001.SZ" else 0)
-                    for code in ts_codes
-                ]
-                return FakeResult(rows)
-            return await super().execute(statement, params)
-
-    fetch_calls: list[str] = []
-
-    class SelectiveProvider:
-        name = "fake"
-
-        def fetch_daily_kline(self, ts_code, start_date, end_date):
-            fetch_calls.append(ts_code)
-            return [
-                DailyKline(
-                    ts_code=ts_code,
-                    trade_date=start_date,
-                    open=10,
-                    high=11,
-                    low=9,
-                    close=10.5,
-                    data_source=self.name,
-                )
-            ]
-
-    async def fake_upsert_daily_kline(_session, records):
-        return len(records)
-
-    async def fake_record_update_success(*_args, **_kwargs):
-        return None
-
-    async def fake_filter_open_circuits(_session, providers, _data_type):
-        return list(providers)
-
-    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
-    monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
-
-    result = await sync_kline(
-        FailureAwareSession(),
-        ["000001.SZ", "600000.SH"],
-        date(2026, 5, 18),
-        date(2026, 5, 18),
-        providers=[SelectiveProvider()],
-        commit_each=False,
-        concurrency=1,
-    )
-
-    # 000001.SZ was skipped — fetch only called for 600000.SH
-    assert fetch_calls == ["600000.SH"]
-    assert result["inserted_or_updated"] == 1
-    # The skipped stock appears in failures with skipped=True
-    skipped = [f for f in result["failures"] if f["ts_code"] == "000001.SZ"]
-    assert len(skipped) == 1
-    assert skipped[0]["skipped"] is True
-    assert "prior failures" in skipped[0]["error"]
-
 
 # ---------------------------------------------------------------------------
 # sync_kline — configurable per-stock timeout
@@ -1100,8 +992,6 @@ async def test_sync_kline_uses_configurable_per_stock_timeout(monkeypatch) -> No
         return list(providers)
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
     monkeypatch.setattr(service, "create_alert", fake_record_update_failure)
 
@@ -1169,7 +1059,7 @@ async def test_sync_one_stock_success(monkeypatch) -> None:
                 )
             ]
 
-    calls = {"upsert": 0, "success": 0, "failure": 0}
+    calls = {"upsert": 0}
 
     async def fake_upsert_daily_kline(_session, records):
         calls["upsert"] += len(records)
@@ -1188,8 +1078,6 @@ async def test_sync_one_stock_success(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
 
@@ -1202,7 +1090,7 @@ async def test_sync_one_stock_success(monkeypatch) -> None:
     )
 
     assert result == {"success": True, "error": None, "source": "fake", "synced": 1}
-    assert calls == {"upsert": 1, "success": 1, "failure": 0}
+    assert calls == {"upsert": 1}
 
 
 async def test_sync_one_stock_fetch_fails(monkeypatch) -> None:
@@ -1216,7 +1104,7 @@ async def test_sync_one_stock_fetch_fails(monkeypatch) -> None:
         def fetch_daily_kline(self, ts_code, start_date, end_date):
             raise RuntimeError("simulated network failure")
 
-    calls = {"upsert": 0, "success": 0, "failure": 0}
+    calls = {"upsert": 0}
 
     async def fake_upsert_daily_kline(_session, records):
         calls["upsert"] += len(records)
@@ -1232,8 +1120,6 @@ async def test_sync_one_stock_fetch_fails(monkeypatch) -> None:
         return list(providers)
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
     monkeypatch.setattr(service, "create_alert", fake_record_update_failure)
 
@@ -1249,7 +1135,7 @@ async def test_sync_one_stock_fetch_fails(monkeypatch) -> None:
     assert "simulated network failure" in result["error"]
     assert result["source"] is None
     assert result["synced"] == 0
-    assert calls == {"upsert": 0, "success": 0, "failure": 1}
+    assert calls == {"upsert": 0}
 
 
 async def test_sync_one_stock_timeout(monkeypatch) -> None:
@@ -1274,7 +1160,7 @@ async def test_sync_one_stock_timeout(monkeypatch) -> None:
                 )
             ]
 
-    calls = {"upsert": 0, "success": 0, "failure": 0}
+    calls = {"upsert": 0}
 
     async def fake_upsert_daily_kline(_session, records):
         calls["upsert"] += len(records)
@@ -1290,8 +1176,6 @@ async def test_sync_one_stock_timeout(monkeypatch) -> None:
         return list(providers)
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
-    monkeypatch.setattr(service, "record_update_success", fake_record_update_success)
-    monkeypatch.setattr(service, "record_update_failure", fake_record_update_failure)
     monkeypatch.setattr(service, "filter_open_circuits", fake_filter_open_circuits)
     monkeypatch.setattr(service, "create_alert", fake_record_update_failure)
 
@@ -1307,5 +1191,5 @@ async def test_sync_one_stock_timeout(monkeypatch) -> None:
     assert result["success"] is False
     assert result["source"] is None
     assert result["synced"] == 0
-    assert calls == {"upsert": 0, "success": 0, "failure": 1}
+    assert calls == {"upsert": 0}
 

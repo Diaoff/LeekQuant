@@ -72,14 +72,14 @@ def test_incremental_kline_dispatches_kline_sync_dispatch(monkeypatch) -> None:
     from app.api import tasks as task_api
 
     monkeypatch.setattr(task_api, "_guard_beat_lock_free", AsyncMock())
-    apply_async = Mock()
+    apply_async = Mock(return_value=Mock(id="task-abc"))
     monkeypatch.setattr(task_api.kline_sync_dispatch, "apply_async", apply_async)
 
     client = TestClient(app)
     response = client.post("/api/tasks/data/incremental-kline", json={"ts_codes": ["000001.SZ"]})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "dispatched"}
+    assert response.json() == {"task_id": "task-abc", "status": "dispatched"}
     apply_async.assert_called_once_with(
         kwargs={"job_type": "incremental", "ts_codes": ["000001.SZ"]},
     )
@@ -89,14 +89,14 @@ def test_incremental_kline_dispatches_without_ts_codes(monkeypatch) -> None:
     from app.api import tasks as task_api
 
     monkeypatch.setattr(task_api, "_guard_beat_lock_free", AsyncMock())
-    apply_async = Mock()
+    apply_async = Mock(return_value=Mock(id="task-def"))
     monkeypatch.setattr(task_api.kline_sync_dispatch, "apply_async", apply_async)
 
     client = TestClient(app)
     response = client.post("/api/tasks/data/incremental-kline", json={})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "dispatched"}
+    assert response.json() == {"task_id": "task-def", "status": "dispatched"}
     apply_async.assert_called_once_with(kwargs={"job_type": "incremental"})
 
 
@@ -109,14 +109,14 @@ def test_sync_all_kline_dispatches_kline_sync_dispatch_full(monkeypatch) -> None
     from app.api import tasks as task_api
 
     monkeypatch.setattr(task_api, "_guard_beat_lock_free", AsyncMock())
-    apply_async = Mock()
+    apply_async = Mock(return_value=Mock(id="task-full"))
     monkeypatch.setattr(task_api.kline_sync_dispatch, "apply_async", apply_async)
 
     client = TestClient(app)
     response = client.post("/api/tasks/data/sync-all-kline", json={})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "dispatched"}
+    assert response.json() == {"task_id": "task-full", "status": "dispatched"}
     apply_async.assert_called_once_with(
         kwargs={"job_type": "full", "start_date": None, "end_date": None},
     )
@@ -126,7 +126,7 @@ def test_sync_all_kline_passes_date_overrides(monkeypatch) -> None:
     from app.api import tasks as task_api
 
     monkeypatch.setattr(task_api, "_guard_beat_lock_free", AsyncMock())
-    apply_async = Mock()
+    apply_async = Mock(return_value=Mock(id="task-full-dates"))
     monkeypatch.setattr(task_api.kline_sync_dispatch, "apply_async", apply_async)
 
     client = TestClient(app)
@@ -140,114 +140,3 @@ def test_sync_all_kline_passes_date_overrides(monkeypatch) -> None:
         kwargs={"job_type": "full", "start_date": "2025-01-01", "end_date": "2025-06-30"},
     )
 
-
-# ---------------------------------------------------------------------------
-# POST /api/tasks/data/incremental-kline/retry
-# ---------------------------------------------------------------------------
-
-
-def test_retry_incremental_resets_failed_items_and_dispatches_worker(monkeypatch) -> None:
-    from app.api import tasks as task_api
-
-    fake_session = FakeTaskSession(latest_job_id=42)
-    monkeypatch.setattr(task_api, "reset_failed_items_for_retry", AsyncMock(return_value=5))
-    apply_async = Mock()
-    monkeypatch.setattr(task_api.kline_sync_worker, "apply_async", apply_async)
-    app.dependency_overrides[get_session] = _override_session(fake_session)
-
-    try:
-        client = TestClient(app)
-        response = client.post("/api/tasks/data/incremental-kline/retry")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "retrying"
-    assert body["reset_count"] == 5
-    assert body["job_id"] == 42
-    apply_async.assert_called_once_with(kwargs={"job_id": 42})
-
-
-def test_retry_incremental_returns_noop_when_no_failed_items(monkeypatch) -> None:
-    from app.api import tasks as task_api
-
-    fake_session = FakeTaskSession(latest_job_id=7)
-    monkeypatch.setattr(task_api, "reset_failed_items_for_retry", AsyncMock(return_value=0))
-    apply_async = Mock()
-    monkeypatch.setattr(task_api.kline_sync_worker, "apply_async", apply_async)
-    app.dependency_overrides[get_session] = _override_session(fake_session)
-
-    try:
-        client = TestClient(app)
-        response = client.post("/api/tasks/data/incremental-kline/retry")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "noop"
-    assert body["reset_count"] == 0
-    assert body["job_id"] == 7
-    apply_async.assert_not_called()
-
-
-def test_retry_incremental_returns_404_when_no_previous_job(monkeypatch) -> None:
-    from app.api import tasks as task_api
-
-    fake_session = FakeTaskSession(latest_job_id=None)
-    monkeypatch.setattr(task_api, "reset_failed_items_for_retry", AsyncMock(return_value=0))
-    app.dependency_overrides[get_session] = _override_session(fake_session)
-
-    try:
-        client = TestClient(app)
-        response = client.post("/api/tasks/data/incremental-kline/retry")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 404
-    assert "no previous incremental kline sync job" in response.json()["detail"]
-
-
-# ---------------------------------------------------------------------------
-# POST /api/tasks/data/sync-all-kline/retry
-# ---------------------------------------------------------------------------
-
-
-def test_retry_full_resets_failed_items_and_dispatches_worker(monkeypatch) -> None:
-    from app.api import tasks as task_api
-
-    fake_session = FakeTaskSession(latest_job_id=99)
-    monkeypatch.setattr(task_api, "reset_failed_items_for_retry", AsyncMock(return_value=3))
-    apply_async = Mock()
-    monkeypatch.setattr(task_api.kline_sync_worker, "apply_async", apply_async)
-    app.dependency_overrides[get_session] = _override_session(fake_session)
-
-    try:
-        client = TestClient(app)
-        response = client.post("/api/tasks/data/sync-all-kline/retry")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "retrying"
-    assert body["reset_count"] == 3
-    assert body["job_id"] == 99
-    apply_async.assert_called_once_with(kwargs={"job_id": 99})
-
-
-def test_retry_full_returns_404_when_no_previous_job(monkeypatch) -> None:
-    from app.api import tasks as task_api
-
-    fake_session = FakeTaskSession(latest_job_id=None)
-    app.dependency_overrides[get_session] = _override_session(fake_session)
-
-    try:
-        client = TestClient(app)
-        response = client.post("/api/tasks/data/sync-all-kline/retry")
-    finally:
-        app.dependency_overrides.clear()
-
-    assert response.status_code == 404
-    assert "no previous full kline sync job" in response.json()["detail"]

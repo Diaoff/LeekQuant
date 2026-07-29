@@ -17,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.error import URLError
 
 from app.core.config import get_settings
-from app.data.circuit_breaker import CircuitBreaker
 from app.data.providers import (
     DataProvider,
     DataProviderError,
@@ -47,64 +46,20 @@ _PROVIDER_ORDER: list[str] = [
 ]
 _REDIS_CLIENT: redis_mod.Redis | None = None
 
-# Module-level circuit breaker singleton (lazy-initialized).
-# Note: the breaker is consulted from the ASYNC service layer (via
-# filter_open_circuits) BEFORE asyncio.to_thread(fetch_with_fallback, ...) —
-# never from inside fetch_with_fallback itself, because the breaker's is_open
-# query needs an AsyncSession and we are inside a worker thread there.
-_BREAKER: CircuitBreaker | None = None
-
-
-def _get_breaker() -> CircuitBreaker:
-    global _BREAKER
-    if _BREAKER is None:
-        _BREAKER = CircuitBreaker()
-    return _BREAKER
-
-
-def reset_breaker_for_tests() -> None:
-    """Test helper — clear the cached circuit breaker singleton."""
-    global _BREAKER
-    _BREAKER = None
-
-
 async def filter_open_circuits(
     session: AsyncSession,
     providers: list[DataProvider],
     data_type: str,
 ) -> list[DataProvider]:
-    """Filter out providers whose circuit breaker is currently OPEN.
+    """Return ``providers`` unchanged.
 
-    MUST be called from an async context (the caller's main event loop),
-    BEFORE handing the provider list to ``fetch_with_fallback`` via
-    ``asyncio.to_thread``. The breaker's ``is_open`` query needs an
-    ``AsyncSession`` and cannot run inside the worker thread that
-    ``fetch_with_fallback`` executes in.
-
-    Uses ``CircuitBreaker.is_open_batch`` — a single SELECT per data_type
-    for all sources — rather than one query per (data_type, source) pair.
-    For sync_kline processing 4000+ stocks this is the difference between
-    ~12000 DB round-trips and 1.
-
-    Fail-open policy: if the breaker's DB query raises (e.g. DB unavailable),
-    the provider is kept in the list rather than dropped — the underlying
-    fetch will then surface the real error. This matches the previous
-    fail-open semantics but ONLY for unexpected breaker errors, not for
-    normal operation.
-
-    When the breaker is disabled (threshold <= 0), this is a no-op pass-through.
+    The circuit breaker that previously short-circuited failing providers
+    (it read ``data_update_state.failure_count``) has been removed — the
+    ``data_update_state`` table no longer exists. Provider health is now
+    handled by the kline-sync DB queue's per-item retry / permanent-failure
+    mechanism, so no upfront provider filtering is needed here.
     """
-    breaker = _get_breaker()
-    if breaker.threshold <= 0:
-        return list(providers)
-    sources = [p.name for p in providers]
-    try:
-        open_by_source = await breaker.is_open_batch(session, data_type, sources)
-    except Exception:
-        # Breaker query failed (DB unavailable, etc.) — fail-open by
-        # keeping all providers; the fetch itself will surface real errors.
-        return list(providers)
-    return [p for p in providers if not open_by_source.get(p.name, False)]
+    return list(providers)
 
 
 def _get_redis() -> redis_mod.Redis | None:
@@ -207,17 +162,13 @@ async def ping_providers(
     """Test each provider with a single stock, return only working providers.
 
     Runs a quick health check by fetching one stock's K-line for the last 5
-    days from each provider. Providers that fail are immediately recorded as
-    circuit-open in ``data_update_state`` so the per-stock loop never retries
-    them.
+    days from each provider.
 
     MUST be called from async context before ``asyncio.to_thread``.
 
     Returns:
         Filtered list of providers that returned data.
     """
-    from app.data.repository import record_update_failure
-
     settings = get_settings()
     today = datetime.now(tz=UTC).date()
     start = today - timedelta(days=10)
@@ -243,22 +194,8 @@ async def ping_providers(
                 working.append(provider)
             else:
                 logger.warning("provider %s ping failed for %s", provider.name, sample_ts_code)
-                try:
-                    await record_update_failure(
-                        session, data_type, provider.name,
-                        f"ping failed: no data for {sample_ts_code}",
-                    )
-                except Exception:
-                    await session.rollback()
         except Exception as exc:
             logger.warning("provider %s ping raised: %s", provider.name, exc)
-            try:
-                await record_update_failure(
-                    session, data_type, provider.name,
-                    f"ping failed: {exc}",
-                )
-            except Exception:
-                await session.rollback()
 
     if not working:
         logger.error("ALL providers failed ping health-check for %s", data_type)

@@ -18,8 +18,6 @@ from app.data.repository import (
     create_alert,
     delete_unsupported_stock_data,
     list_recent_jobs,
-    record_update_failure,
-    record_update_success,
     upsert_daily_kline,
     upsert_stock_basic,
     upsert_trade_calendar,
@@ -194,28 +192,6 @@ async def _bulk_load_is_st(session: AsyncSession, ts_codes: list[str]) -> dict[s
     return {code: present.get(code, False) for code in ts_codes}
 
 
-async def _bulk_load_failure_counts(session: AsyncSession, ts_codes: list[str]) -> dict[str, int]:
-    """Load data_update_state.failure_count for all ts_codes in ONE query.
-
-    Used by sync_kline to skip stocks that have already failed
-    ``MAX_PER_STOCK_RETRIES`` times in prior batches — prevents a chronically
-    broken stock (delisted, suspended, bad data) from exhausting the batch's
-    soft time limit on every run. Returns ``{ts_code: int}``; missing stocks
-    default to 0.
-    """
-    if not ts_codes:
-        return {}
-    result = await session.execute(
-        text(
-            "SELECT ts_code, COALESCE(MAX(failure_count), 0) AS failure_count "
-            "FROM data_update_state WHERE data_type = 'daily_kline' "
-            "AND ts_code = ANY(CAST(:ts_codes AS VARCHAR[])) GROUP BY ts_code"
-        ),
-        {"ts_codes": ts_codes},
-    )
-    return {row.ts_code: int(row.failure_count) for row in result.all()}
-
-
 async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> list[str]:
     result = await session.execute(
         text(
@@ -388,7 +364,6 @@ async def sync_stock_basic(
 
     if not valid_records:
         message = "stock basic sync returned no valid records"
-        await record_update_failure(session, "stock_basic", source, message)
         await create_alert(
             session,
             level="error",
@@ -403,7 +378,6 @@ async def sync_stock_basic(
     count = await upsert_stock_basic(session, valid_records)
     await backfill_stock_basic_market(session)
     deleted = await delete_unsupported_stock_data(session)
-    await record_update_success(session, "stock_basic", source)
     if invalid_records:
         await create_alert(
             session,
@@ -453,7 +427,6 @@ async def sync_trade_calendar(
 
     count = await upsert_trade_calendar(session, records)
     latest = max((record.cal_date for record in records if record.is_open), default=None)
-    await record_update_success(session, "trade_calendar", source, last_trade_date=latest)
     await session.commit()
     return {"source": source, "inserted_or_updated": count, "start_date": start_date, "end_date": end_date}
 
@@ -502,11 +475,9 @@ async def sync_kline(
         async with per_stock_session_factory() as setup_session:
             filtered_provider_list = await filter_open_circuits(setup_session, provider_list, "daily_kline")
             is_st_by_code = await _bulk_load_is_st(setup_session, codes)
-            failure_counts_by_code = await _bulk_load_failure_counts(setup_session, codes)
     else:
         filtered_provider_list = await filter_open_circuits(setup_session_cm, provider_list, "daily_kline")
         is_st_by_code = await _bulk_load_is_st(setup_session_cm, codes)
-        failure_counts_by_code = await _bulk_load_failure_counts(setup_session_cm, codes)
 
     if not filtered_provider_list:
         # All providers' circuits are open — install a sync stub that raises
@@ -565,29 +536,7 @@ async def sync_kline(
             except Exception:
                 pass
 
-    # Per-stock consecutive failure skip: if a single ts_code has already
-    # failed kline_permanent_failure_threshold times in prior batches (tracked
-    # in data_update_state.failure_count), skip it entirely. The threshold
-    # matches kline_sync_failures.is_permanent_failure so a skipped stock is
-    # truly hopeless (data source down, delisted, bad ts_code) — not just
-    # temporarily flaky. Batch subtasks report skipped codes to
-    # kline_sync_failures so the completion gate can drive them to permanent
-    # failure and stop re-dispatching.
-    MAX_PER_STOCK_RETRIES = settings.kline_permanent_failure_threshold
-
     async def process_code(ts_code: str) -> dict[str, Any]:
-        if failure_counts_by_code.get(ts_code, 0) >= MAX_PER_STOCK_RETRIES:
-            logger.warning(
-                "skipping %s: %d prior consecutive failures (>= %d threshold)",
-                ts_code,
-                failure_counts_by_code[ts_code],
-                MAX_PER_STOCK_RETRIES,
-            )
-            return {
-                "ts_code": ts_code,
-                "error": f"skipped: {failure_counts_by_code[ts_code]} prior failures",
-                "skipped": True,
-            }
         if commit_each:
             async with per_stock_session_factory() as wk_session:
                 try:
@@ -608,7 +557,6 @@ async def sync_kline(
                     quality_issues = _daily_kline_quality_issues(records, is_st=is_st_by_code.get(ts_code, False))
                     count = await upsert_daily_kline(wk_session, records)
                     latest = max((record.trade_date for record in records), default=None)
-                    await record_update_success(wk_session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
                     await _create_kline_quality_alert(
                         wk_session,
                         ts_code=ts_code,
@@ -625,7 +573,6 @@ async def sync_kline(
                         await wk_session.rollback()
                     except Exception:
                         pass
-                    await record_update_failure(wk_session, "daily_kline", "fallback", message, ts_code=ts_code)
                     await wk_session.commit()
                     return {"ts_code": ts_code, "error": message}
 
@@ -648,7 +595,6 @@ async def sync_kline(
             quality_issues = _daily_kline_quality_issues(records, is_st=is_st_by_code.get(ts_code, False))
             count = await upsert_daily_kline(session, records)
             latest = max((record.trade_date for record in records), default=None)
-            await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
             await _create_kline_quality_alert(
                 session,
                 ts_code=ts_code,
@@ -661,7 +607,6 @@ async def sync_kline(
         except Exception as exc:
             message = str(exc)
             assert session is not None
-            await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
             return {"ts_code": ts_code, "error": message}
 
     if commit_each and concurrency > 1:
@@ -820,7 +765,6 @@ async def sync_one_stock(
             quality_issues = _daily_kline_quality_issues(records, is_st=is_st)
             count = await upsert_daily_kline(session, records)
             latest = max((record.trade_date for record in records), default=None)
-            await record_update_success(session, "daily_kline", source, ts_code=ts_code, last_trade_date=latest)
             await _create_kline_quality_alert(
                 session,
                 ts_code=ts_code,
@@ -840,7 +784,6 @@ async def sync_one_stock(
                     await session.rollback()
             except Exception:
                 pass
-            await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
             await session.commit()
             return {"success": False, "error": message, "source": None, "synced": 0}
         except Exception as exc:
@@ -850,7 +793,6 @@ async def sync_one_stock(
                     await session.rollback()
             except Exception:
                 pass
-            await record_update_failure(session, "daily_kline", "fallback", message, ts_code=ts_code)
             await session.commit()
             return {"success": False, "error": message, "source": None, "synced": 0}
 

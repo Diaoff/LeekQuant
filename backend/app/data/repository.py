@@ -263,69 +263,6 @@ async def upsert_stock_fundamentals(session: AsyncSession, records: list[StockFu
     return len(records)
 
 
-async def record_update_success(
-    session: AsyncSession,
-    data_type: str,
-    source: str,
-    *,
-    ts_code: str | None = None,
-    last_trade_date: date | None = None,
-) -> None:
-    await session.execute(
-        text(
-            """
-            INSERT INTO data_update_state (
-                data_type, ts_code, source, last_trade_date, last_success_at, failure_count, error_message, updated_at
-            )
-            VALUES (:data_type, :ts_code, :source, :last_trade_date, NOW(), 0, NULL, NOW())
-            ON CONFLICT (data_type, ts_code, source) DO UPDATE SET
-                last_trade_date = COALESCE(EXCLUDED.last_trade_date, data_update_state.last_trade_date),
-                last_success_at = NOW(),
-                failure_count = 0,
-                error_message = NULL,
-                updated_at = NOW()
-            """
-        ),
-        {
-            "data_type": data_type,
-            "ts_code": ts_code,
-            "source": source,
-            "last_trade_date": last_trade_date,
-        },
-    )
-
-
-async def record_update_failure(
-    session: AsyncSession,
-    data_type: str,
-    source: str,
-    error_message: str,
-    *,
-    ts_code: str | None = None,
-) -> None:
-    await session.execute(
-        text(
-            """
-            INSERT INTO data_update_state (
-                data_type, ts_code, source, last_failure_at, failure_count, error_message, updated_at
-            )
-            VALUES (:data_type, :ts_code, :source, NOW(), 1, :error_message, NOW())
-            ON CONFLICT (data_type, ts_code, source) DO UPDATE SET
-                last_failure_at = NOW(),
-                failure_count = data_update_state.failure_count + 1,
-                error_message = EXCLUDED.error_message,
-                updated_at = NOW()
-            """
-        ),
-        {
-            "data_type": data_type,
-            "ts_code": ts_code,
-            "source": source,
-            "error_message": error_message[:4000],
-        },
-    )
-
-
 async def create_alert(
     session: AsyncSession,
     *,
@@ -546,3 +483,564 @@ async def mark_task_run_failed(
         params,
     )
     await session.commit()
+
+
+async def mark_task_run_cancelled(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    error_message: str,
+) -> None:
+    """Mark a task_runs row as cancelled (e.g. beat lock skipped).
+
+    Only touches non-terminal rows so a status the task body already wrote is
+    never overwritten.
+    """
+    await session.execute(
+        text(
+            """
+            UPDATE task_runs
+            SET status = 'cancelled',
+                finished_at = NOW(),
+                error_message = COALESCE(error_message, :error_message)
+            WHERE task_id = :task_id
+              AND status IN ('pending', 'running')
+            """
+        ),
+        {
+            "task_id": task_id,
+            "error_message": error_message[:4000],
+        },
+    )
+    await session.commit()
+
+
+async def reconcile_task_run_status(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    status: str,
+    error_message: str | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """Backstop reconciliation of a task_runs row to Celery's terminal state.
+
+    Called from the Celery ``task_failure`` / ``task_success`` / ``task_revoked``
+    signals. Idempotent: only updates rows still in ``status IN ('pending', 'running')``,
+    so it never overwrites a status the task body already wrote.
+    """
+    await session.execute(
+        text(
+            """
+            UPDATE task_runs
+            SET status = :status,
+                finished_at = COALESCE(finished_at, NOW()),
+                error_message = COALESCE(error_message, :error_message),
+                result = COALESCE(CAST(:result AS JSONB), result)
+            WHERE task_id = :task_id
+              AND status IN ('pending', 'running')
+            """
+        ),
+        {
+            "task_id": task_id,
+            "status": status,
+            "error_message": error_message[:4000] if error_message else None,
+            "result": json.dumps(result, ensure_ascii=False, default=str) if result is not None else None,
+        },
+    )
+    await session.commit()
+
+
+async def get_latest_task_run(
+    session: AsyncSession,
+    *,
+    task_name: str,
+) -> dict[str, Any] | None:
+    """Return the most recent task_runs row for ``task_name`` (any status)."""
+    result = await session.execute(
+        text(
+            """
+            SELECT id, task_name, task_id, status, started_at, finished_at,
+                   duration_ms, payload, result, error_message
+            FROM task_runs
+            WHERE task_name = :task_name
+            ORDER BY started_at DESC NULLS LAST, id DESC
+            LIMIT 1
+            """
+        ),
+        {"task_name": task_name},
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# K-line sync DB queue (kline_sync_jobs / kline_sync_items)
+# ---------------------------------------------------------------------------
+
+
+async def create_kline_sync_job(
+    session: AsyncSession,
+    *,
+    job_type: str,
+    config: dict[str, Any] | None = None,
+) -> int:
+    """Insert a kline_sync_jobs row (status='running') and return its id."""
+    result = await session.execute(
+        text(
+            """
+            INSERT INTO kline_sync_jobs (job_type, status, config, started_at)
+            VALUES (:job_type, 'running', CAST(:config AS JSONB), NOW())
+            RETURNING id
+            """
+        ),
+        {
+            "job_type": job_type,
+            "config": json.dumps(config or {}, ensure_ascii=False, default=str),
+        },
+    )
+    job_id = int(result.scalar_one())
+    await session.commit()
+    return job_id
+
+
+async def insert_kline_sync_items(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    items: list[dict[str, Any]],
+) -> int:
+    """Bulk-insert work items for a job and bump the job's scope_total."""
+    if not items:
+        await session.commit()
+        return 0
+    values = [
+        {
+            "job_id": job_id,
+            "ts_code": item["ts_code"],
+            "start_date": item["start_date"],
+            "end_date": item["end_date"],
+        }
+        for item in items
+    ]
+    await session.execute(
+        text(
+            """
+            INSERT INTO kline_sync_items (job_id, ts_code, start_date, end_date, status)
+            VALUES (:job_id, :ts_code, :start_date, :end_date, 'pending')
+            ON CONFLICT (job_id, ts_code, start_date, end_date) DO NOTHING
+            """
+        ),
+        values,
+    )
+    await session.execute(
+        text(
+            """
+            UPDATE kline_sync_jobs
+            SET scope_total = (SELECT COUNT(*) FROM kline_sync_items WHERE job_id = :job_id)
+            WHERE id = :job_id
+            """
+        ),
+        {"job_id": job_id},
+    )
+    await session.commit()
+    return len(values)
+
+
+async def claim_kline_sync_items(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    count: int,
+    worker_id: str,
+) -> list[dict[str, Any]]:
+    """Atomically claim up to ``count`` pending items for a worker.
+
+    Uses ``FOR UPDATE SKIP LOCKED`` so concurrent workers never claim the same
+    item. Claiming increments ``attempts`` (a claim IS an attempt) and stamps
+    ``last_attempt_at`` for stuck-item detection.
+    """
+    result = await session.execute(
+        text(
+            """
+            UPDATE kline_sync_items
+            SET status = 'running',
+                worker_id = :worker_id,
+                attempts = attempts + 1,
+                last_attempt_at = NOW()
+            WHERE id IN (
+                SELECT id
+                FROM kline_sync_items
+                WHERE job_id = :job_id AND status = 'pending'
+                ORDER BY id
+                LIMIT :count
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, ts_code, start_date, end_date, attempts
+            """
+        ),
+        {"job_id": job_id, "count": max(1, count), "worker_id": worker_id},
+    )
+    rows = [dict(row) for row in result.mappings().all()]
+    await session.commit()
+    return rows
+
+
+async def mark_item_done(
+    session: AsyncSession,
+    *,
+    item_id: int,
+    job_id: int,
+) -> None:
+    """Mark an item done and bump the job's scope_done counter."""
+    await session.execute(
+        text(
+            """
+            UPDATE kline_sync_items
+            SET status = 'done', worker_id = NULL, last_error = NULL
+            WHERE id = :item_id
+            """
+        ),
+        {"item_id": item_id},
+    )
+    await session.execute(
+        text("UPDATE kline_sync_jobs SET scope_done = scope_done + 1 WHERE id = :job_id"),
+        {"job_id": job_id},
+    )
+    await session.commit()
+
+
+async def mark_item_failed(
+    session: AsyncSession,
+    *,
+    item_id: int,
+    job_id: int,
+    error: str,
+    max_attempts: int,
+) -> bool:
+    """Record a failure for an item.
+
+    ``attempts`` is NOT incremented here — ``claim_kline_sync_items`` already
+    counted this attempt; incrementing again would double-count each failure.
+    Returns True when the item crossed ``max_attempts`` and became
+    ``permanently_failed`` (job counters updated accordingly).
+    """
+    result = await session.execute(
+        text(
+            """
+            UPDATE kline_sync_items
+            SET status = CASE
+                    WHEN attempts >= :max_attempts THEN 'permanently_failed'
+                    ELSE 'pending'
+                END,
+                worker_id = NULL,
+                last_error = :error
+            WHERE id = :item_id
+            RETURNING status, ts_code
+            """
+        ),
+        {"item_id": item_id, "max_attempts": max_attempts, "error": error[:4000]},
+    )
+    row = result.mappings().one_or_none()
+    is_permanent = bool(row and row["status"] == "permanently_failed")
+    if is_permanent:
+        await session.execute(
+            text(
+                """
+                UPDATE kline_sync_jobs
+                SET scope_failed = scope_failed + 1,
+                    permanent_failure_codes = array_append(
+                        COALESCE(permanent_failure_codes, ARRAY[]::TEXT[]), :ts_code
+                    )
+                WHERE id = :job_id
+                """
+            ),
+            {"job_id": job_id, "ts_code": row["ts_code"]},
+        )
+    await session.commit()
+    return is_permanent
+
+
+async def recover_stuck_items(
+    session: AsyncSession,
+    *,
+    stuck_seconds: int,
+) -> int:
+    """Reset 'running' items whose last attempt is older than ``stuck_seconds``."""
+    result = await session.execute(
+        text(
+            """
+            UPDATE kline_sync_items
+            SET status = 'pending', worker_id = NULL
+            WHERE status = 'running'
+              AND (
+                  last_attempt_at IS NULL
+                  OR last_attempt_at < NOW() - make_interval(secs => :stuck_seconds)
+              )
+            RETURNING id
+            """
+        ),
+        {"stuck_seconds": stuck_seconds},
+    )
+    rows = result.fetchall()
+    await session.commit()
+    return len(rows)
+
+
+async def complete_job_if_done(
+    session: AsyncSession,
+    *,
+    job_id: int,
+) -> bool:
+    """Mark the job completed when no pending/running items remain."""
+    result = await session.execute(
+        text(
+            """
+            UPDATE kline_sync_jobs
+            SET status = 'completed', completed_at = NOW()
+            WHERE id = :job_id
+              AND status = 'running'
+              AND NOT EXISTS (
+                  SELECT 1 FROM kline_sync_items
+                  WHERE job_id = :job_id AND status IN ('pending', 'running')
+              )
+            RETURNING id
+            """
+        ),
+        {"job_id": job_id},
+    )
+    completed = result.first() is not None
+    await session.commit()
+    return completed
+
+
+async def get_job_progress(
+    session: AsyncSession,
+    *,
+    job_id: int,
+) -> dict[str, Any] | None:
+    """Return a job row merged with live per-status item counts."""
+    result = await session.execute(
+        text(
+            """
+            SELECT
+                j.id, j.job_type, j.status,
+                j.scope_total, j.scope_done, j.scope_failed,
+                j.permanent_failure_codes, j.config,
+                j.created_at, j.started_at, j.completed_at, j.error,
+                COUNT(i.id)::INT AS item_total,
+                COUNT(*) FILTER (WHERE i.status = 'pending')::INT AS pending,
+                COUNT(*) FILTER (WHERE i.status = 'running')::INT AS running,
+                COUNT(*) FILTER (WHERE i.status = 'done')::INT AS done,
+                COUNT(*) FILTER (WHERE i.status = 'permanently_failed')::INT AS permanently_failed
+            FROM kline_sync_jobs j
+            LEFT JOIN kline_sync_items i ON i.job_id = j.id
+            WHERE j.id = :job_id
+            GROUP BY j.id
+            """
+        ),
+        {"job_id": job_id},
+    )
+    row = result.mappings().one_or_none()
+    if row is None:
+        return None
+    progress = dict(row)
+    progress["permanent_failure_codes"] = list(progress.get("permanent_failure_codes") or [])
+    return progress
+
+
+async def list_job_items(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    status: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """List items for a job, optionally filtered by status."""
+    status_filter = ""
+    params: dict[str, Any] = {"job_id": job_id, "limit": max(1, min(limit, 1000))}
+    if status is not None:
+        status_filter = "AND status = :status"
+        params["status"] = status
+    result = await session.execute(
+        text(
+            f"""
+            SELECT id, ts_code, start_date, end_date, status, attempts,
+                   last_error, last_attempt_at, worker_id
+            FROM kline_sync_items
+            WHERE job_id = :job_id
+              {status_filter}
+            ORDER BY id
+            LIMIT :limit
+            """
+        ),
+        params,
+    )
+    items = [dict(row) for row in result.mappings().all()]
+    return {"job_id": job_id, "items": items, "count": len(items)}
+
+
+async def list_recent_jobs(
+    session: AsyncSession,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List recent jobs (newest first) with live per-status item counts."""
+    result = await session.execute(
+        text(
+            """
+            SELECT
+                j.id, j.job_type, j.status,
+                j.scope_total, j.scope_done, j.scope_failed,
+                j.permanent_failure_codes, j.config,
+                j.created_at, j.started_at, j.completed_at, j.error,
+                COUNT(i.id)::INT AS item_total,
+                COUNT(*) FILTER (WHERE i.status = 'pending')::INT AS pending,
+                COUNT(*) FILTER (WHERE i.status = 'running')::INT AS running,
+                COUNT(*) FILTER (WHERE i.status = 'done')::INT AS done,
+                COUNT(*) FILTER (WHERE i.status = 'permanently_failed')::INT AS permanently_failed
+            FROM kline_sync_jobs j
+            LEFT JOIN kline_sync_items i ON i.job_id = j.id
+            GROUP BY j.id
+            ORDER BY j.created_at DESC, j.id DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": max(1, min(limit, 100))},
+    )
+    jobs = []
+    for row in result.mappings().all():
+        job = dict(row)
+        job["permanent_failure_codes"] = list(job.get("permanent_failure_codes") or [])
+        jobs.append(job)
+    return jobs
+
+
+# ---------------------------------------------------------------------------
+# Sync progress (source of truth: daily_kline vs latest open trading day)
+# ---------------------------------------------------------------------------
+
+
+async def get_sync_progress(
+    session: AsyncSession,
+    *,
+    ts_codes: list[str] | None = None,
+    watchlist_id: int | None = None,
+) -> dict[str, Any]:
+    """Report K-line sync progress straight from ``daily_kline`` (source of truth).
+
+    A stock is "caught up" when ``MAX(daily_kline.trade_date)`` reaches the
+    latest open trading day. Deliberately independent of ``data_update_state``
+    (multiple rows per stock, per-source semantics) and of any Celery task
+    status. ``total`` excludes delisted stocks and unsupported markets — the
+    same scope used by ``infer_incremental_kline_ranges`` — so the progress
+    denominator always matches what a dispatch would actually sync.
+
+    Returns ``{latest_open_day, total, caught_up, remaining, not_caught_up_codes}``.
+    No failure counts here: permanent failures live in ``kline_sync_jobs``.
+    """
+    params: dict[str, Any] = {
+        "has_ts_codes": ts_codes is not None,
+        "ts_codes": ts_codes or [],
+        "has_watchlist": watchlist_id is not None,
+        "watchlist_id": watchlist_id if watchlist_id is not None else -1,
+    }
+    result = await session.execute(
+        text(
+            f"""
+            WITH latest AS (
+                SELECT MAX(cal_date) AS latest_open_day
+                FROM trade_calendar
+                WHERE is_open = TRUE AND cal_date <= CURRENT_DATE
+            ),
+            scope AS (
+                SELECT sb.ts_code
+                FROM stock_basic sb
+                CROSS JOIN latest l
+                WHERE sb.is_delisted = FALSE
+                  AND (sb.delist_date IS NULL OR sb.delist_date > l.latest_open_day)
+                  AND {supported_stock_sql_condition("sb")}
+                  AND (
+                      NOT CAST(:has_ts_codes AS BOOLEAN)
+                      OR sb.ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))
+                  )
+                  AND (
+                      NOT CAST(:has_watchlist AS BOOLEAN)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM watchlist w
+                          JOIN watchlist_groups wg
+                            ON wg.user_id = w.user_id AND wg.group_name = w.group_name
+                          WHERE wg.id = :watchlist_id AND w.ts_code = sb.ts_code
+                      )
+                  )
+            ),
+            dk AS (
+                SELECT ts_code, MAX(trade_date) AS last_kline_date
+                FROM daily_kline
+                WHERE ts_code IN (SELECT ts_code FROM scope)
+                GROUP BY ts_code
+            )
+            SELECT
+                (SELECT latest_open_day FROM latest) AS latest_open_day,
+                COUNT(s.ts_code)::INT AS total,
+                COUNT(*) FILTER (
+                    WHERE dk.last_kline_date >= (SELECT latest_open_day FROM latest)
+                )::INT AS caught_up,
+                COUNT(*) FILTER (
+                    WHERE dk.last_kline_date IS NULL
+                       OR dk.last_kline_date < (SELECT latest_open_day FROM latest)
+                )::INT AS remaining,
+                COALESCE(
+                    ARRAY_AGG(s.ts_code ORDER BY s.ts_code) FILTER (
+                        WHERE dk.last_kline_date IS NULL
+                           OR dk.last_kline_date < (SELECT latest_open_day FROM latest)
+                    ),
+                    ARRAY[]::VARCHAR[]
+                ) AS not_caught_up_codes
+            FROM scope s
+            LEFT JOIN dk ON dk.ts_code = s.ts_code
+            """
+        ),
+        params,
+    )
+    row = result.mappings().one()
+    return {
+        "latest_open_day": row["latest_open_day"],
+        "total": int(row["total"] or 0),
+        "caught_up": int(row["caught_up"] or 0),
+        "remaining": int(row["remaining"] or 0),
+        "not_caught_up_codes": list(row["not_caught_up_codes"] or []),
+    }
+
+
+async def get_active_stock_codes(
+    session: AsyncSession,
+    ts_codes: list[str],
+) -> list[str]:
+    """Filter ``ts_codes`` down to stocks NOT suspended on their latest K-line day.
+
+    Stocks with no K-line data at all are kept (we cannot know their status,
+    and they need an initial sync anyway).
+    """
+    if not ts_codes:
+        return []
+    result = await session.execute(
+        text(
+            """
+            WITH latest_k AS (
+                SELECT DISTINCT ON (ts_code) ts_code, is_suspended
+                FROM daily_kline
+                WHERE ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))
+                ORDER BY ts_code, trade_date DESC
+            )
+            SELECT c.code
+            FROM UNNEST(CAST(:ts_codes AS VARCHAR[])) AS c(code)
+            LEFT JOIN latest_k lk ON lk.ts_code = c.code
+            WHERE COALESCE(lk.is_suspended, FALSE) = FALSE
+            ORDER BY c.code
+            """
+        ),
+        {"ts_codes": ts_codes},
+    )
+    return [str(row[0]) for row in result.fetchall()]

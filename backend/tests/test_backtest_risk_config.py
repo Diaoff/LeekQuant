@@ -355,3 +355,38 @@ async def test_resolve_stock_codes_keeps_watchlist_filters_disabled_by_default()
     assert "f.pe_ttm" not in sql
     assert session.params[0]["user_id"] == 7
     assert session.params[0]["group_name"] == "手动组合"
+
+
+def test_backtest_task_uses_run_async_not_asyncio_run() -> None:
+    import inspect
+
+    import app.backtest.tasks as t
+
+    src = inspect.getsource(t)
+    assert "asyncio.run(" not in src, "backtest task must not call asyncio.run (causes 'different loop')"
+    assert "run_async(" in src, "backtest task must use run_async (persistent worker loop)"
+
+
+class _FakeMappings:
+    def __init__(self, row):
+        self._row = row
+
+    def one_or_none(self):
+        return self._row
+
+
+class _FakeExecuteResult:
+    def mappings(self):
+        return _FakeMappings({"id": 11, "status": "pending", "total_return": None,
+                              "error_message": None, "finished_at": None})
+
+
+@pytest.mark.asyncio
+async def test_backtest_status_returns_db_status_with_id() -> None:
+    session = CaptureSession([_FakeExecuteResult()])
+    resp = await backtests.backtest_status(11, FakeRequest(), session)
+    assert resp["id"] == 11
+    assert resp["status"] == "pending"
+    assert resp["ready"] is False
+    assert resp["error_message"] is None
+    assert "finished_at" in resp

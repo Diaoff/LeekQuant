@@ -6,7 +6,6 @@ from datetime import date
 from typing import Any, Literal
 from uuid import uuid4
 
-from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kombu.exceptions import OperationalError
 from pydantic import BaseModel, Field, model_validator
@@ -539,19 +538,37 @@ async def delete_backtest(
 
 
 @router.get("/{backtest_id}/status")
-async def backtest_status(backtest_id: str) -> dict[str, Any]:
-    async_result = AsyncResult(backtest_id, app=celery_app)
-    payload = {
-        "task_id": backtest_id,
-        "status": async_result.status.lower(),
-        "ready": async_result.ready(),
+async def backtest_status(
+    backtest_id: int,
+    req: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """返回回测的真实 DB 状态（按整数 id）。
+
+    Celery 任务会同步把终态（running/success/failed）写入 backtest_results，
+    因此直接读该行，而不是查 Celery result backend（它的 key 是 uuid task_id，不是 DB id）。
+    """
+    user_id = _extract_user_id(req)
+    row = (
+        await session.execute(
+            text(
+                "SELECT id, status, total_return, error_message, finished_at "
+                "FROM backtest_results WHERE id = :id AND user_id = :user_id"
+            ),
+            {"id": backtest_id, "user_id": user_id},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
+
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "total_return": row["total_return"],
+        "error_message": row["error_message"],
+        "finished_at": str(row["finished_at"]) if row["finished_at"] is not None else None,
+        "ready": row["status"] in ("success", "failed", "cancelled"),
     }
-    if async_result.ready():
-        if async_result.failed():
-            payload["error"] = str(async_result.result)
-        else:
-            payload["result"] = async_result.result
-    return payload
 
 
 @router.post("/{backtest_id}/cancel", status_code=202)

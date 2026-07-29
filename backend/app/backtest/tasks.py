@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -14,7 +15,10 @@ from app.backtest.adapter import BacktestConfig, BacktestRunner, KBar
 from app.backtest.cost import FeeConfig, build_fee_config
 from app.db.session import async_session_factory
 from app.preferences.service import get_trading_fee_config
+from app.core.asyncio_runtime import run_async
 from app.tasks.celery_app import celery_app
+
+logger = logging.getLogger(__name__)
 
 RISK_CONFIG_FIELDS = (
     "stop_loss_pct",
@@ -367,7 +371,6 @@ def _parse_kline_rows(rows: list[dict[str, Any]]) -> list[KBar]:
 @celery_app.task(name="app.tasks.run_backtest", bind=True, max_retries=1)
 def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
     """Execute a backtest by running user strategy code against historical K-line data."""
-    import asyncio
 
     async def _run() -> dict[str, Any]:
         async with async_session_factory() as session:
@@ -565,12 +568,11 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             return results
 
     try:
-        return asyncio.run(_run())
+        return run_async(_run())
     except SoftTimeLimitExceeded:
         # Soft time limit (task_soft_time_limit=1500s) exceeded — graceful cleanup.
         # Mark DB record as failed with explicit reason. Without this handler, Celery
         # would be hard-killed at task_time_limit=1800s leaving status='running'.
-        import asyncio as _asyncio
 
         async def _mark_timeout() -> None:
             async with async_session_factory() as session:
@@ -587,10 +589,30 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
 
         try:
-            _asyncio.run(_mark_timeout())
+            run_async(_mark_timeout())
         except Exception:
-            pass
+            logger.exception("Failed to mark backtest %s as timed out", backtest_id)
         return {"error": f"backtest {backtest_id} timed out (soft time limit exceeded)"}
     except Exception as exc:
         import traceback
-        return {"error": f"unhandled exception in backtest {backtest_id}: {traceback.format_exc()}"}
+        err_msg = f"unhandled exception in backtest {backtest_id}: {traceback.format_exc()}"
+        logger.error(err_msg)
+
+        async def _mark_failed() -> None:
+            async with async_session_factory() as session:
+                await session.execute(
+                    text(
+                        "UPDATE backtest_results "
+                        "SET status = 'failed', error_message = :err, finished_at = NOW() "
+                        "WHERE id = :id AND status IN ('pending', 'running')"
+                    ),
+                    {"err": err_msg[:2000], "id": backtest_id},
+                )
+                await session.commit()
+
+        try:
+            run_async(_mark_failed())
+        except Exception:
+            logger.exception("Failed to mark backtest %s as failed after unhandled error", backtest_id)
+
+        return {"error": err_msg}
