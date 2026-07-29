@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.data.fetcher import DataProvider, default_providers, fetch_with_fallback, get_data_proxy_url
+from app.data.fetcher import DataProvider, DataProviderError, default_providers, fetch_with_fallback, filter_open_circuits, get_data_proxy_url
 from app.data.normalizers import normalize_ts_code
 from app.data.repository import (
     create_alert,
@@ -802,9 +802,18 @@ async def sync_fundamentals(
             if commit_each:
                 async with async_session_factory() as wk_session:
                     try:
+                        # P1 NEW-1: filter open-circuit providers in async land
+                        # before to_thread. Use wk_session (per-stock session).
+                        per_stock_providers = await filter_open_circuits(
+                            wk_session, providers or default_providers(), "fundamentals"
+                        )
+                        if not per_stock_providers:
+                            raise DataProviderError(
+                                f"all providers circuit-open for fundamentals ({code})"
+                            )
                         source, records = await asyncio.to_thread(
                             fetch_with_fallback,
-                            providers or default_providers(),
+                            per_stock_providers,
                             "fetch_stock_fundamentals",
                             [code],
                             start_date,
@@ -826,9 +835,18 @@ async def sync_fundamentals(
                         await wk_session.commit()
                         return {"ts_code": code, "error": message}
 
+            # P1 NEW-1: filter open-circuit providers in async land before to_thread.
+            # session is the caller's session (non-commit_each mode).
+            filtered_provider_list = await filter_open_circuits(
+                session, provider_list, "fundamentals"
+            )
+            if not filtered_provider_list:
+                raise DataProviderError(
+                    f"all providers circuit-open for fundamentals ({code})"
+                )
             source, records = await asyncio.to_thread(
                 fetch_with_fallback,
-                provider_list,
+                filtered_provider_list,
                 "fetch_stock_fundamentals",
                 [code],
                 start_date,

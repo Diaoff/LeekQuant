@@ -1,11 +1,10 @@
-import asyncio
 import json
 import logging
 from datetime import timedelta
 
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import task_failure, task_prerun, task_success, worker_ready
+from celery.signals import task_failure, task_prerun, task_revoked, task_success, worker_process_init, worker_ready
 from kombu import Queue
 
 from app.core.config import get_settings
@@ -51,8 +50,8 @@ celery_app.conf.update(
         "app.tasks.trading_tasks.*": {"queue": "trading"},
         "app.tasks.signal_tasks.*": {"queue": "trading"},
     },
-    task_time_limit=1800,
-    task_soft_time_limit=1500,
+    task_time_limit=settings.celery_task_time_limit,
+    task_soft_time_limit=settings.celery_task_soft_time_limit,
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     task_default_retry_delay=60,
@@ -69,8 +68,19 @@ celery_app.conf.update(
             "schedule": crontab(day_of_week="sunday", hour=2, minute=0),
         },
         "incremental-kline-daily": {
-            "task": "app.tasks.data_tasks.incremental_kline_update",
-            "schedule": crontab(hour=17, minute=0),
+            "task": "app.tasks.data_tasks.kline_sync_dispatch",
+            "schedule": crontab(hour=16, minute=0),
+            "kwargs": {"job_type": "incremental"},
+        },
+        "incremental-kline-evening": {
+            "task": "app.tasks.data_tasks.kline_sync_dispatch",
+            "schedule": crontab(hour=21, minute=0),
+            "kwargs": {"job_type": "incremental"},
+        },
+        "full-kline-weekly": {
+            "task": "app.tasks.data_tasks.kline_sync_dispatch",
+            "schedule": crontab(day_of_week="sunday", hour=4, minute=0),
+            "kwargs": {"job_type": "full"},
         },
         "generate-signals-daily": {
             "task": "app.tasks.signal_tasks.generate_all_signals",
@@ -100,8 +110,27 @@ celery_app.conf.update(
             "task": "app.tasks.data_tasks.cleanup_stale_task_runs",
             "schedule": crontab(minute=15),  # hourly at :15
         },
+        "kline-sync-recover-stuck": {
+            "task": "app.tasks.data_tasks.kline_sync_recover_stuck",
+            "schedule": timedelta(seconds=settings.kline_sync_recover_interval_seconds),
+        },
     },
 )
+
+
+@worker_process_init.connect
+def init_async_loop(**_kwargs) -> None:
+    """Create one event loop per worker process and keep it alive.
+
+    Every Celery task body drives the async SQLAlchemy engine through this
+    loop (via ``app.core.asyncio_runtime.run_async``). Reusing a single loop
+    for the process lifetime prevents "Task ... attached to a different loop"
+    errors that ``asyncio.run`` (which closes the loop each call) would cause
+    on a module-level async engine.
+    """
+    from app.core.asyncio_runtime import get_loop
+
+    get_loop()
 
 
 @worker_ready.connect
@@ -114,13 +143,27 @@ def cleanup_stale_running_tasks_on_worker_ready(**_kwargs) -> None:
                 error_message="stale running task after celery worker startup",
             )
 
+    from app.core.asyncio_runtime import run_async
+
     try:
-        cleaned = asyncio.run(cleanup())
+        cleaned = run_async(cleanup())
     except Exception:
         logger.exception("Failed to clean stale running task records on worker startup")
         return
     if cleaned:
         logger.warning("Marked %s stale running task record(s) as failed", cleaned)
+
+    # Kick off one stuck-item recovery pass immediately so items left running
+    # by a crashed worker are reset to pending without waiting a full interval.
+    _trigger_recover_on_startup()
+
+
+def _trigger_recover_on_startup() -> None:
+    try:
+        celery_app.send_task("app.tasks.data_tasks.kline_sync_recover_stuck")
+        logger.info("Enqueued initial kline_sync_recover_stuck on worker startup")
+    except Exception:
+        logger.debug("Could not enqueue initial kline_sync_recover_stuck", exc_info=True)
 
 
 def _publish_task_event(status: str, task_id: str | None, task_name: str, **extra) -> None:
@@ -149,9 +192,65 @@ def on_task_prerun(sender=None, task_id=None, **kwargs) -> None:
 
 @task_success.connect
 def on_task_success(sender=None, result=None, **kwargs) -> None:
-    _publish_task_event("success", kwargs.get("task_id"), sender, result=str(result) if result is not None else None)
+    task_id = kwargs.get("task_id")
+    _publish_task_event("success", task_id, sender, result=str(result) if result is not None else None)
+    _reconcile_task_run(
+        task_id,
+        "success",
+        result=result if isinstance(result, dict) else None,
+    )
 
 
 @task_failure.connect
 def on_task_failure(sender=None, task_id=None, exception=None, **kwargs) -> None:
     _publish_task_event("failed", task_id, sender, error=str(exception) if exception else None)
+    _reconcile_task_run(
+        task_id,
+        "failed",
+        error_message=str(exception) if exception else "task failed",
+    )
+
+
+@task_revoked.connect
+def on_task_revoked(sender=None, request=None, **kwargs) -> None:
+    task_id = getattr(request, "id", None) or kwargs.get("task_id")
+    if task_id:
+        _reconcile_task_run(task_id, "failed", error_message="task revoked")
+
+
+def _reconcile_task_run(
+    task_id: str | None,
+    status: str,
+    *,
+    error_message: str | None = None,
+    result: dict | None = None,
+) -> None:
+    """Backstop for task_runs status drift.
+
+    The task body's own ``_run_tracked`` bookkeeping is the primary writer, but
+    it runs *inside* the (time-limited) task body and can be skipped when the
+    body is killed (e.g. SoftTimeLimitExceeded) — leaving the row stuck at
+    'running' while Celery reports the real terminal state. This runs from the
+    Celery signal (after the body has exited) with a fresh DB session, so it is
+    not affected by the kill. It is idempotent: it only touches rows that are
+    still non-terminal, so it never overwrites a status the body already wrote.
+    """
+    if not task_id:
+        return
+    try:
+        from app.core.asyncio_runtime import run_async
+        from app.data.repository import reconcile_task_run_status
+
+        async def _run() -> None:
+            async with async_session_factory() as session:
+                await reconcile_task_run_status(
+                    session,
+                    task_id=task_id,
+                    status=status,
+                    error_message=error_message,
+                    result=result,
+                )
+
+        run_async(_run())
+    except Exception:
+        logger.debug("Failed to reconcile task_runs for %s", task_id, exc_info=True)

@@ -9,8 +9,14 @@ from kombu.exceptions import OperationalError
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.data.repository import (
+    create_pending_task_run,
+    get_job_progress,
+    list_job_items,
+    list_recent_jobs,
+    mark_task_run_queue_failed,
+)
 from app.data.service import get_data_status, sync_stock_basic, sync_trade_calendar
-from app.data.repository import create_pending_task_run, mark_task_run_queue_failed
 from app.db.session import async_session_factory, get_session
 from app.tasks.celery_app import celery_app
 from app.tasks.data_tasks import sync_sample_kline
@@ -32,6 +38,29 @@ class KlineSyncRequest(BaseModel):
 @router.get("/status")
 async def data_status(session: AsyncSession = Depends(get_session)) -> dict:
     return await get_data_status(session)
+
+
+@router.get("/kline-sync/jobs")
+async def list_kline_sync_jobs(session: AsyncSession = Depends(get_session)) -> dict:
+    """List recent kline sync jobs with progress."""
+    jobs = await list_recent_jobs(session, limit=20)
+    return {"jobs": jobs}
+
+
+@router.get("/kline-sync/jobs/{job_id}")
+async def get_kline_sync_job(job_id: int, session: AsyncSession = Depends(get_session)) -> dict:
+    """Get a single kline sync job with progress."""
+    return await get_job_progress(session, job_id=job_id)
+
+
+@router.get("/kline-sync/jobs/{job_id}/items")
+async def get_kline_sync_job_items(
+    job_id: int,
+    status: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """List items for a kline sync job."""
+    return await list_job_items(session, job_id=job_id, status=status, limit=200)
 
 
 @router.post("/sync/stock-basic")

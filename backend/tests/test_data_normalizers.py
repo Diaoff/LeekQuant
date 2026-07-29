@@ -90,6 +90,48 @@ def test_normalize_stock_basic_infers_market_from_ts_code(ts_code: str, expected
     assert record.market == expected_market
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "中弘退",      # suffix 退
+        "退市金钰",    # prefix 退市
+        "欧浦退",      # suffix 退
+        "退市XXX",     # generic prefix pattern
+        "XXX退市",     # generic suffix pattern
+    ],
+)
+def test_normalize_stock_basic_detects_delisting_from_name(name: str) -> None:
+    """A-share exchanges rename delisted stocks to include "退" — the normalizer
+    must flag is_delisted=True from the name alone, even when delist_date is
+    missing. Otherwise sync_stock_basic upsert overwrites is_delisted to False
+    and signal generation (which filters is_delisted=FALSE) leaks BUY signals
+    for delisted stocks.
+    """
+    record = normalize_stock_basic(
+        {"ts_code": "000979.SZ", "name": name},
+        "adata",
+    )
+    assert record.is_delisted is True
+
+
+def test_normalize_stock_basic_does_not_flag_normal_name_as_delisted() -> None:
+    """Sanity: stocks without "退" in name are not delisted."""
+    record = normalize_stock_basic(
+        {"ts_code": "600000.SH", "name": "浦发银行"},
+        "adata",
+    )
+    assert record.is_delisted is False
+
+
+def test_normalize_stock_basic_still_uses_delist_date_when_name_clean() -> None:
+    """delist_date is still respected even when name doesn't contain "退"."""
+    record = normalize_stock_basic(
+        {"ts_code": "600000.SH", "name": "浦发银行", "delist_date": "20250101"},
+        "adata",
+    )
+    assert record.is_delisted is True
+
+
 def test_normalize_daily_kline_maps_akshare_fields() -> None:
     record = normalize_daily_kline(
         {

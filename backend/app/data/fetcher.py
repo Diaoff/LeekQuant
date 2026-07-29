@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import random
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
 from typing import TypeAlias
 
 import redis as redis_mod
 from requests.exceptions import ConnectionError as ReqConnectionError
+from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.error import URLError
 
 from app.core.config import get_settings
@@ -22,11 +26,13 @@ from app.data.providers import (
     provider_supports,
 )
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "DataProvider", "DataProviderError",
     "configure_providers",
     "default_providers", "providers_for_capability", "providers_for_method", "stock_basic_providers",
-    "fetch_with_fallback", "get_data_proxy_url",
+    "fetch_with_fallback", "fetch_with_fallback_short", "fetch_union", "filter_open_circuits", "get_data_proxy_url",
 ]
 
 ProviderList: TypeAlias = Iterable[DataProvider]
@@ -41,7 +47,11 @@ _PROVIDER_ORDER: list[str] = [
 ]
 _REDIS_CLIENT: redis_mod.Redis | None = None
 
-# Module-level circuit breaker singleton (lazy-initialized)
+# Module-level circuit breaker singleton (lazy-initialized).
+# Note: the breaker is consulted from the ASYNC service layer (via
+# filter_open_circuits) BEFORE asyncio.to_thread(fetch_with_fallback, ...) —
+# never from inside fetch_with_fallback itself, because the breaker's is_open
+# query needs an AsyncSession and we are inside a worker thread there.
 _BREAKER: CircuitBreaker | None = None
 
 
@@ -56,6 +66,45 @@ def reset_breaker_for_tests() -> None:
     """Test helper — clear the cached circuit breaker singleton."""
     global _BREAKER
     _BREAKER = None
+
+
+async def filter_open_circuits(
+    session: AsyncSession,
+    providers: list[DataProvider],
+    data_type: str,
+) -> list[DataProvider]:
+    """Filter out providers whose circuit breaker is currently OPEN.
+
+    MUST be called from an async context (the caller's main event loop),
+    BEFORE handing the provider list to ``fetch_with_fallback`` via
+    ``asyncio.to_thread``. The breaker's ``is_open`` query needs an
+    ``AsyncSession`` and cannot run inside the worker thread that
+    ``fetch_with_fallback`` executes in.
+
+    Uses ``CircuitBreaker.is_open_batch`` — a single SELECT per data_type
+    for all sources — rather than one query per (data_type, source) pair.
+    For sync_kline processing 4000+ stocks this is the difference between
+    ~12000 DB round-trips and 1.
+
+    Fail-open policy: if the breaker's DB query raises (e.g. DB unavailable),
+    the provider is kept in the list rather than dropped — the underlying
+    fetch will then surface the real error. This matches the previous
+    fail-open semantics but ONLY for unexpected breaker errors, not for
+    normal operation.
+
+    When the breaker is disabled (threshold <= 0), this is a no-op pass-through.
+    """
+    breaker = _get_breaker()
+    if breaker.threshold <= 0:
+        return list(providers)
+    sources = [p.name for p in providers]
+    try:
+        open_by_source = await breaker.is_open_batch(session, data_type, sources)
+    except Exception:
+        # Breaker query failed (DB unavailable, etc.) — fail-open by
+        # keeping all providers; the fetch itself will surface real errors.
+        return list(providers)
+    return [p for p in providers if not open_by_source.get(p.name, False)]
 
 
 def _get_redis() -> redis_mod.Redis | None:
@@ -145,6 +194,84 @@ def get_data_proxy_url() -> str | None:
     return get_settings().data_proxy_url
 
 
+_PING_SAMPLE_CODE = "000001.SZ"
+
+
+async def ping_providers(
+    session: AsyncSession,
+    providers: list[DataProvider],
+    data_type: str,
+    *,
+    sample_ts_code: str = _PING_SAMPLE_CODE,
+) -> list[DataProvider]:
+    """Test each provider with a single stock, return only working providers.
+
+    Runs a quick health check by fetching one stock's K-line for the last 5
+    days from each provider. Providers that fail are immediately recorded as
+    circuit-open in ``data_update_state`` so the per-stock loop never retries
+    them.
+
+    MUST be called from async context before ``asyncio.to_thread``.
+
+    Returns:
+        Filtered list of providers that returned data.
+    """
+    from app.data.repository import record_update_failure
+
+    settings = get_settings()
+    today = datetime.now(tz=UTC).date()
+    start = today - timedelta(days=10)
+    end = today
+
+    working: list[DataProvider] = []
+    capability = METHOD_CAPABILITIES.get("fetch_daily_kline", "daily_kline")
+
+    for provider in providers:
+        if not provider_supports(provider, capability):
+            continue
+        try:
+            result = await asyncio.to_thread(
+                fetch_with_fallback_short,
+                [provider],
+                "fetch_daily_kline",
+                sample_ts_code,
+                start,
+                end,
+                proxy_url=get_data_proxy_url(),
+            )
+            if result is not None:
+                working.append(provider)
+            else:
+                logger.warning("provider %s ping failed for %s", provider.name, sample_ts_code)
+                try:
+                    await record_update_failure(
+                        session, data_type, provider.name,
+                        f"ping failed: no data for {sample_ts_code}",
+                    )
+                except Exception:
+                    await session.rollback()
+        except Exception as exc:
+            logger.warning("provider %s ping raised: %s", provider.name, exc)
+            try:
+                await record_update_failure(
+                    session, data_type, provider.name,
+                    f"ping failed: {exc}",
+                )
+            except Exception:
+                await session.rollback()
+
+    if not working:
+        logger.error("ALL providers failed ping health-check for %s", data_type)
+    else:
+        logger.info(
+            "provider health-check for %s: %d/%d working — %s",
+            data_type, len(working), len(providers),
+            [p.name for p in working],
+        )
+
+    return working
+
+
 def _try_once(provider: DataProvider, method_name: str, args: tuple) -> list | None:
     method = getattr(provider, method_name)
     records = method(*args)
@@ -156,19 +283,19 @@ def fetch_with_fallback(
     method_name: str,
     *args,
     proxy_url: str | None = None,
-    data_type: str | None = None,
-    session=None,
 ) -> tuple[str, list]:
-    """Fetch with provider fallback, retry, and circuit breaker.
+    """Fetch with provider fallback + retry. Synchronous — runs in a worker
+    thread when called from async code via ``asyncio.to_thread``.
+
+    Circuit-breaker check is intentionally NOT done here: it requires an
+    ``AsyncSession`` and we are in a worker thread. Callers MUST filter
+    open-circuit providers beforehand using ``filter_open_circuits`` (async).
 
     Args:
         providers: Ordered list of providers (primary first).
         method_name: Provider method to call (e.g. "fetch_kline").
         *args: Positional args passed to the provider method.
-        proxy_url: Optional HTTP proxy URL for Chinese data sources.
-        data_type: If provided (and session too), enables circuit-breaker checks
-            against `data_update_state.failure_count` for each provider.
-        session: AsyncSession for circuit-breaker lookups. If None, breaker is bypassed.
+        proxy_url: Optional HTTP proxy for Chinese data sources.
 
     Returns:
         (provider_name, records) tuple from the first successful provider.
@@ -184,22 +311,11 @@ def fetch_with_fallback(
     if not provider_list:
         raise DataProviderError(f"no enabled providers support {capability or method_name}")
 
-    breaker = _get_breaker() if data_type else None
     settings = get_settings()
     max_retries = settings.data_max_retries
 
     with _data_proxy_ctx(proxy_url):
         for provider in provider_list:
-            # Circuit breaker check — skip provider if open
-            if breaker is not None and session is not None and data_type:
-                try:
-                    is_open = _breaker_sync_check(breaker, session, data_type, provider.name)
-                except Exception:
-                    is_open = False  # fail-open on breaker errors
-                if is_open:
-                    errors.append(f"{provider.name}: circuit open (skipped)")
-                    continue
-
             for attempt in range(max_retries):
                 try:
                     records = _try_once(provider, method_name, args)
@@ -222,18 +338,99 @@ def fetch_with_fallback(
     raise DataProviderError("; ".join(errors) or "all providers failed")
 
 
-def _breaker_sync_check(breaker: CircuitBreaker, session, data_type: str, source: str) -> bool:
-    """Synchronous wrapper for breaker.is_open — runs the coroutine via asyncio.
+def fetch_with_fallback_short(
+    providers: ProviderList,
+    method_name: str,
+    *args,
+    proxy_url: str | None = None,
+    max_attempts: int = 1,
+) -> tuple[str, list] | None:
+    """Like fetch_with_fallback but with NO retries and NO exception.
 
-    Returns False on any error (fail-open).
+    Used for health-check pings: returns (name, records) on first success,
+    None if all providers fail. Never raises — the caller decides what to do
+    with a None result.
     """
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside an async context — caller should pass an async-friendly session
-            # Fall back to fail-open rather than blocking the event loop
-            return False
-        return loop.run_until_complete(breaker.is_open(session, data_type, source))
-    except Exception:
-        return False
+    capability = METHOD_CAPABILITIES.get(method_name)
+    provider_list = [
+        provider for provider in providers if capability is None or provider_supports(provider, capability)
+    ]
+    if not provider_list:
+        return None
+
+    with _data_proxy_ctx(proxy_url):
+        for provider in provider_list:
+            for attempt in range(max_attempts):
+                try:
+                    method = getattr(provider, method_name)
+                    records = method(*args)
+                    if records:
+                        return provider.name, records
+                except Exception:
+                    break
+    return None
+
+
+def fetch_union(
+    providers: ProviderList,
+    method_name: str,
+    *args,
+    proxy_url: str | None = None,
+) -> tuple[list[str], list]:
+    """Fetch from ALL providers and union their records (deduped by ts_code).
+
+    Unlike :func:`fetch_with_fallback` (which returns the first non-empty
+    provider), this collects records from every provider and merges them.
+    Used by ``sync_stock_basic`` where *completeness* matters more than
+    single-source purity: e.g. AData's ``all_code()`` returns only ~990 rows
+    while AkShare returns the full ~5900-row A-share universe, so stopping at
+    the first non-empty provider would silently truncate the stock list.
+
+    First occurrence of a ``ts_code`` wins; later duplicates are dropped.
+
+    Returns:
+        (list_of_source_names, unioned_records).
+    """
+    capability = METHOD_CAPABILITIES.get(method_name)
+    provider_list = [
+        provider for provider in providers if capability is None or provider_supports(provider, capability)
+    ]
+    if not provider_list:
+        raise DataProviderError(f"no enabled providers support {capability or method_name}")
+
+    settings = get_settings()
+    max_retries = settings.data_max_retries
+
+    seen: set[str] = set()
+    unioned: list = []
+    sources: list[str] = []
+
+    with _data_proxy_ctx(proxy_url):
+        for provider in provider_list:
+            for attempt in range(max_retries):
+                try:
+                    method = getattr(provider, method_name)
+                    records = method(*args)
+                except _RETRYABLE as exc:
+                    if attempt < max_retries - 1:
+                        backoff = (2 ** attempt) + random.random()
+                        time.sleep(min(backoff, 30.0))
+                        continue
+                    break
+                except Exception:
+                    # Non-retryable provider error: skip this provider,
+                    # continue with the next one (resilient to one bad source).
+                    break
+                if not records:
+                    break
+                sources.append(provider.name)
+                for record in records:
+                    key = getattr(record, "ts_code", None)
+                    if key is None or key not in seen:
+                        if key is not None:
+                            seen.add(key)
+                        unioned.append(record)
+                break  # success for this provider; move on
+    if not unioned:
+        raise DataProviderError(f"all providers returned no records for {method_name}")
+    return sources, unioned

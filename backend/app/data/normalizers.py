@@ -121,7 +121,17 @@ def normalize_stock_basic(row: Mapping[str, Any], source: str) -> StockBasic:
     baostock_delisted = raw_status is not None and str(raw_status).strip() == "0"
     market = first_value(row, "market", "type", "板块") or infer_market(ts_code)
     exchange = first_value(row, "exchange", "交易所") or infer_exchange(ts_code)
-    is_delisted = delist_date is not None or baostock_delisted or truthy(first_value(row, "is_delisted", "退市", "delisted"))
+    # A-share exchanges rename delisted stocks to include "退" (e.g. "中弘退",
+    # "退市金钰", "欧浦退"). Name-based detection is the most reliable signal
+    # because data sources often omit delist_date but always carry the
+    # exchange-mandated name. Mirrors how is_st detects "ST" in the name.
+    name_delisted = "退" in name
+    is_delisted = (
+        delist_date is not None
+        or baostock_delisted
+        or name_delisted
+        or truthy(first_value(row, "is_delisted", "退市", "delisted"))
+    )
 
     return StockBasic(
         ts_code=ts_code,

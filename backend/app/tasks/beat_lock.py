@@ -30,6 +30,18 @@ DEFAULT_TTL_SECONDS = 1860
 T = TypeVar("T")
 
 
+class BeatLockSkipped(Exception):
+    """Raised by ``with_beat_lock`` when another worker holds the lock.
+
+    Replacing the old "return None" behaviour: a beat task that returns None is
+    reported as *success* by the Celery success signal, which wrongly marked its
+    (never-run) ``task_runs`` row as ``success`` — a "phantom success" with zero
+    batches. Raising instead lets the failure signal mark the row ``failed``
+    (or ``cancelled``, when we can identify it), so the status page stays honest.
+    Not in any task's ``autoretry_for`` tuple, so it never triggers a retry.
+    """
+
+
 class BeatLock:
     """Redis-backed distributed lock for beat tasks."""
 
@@ -97,6 +109,19 @@ class BeatLock:
     def _key(self, task_name: str) -> str:
         return f"beat:lock:{task_name}"
 
+    def is_locked(self, task_name: str) -> bool:
+        """Non-destructive check: is the lock currently held by anyone?
+
+        Used by the API layer to refuse dispatching a beat-locked task (and avoid
+        creating a phantom ``task_runs`` row) when the scheduled run already holds
+        the lock. Returns ``False`` on any Redis error (fail-open) so a transient
+        Redis blip never blocks legitimate user-triggered syncs.
+        """
+        try:
+            return self._client.get(self._key(task_name)) is not None
+        except RedisError:
+            return False
+
     def close(self) -> None:
         try:
             self._client.close()
@@ -123,12 +148,50 @@ def reset_beat_lock_for_tests() -> None:
         _beat_lock = None
 
 
+def _mark_cancelled_if_tracked(args: tuple) -> None:
+    """Best-effort: mark a skipped beat task's task_runs row as ``cancelled``.
+
+    A bound Celery task's first positional arg is the task instance, whose
+    ``request.id`` is the task_runs task_id. Marking the row cancelled (instead
+    of leaving it ``pending``/``running``) keeps the status page honest and
+    prevents the "phantom success" that the old "return None" path produced.
+    Any failure here is swallowed — the raise below is what truly stops the run.
+    """
+    try:
+        if not args:
+            return
+        self = args[0]
+        task_id = getattr(getattr(self, "request", None), "id", None)
+        if not task_id:
+            return
+
+        from app.core.asyncio_runtime import run_async
+        from app.data.repository import mark_task_run_cancelled
+        from app.db.session import async_session_factory
+
+        async def _do() -> None:
+            async with async_session_factory() as session:
+                await mark_task_run_cancelled(
+                    session,
+                    task_id=str(task_id),
+                    error_message="skipped: beat lock held by another worker",
+                )
+
+        run_async(_do())
+    except Exception:
+        logger.debug("failed to mark skipped beat task as cancelled", exc_info=True)
+
+
 def with_beat_lock(task_name: str) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator: acquire BeatLock before task body; skip if cannot acquire.
 
-    Returns None when the lock is held by another worker. The Celery task
-    should treat None as a successful no-op (do NOT raise, to avoid
-    triggering retry backoff).
+    When the lock is held by another worker, raises ``BeatLockSkipped`` instead
+    of returning ``None``. This is deliberate: a beat task returning ``None`` was
+    reported as *success* by the Celery success signal, which wrongly marked its
+    (never-run) ``task_runs`` row as ``success`` — a "phantom success" with zero
+    batches. Raising makes the failure signal mark the row ``failed``/``cancelled``
+    so the status page stays truthful. ``BeatLockSkipped`` is excluded from every
+    task's ``autoretry_for`` tuple, so it never triggers a retry backoff.
     """
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
@@ -137,7 +200,10 @@ def with_beat_lock(task_name: str) -> Callable[[Callable[..., T]], Callable[...,
             lock = get_beat_lock()
             if not lock.acquire(task_name):
                 logger.info("skip duplicate beat run: %s", task_name)
-                return None
+                _mark_cancelled_if_tracked(args)
+                raise BeatLockSkipped(
+                    f"beat lock held by another worker for {task_name}"
+                )
             try:
                 return func(*args, **kwargs)
             finally:

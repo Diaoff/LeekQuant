@@ -156,15 +156,29 @@ async def _run_tracked(
             result = await fn(async_session_factory)
         except Exception as exc:
             duration_ms = int((perf_counter() - started) * 1000)
+            # A task may attach a structured result to its exception via a
+            # ``result`` attribute so the task_runs row is marked failed yet
+            # retains detail for retry.
+            extra_result = getattr(exc, "result", None)
             try:
                 await tracker_session.rollback()
             except Exception as rollback_exc:  # pragma: no cover - original failure is more actionable.
                 exc.add_note(f"Failed to rollback task session: {rollback_exc}")
             try:
-                await _finish_task_run(tracker_session, run_id, "failed", duration_ms, error_message=str(exc))
+                await _finish_task_run(
+                    tracker_session,
+                    run_id,
+                    "failed",
+                    duration_ms,
+                    result=extra_result,
+                    error_message=str(exc),
+                )
             except Exception as finish_exc:
                 exc.add_note(f"Failed to record task failure: {finish_exc}")
             raise
         duration_ms = int((perf_counter() - started) * 1000)
-        await _finish_task_run(tracker_session, run_id, "success", duration_ms, result=result)
+        final_status = "success"
+        if isinstance(result, dict) and result.get("_task_status") in ("dispatched", "success"):
+            final_status = result.pop("_task_status")
+        await _finish_task_run(tracker_session, run_id, final_status, duration_ms, result=result)
         return _jsonable(result)

@@ -7,6 +7,7 @@ from redis.exceptions import RedisError
 from app.tasks import beat_lock as beat_lock_module
 from app.tasks.beat_lock import (
     BeatLock,
+    BeatLockSkipped,
     get_beat_lock,
     reset_beat_lock_for_tests,
     with_beat_lock,
@@ -154,8 +155,54 @@ def test_decorator_skips_task_when_lock_held():
     def task():
         raise AssertionError("task should not run when lock is held")
 
-    # Returns None, no exception
-    assert task() is None
+    # Must raise BeatLockSkipped (not return None): returning None used to make
+    # the Celery success signal wrongly mark the row "success" (phantom success).
+    with pytest.raises(BeatLockSkipped):
+        task()
+
+
+def test_decorator_marks_cancelled_when_lock_held(monkeypatch):
+    """When the lock is held, the skipped run's task_runs row is marked cancelled."""
+    lock, fake = _make_beat_lock()
+    fake.store["beat:lock:test.cancelled"] = "another-worker"
+    beat_lock_module._beat_lock = lock
+
+    cancelled: dict = {}
+
+    async def fake_mark_cancelled(session, *, task_id, error_message):
+        cancelled["task_id"] = task_id
+        cancelled["error_message"] = error_message
+
+    def fake_session_cm():
+        class _S:
+            async def __aenter__(self):
+                return _S
+
+            async def __aexit__(self, *_e):
+                return False
+
+        return _S()
+
+    monkeypatch.setattr(
+        "app.data.repository.mark_task_run_cancelled", fake_mark_cancelled
+    )
+    monkeypatch.setattr("app.db.session.async_session_factory", fake_session_cm)
+
+    # A bound Celery task's first positional arg carries request.id.
+    class _FakeRequest:
+        id = "task-cancelled-1"
+
+    class _FakeSelf:
+        request = _FakeRequest()
+
+    @with_beat_lock("test.cancelled")
+    def task(*_args):
+        raise AssertionError("should not run")
+
+    with pytest.raises(BeatLockSkipped):
+        task(_FakeSelf())
+    assert cancelled["task_id"] == "task-cancelled-1"
+    assert "beat lock" in (cancelled["error_message"] or "")
 
 
 def test_decorator_releases_lock_after_success():

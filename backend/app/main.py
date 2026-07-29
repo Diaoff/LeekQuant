@@ -84,10 +84,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     request_id = getattr(request.state, "request_id", "unknown")
     logger.exception(
         "unhandled exception",
-        error=exc.__class__.__name__,
-        path=request.url.path,
-        method=request.method,
-        request_id=request_id,
+        extra={
+            "error": exc.__class__.__name__,
+            "path": request.url.path,
+            "method": request.method,
+            "request_id": request_id,
+        },
     )
     return JSONResponse(
         status_code=500,

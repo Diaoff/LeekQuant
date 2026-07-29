@@ -59,6 +59,48 @@ class CircuitBreaker:
         # Cooldown expired → half-open (allow one attempt)
         return False
 
+    async def is_open_batch(
+        self,
+        session: AsyncSession,
+        data_type: str,
+        sources: list[str],
+    ) -> dict[str, bool]:
+        """Batched version of is_open — one DB query for all sources.
+
+        Returns ``{source: is_open}`` for every requested source. Sources
+        absent from the table are returned as ``False`` (closed).
+
+        Why this matters: ``sync_kline`` processes 4000+ stocks, each formerly
+        triggering N provider × 1 breaker.is_open query = 12000+ DB round-trips
+        just for the breaker. This method collapses those to a single SELECT.
+        """
+        if self.threshold <= 0 or not sources:
+            return {s: False for s in sources}
+        rows = (await session.execute(
+            text(
+                """
+                SELECT source, MAX(failure_count) AS failure_count, MAX(last_failure_at) AS last_failure_at
+                FROM data_update_state
+                WHERE data_type = :dt AND source = ANY(CAST(:sources AS VARCHAR[]))
+                GROUP BY source
+                """,
+            ),
+            {"dt": data_type, "sources": list(sources)},
+        )).all()
+        open_by_source: dict[str, bool] = {s: False for s in sources}
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            source = row.source
+            if row.failure_count is None or row.failure_count < self.threshold:
+                continue
+            last_failure = row.last_failure_at
+            if last_failure is None:
+                continue
+            if now - last_failure.replace(tzinfo=timezone.utc) < self.cooldown:
+                open_by_source[source] = True
+            # else: cooldown elapsed → half-open → False (allow attempt)
+        return open_by_source
+
     async def record_success(self, session: AsyncSession, data_type: str, source: str) -> None:
         """Delegate to repository.record_update_success — closes the circuit."""
         # Intentionally a thin wrapper; the repository function does the UPSERT.

@@ -92,7 +92,7 @@ async def test_get_kline_sync_returns_default_when_preference_missing() -> None:
 
     result = await service.get_kline_sync_payload(session)
 
-    assert result == {"full_kline_sync_concurrency": 2}
+    assert result == {"full_kline_sync_concurrency": 8}
     assert session.params[0]["user_id"] == 0
     assert session.params[0]["key"] == "kline_sync"
 

@@ -126,7 +126,7 @@ async def test_task_body_close_session_doesnt_break_finish(monkeypatch):
 
     async def task_body(session_factory):
         # Open and explicitly close the task body's own session, mimicking
-        # sync_fundamentals_task / incremental_kline_update behavior.
+        # sync_fundamentals_task / kline_sync_dispatch behavior.
         async with session_factory() as session:
             await session.execute(text("SELECT 1"))
         # Even after the task body's session is gone (context manager exited),
