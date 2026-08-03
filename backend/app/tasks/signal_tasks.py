@@ -21,6 +21,7 @@ from app.sim.service import SignalOrderRequest, _insert_signal, _money, generate
 from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
 from app.tasks.tracking import _run_tracked, with_session
+from app.core.asyncio_runtime import run_async
 
 LOOKBACK_BARS = 60
 MAX_SIGNAL_CONCURRENCY = 4
@@ -309,7 +310,7 @@ async def _latest_factor_scores(session, trade_date: date, ts_codes: list[str]) 
                   AND trade_date <= :trade_date
                   AND ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))
             )
-            SELECT sr.ts_code, sr.trade_date, sr.total_score, sr.rank
+            SELECT sr.ts_code, sr.trade_date, sr.total_score, sr.rank, sr.score_run_id
             FROM scoring_rank sr
             JOIN latest_rank_date lrd ON lrd.trade_date = sr.trade_date
             WHERE sr.scope_type = 'all'
@@ -849,7 +850,7 @@ async def generate_intraday_position_signals_for_date(
 @with_beat_lock("app.tasks.signal_tasks.generate_all_signals")
 def generate_all_signals(self, trade_date: str | None = None, concurrency: int | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else None
-    result = asyncio.run(
+    result = run_async(
         _run_tracked(
             "generate_all_signals",
             self.request.id,
@@ -872,7 +873,7 @@ def generate_all_signals(self, trade_date: str | None = None, concurrency: int |
 )
 def generate_intraday_position_signals(self, trade_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else None
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "generate_intraday_position_signals",
             self.request.id,

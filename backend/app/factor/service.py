@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -15,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.factor.definitions import BUILTIN_FACTORS
 from app.factor.expression import FactorContext, evaluate_expression, validate_expression as _validate_expression
 from app.libs import MyTT
+
+logger = logging.getLogger(__name__)
 
 FACTOR_QUANT = Decimal("0.00000001")
 SCORE_QUANT = Decimal("0.00000001")
@@ -58,6 +62,104 @@ def _serialize_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_serialize_value(item) for item in value]
     return value
+
+
+def _compute_definition_hash(definitions: list[dict[str, Any]]) -> str:
+    sorted_defs = sorted(definitions, key=lambda d: d["name"])
+    payload = json.dumps(sorted_defs, ensure_ascii=False, default=str, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _compute_universe_hash(ts_codes: list[str]) -> str:
+    sorted_codes = sorted(ts_codes)
+    payload = ",".join(sorted_codes)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+async def _create_score_run(
+    session: AsyncSession,
+    *,
+    score_date: date,
+    scope_type: str,
+    scope_value: str | None,
+    definitions: list[dict[str, Any]],
+    ts_codes: list[str],
+) -> int:
+    definition_hash = _compute_definition_hash(definitions)
+    universe_hash = _compute_universe_hash(ts_codes)
+    result = await session.execute(
+        text(
+            """
+            INSERT INTO factor_score_runs (
+                score_date, scope_type, scope_value, definition_snapshot,
+                definition_hash, universe_hash, data_cutoff, engine_version, status
+            )
+            VALUES (
+                :score_date, :scope_type, :scope_value, CAST(:snapshot AS JSONB),
+                :definition_hash, :universe_hash, :score_date, '1', 'running'
+            )
+            RETURNING id
+            """
+        ),
+        {
+            "score_date": score_date,
+            "scope_type": scope_type,
+            "scope_value": scope_value if scope_type != "all" else None,
+            "snapshot": _json(_serialize_value(definitions)),
+            "definition_hash": definition_hash,
+            "universe_hash": universe_hash,
+        },
+    )
+    return int(result.scalar_one())
+
+
+async def _complete_score_run(
+    session: AsyncSession,
+    *,
+    score_run_id: int,
+    coverage: dict[str, Any] | None = None,
+    factor_counts: dict[str, int] | None = None,
+) -> None:
+    await session.execute(
+        text(
+            """
+            UPDATE factor_score_runs
+            SET status = 'success',
+                coverage = CAST(:coverage AS JSONB),
+                factor_counts = CAST(:factor_counts AS JSONB),
+                finished_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": score_run_id,
+            "coverage": _json(coverage or {}),
+            "factor_counts": _json(factor_counts or {}),
+        },
+    )
+
+
+async def _fail_score_run(
+    session: AsyncSession,
+    *,
+    score_run_id: int,
+    error_summary: dict[str, Any] | None = None,
+) -> None:
+    await session.execute(
+        text(
+            """
+            UPDATE factor_score_runs
+            SET status = 'failed',
+                error_summary = CAST(:error_summary AS JSONB),
+                finished_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {
+            "id": score_run_id,
+            "error_summary": _json(error_summary or {}),
+        },
+    )
 
 
 def serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -117,7 +219,15 @@ async def seed_factor_definitions(session: AsyncSession, *, commit: bool = True)
                 :name, :display_name, :category, :expression, :direction,
                 :default_weight, :enabled, :description
             )
-            ON CONFLICT (name) DO NOTHING
+            ON CONFLICT (name) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                category = EXCLUDED.category,
+                expression = EXCLUDED.expression,
+                direction = EXCLUDED.direction,
+                default_weight = EXCLUDED.default_weight,
+                enabled = EXCLUDED.enabled,
+                description = EXCLUDED.description,
+                updated_at = NOW()
             """
         ),
         rows,
@@ -398,6 +508,7 @@ def _compute_raw_factor_values(
             expression = defn.get("expression", "")
             if not expression:
                 continue
+            factor_errors: list[str] = []
             for ts_code in ts_codes:
                 rows = by_code.get(ts_code, [])
                 if not rows:
@@ -432,8 +543,12 @@ def _compute_raw_factor_values(
                     last_val = float(result[-1]) if len(result) > 0 else np.nan
                     if np.isfinite(last_val):
                         raw[factor_name][ts_code] = _to_decimal(last_val)
-                except Exception:
-                    continue
+                except Exception as e:
+                    factor_errors.append(f"{ts_code}: {e}")
+            if factor_errors:
+                logger.warning("factor %s: %d errors: %s", factor_name, len(factor_errors), "; ".join(factor_errors[:5]))
+        if not any(raw.values()):
+            return {}
         return raw
 
     for ts_code, row in fundamentals.items():
@@ -468,31 +583,38 @@ async def _upsert_factor_values(
     *,
     trade_date: date,
     rows: list[dict[str, Any]],
+    score_run_id: int | None = None,
 ) -> int:
     if not rows:
         return 0
+    params = []
+    for row in rows:
+        r = dict(row)
+        r["score_run_id"] = score_run_id
+        params.append(r)
     await session.execute(
         text(
             """
             INSERT INTO factor_values (
                 ts_code, trade_date, factor_name, value, normalized_value,
-                percentile_rank, data_source, updated_at
+                percentile_rank, data_source, score_run_id, updated_at
             )
             VALUES (
                 :ts_code, :trade_date, :factor_name, :value, :normalized_value,
-                :percentile_rank, 'computed', NOW()
+                :percentile_rank, 'computed', :score_run_id, NOW()
             )
             ON CONFLICT (ts_code, trade_date, factor_name) DO UPDATE SET
                 value = EXCLUDED.value,
                 normalized_value = EXCLUDED.normalized_value,
                 percentile_rank = EXCLUDED.percentile_rank,
                 data_source = EXCLUDED.data_source,
+                score_run_id = EXCLUDED.score_run_id,
                 updated_at = NOW()
             """
         ),
-        rows,
+        params,
     )
-    return len(rows)
+    return len(params)
 
 
 async def _delete_factor_values_for_date(
@@ -568,6 +690,7 @@ async def _upsert_scoring_rank(
     scope_value: str | None,
     factor_rows: list[dict[str, Any]],
     definitions: list[dict[str, Any]],
+    score_run_id: int | None = None,
 ) -> int:
     codes = await _scope_codes(session, scope_type, scope_value)
     definition_by_name = {row["name"]: row for row in definitions}
@@ -618,6 +741,7 @@ async def _upsert_scoring_rank(
                 "rank": rank,
                 "percentile_rank": Decimal(str(float(percentile.loc[ts_code]))).quantize(SCORE_QUANT, rounding=ROUND_HALF_UP),
                 "factor_breakdown": _json(_serialize_value(breakdown[ts_code])),
+                "score_run_id": score_run_id,
             }
         )
 
@@ -626,23 +750,35 @@ async def _upsert_scoring_rank(
             """
             INSERT INTO scoring_rank (
                 trade_date, ts_code, scope_type, scope_value, total_score,
-                rank, percentile_rank, factor_breakdown, updated_at
+                rank, percentile_rank, factor_breakdown, score_run_id, updated_at
             )
             VALUES (
                 :trade_date, :ts_code, :scope_type, :scope_value, :total_score,
-                :rank, :percentile_rank, CAST(:factor_breakdown AS JSONB), NOW()
+                :rank, :percentile_rank, CAST(:factor_breakdown AS JSONB),
+                :score_run_id, NOW()
             )
             ON CONFLICT (trade_date, ts_code, scope_type, (COALESCE(scope_value, ''))) DO UPDATE SET
                 total_score = EXCLUDED.total_score,
                 rank = EXCLUDED.rank,
                 percentile_rank = EXCLUDED.percentile_rank,
                 factor_breakdown = EXCLUDED.factor_breakdown,
+                score_run_id = EXCLUDED.score_run_id,
                 updated_at = NOW()
             """
         ),
         rows,
     )
     return len(rows)
+
+
+async def validate_all_enabled_expressions(session: AsyncSession) -> list[dict[str, str]]:
+    definitions = await _enabled_factor_definitions(session)
+    invalid: list[dict[str, str]] = []
+    for defn in definitions:
+        ok, error = _validate_expression(defn["expression"])
+        if not ok:
+            invalid.append({"name": defn["name"], "expression": defn["expression"], "error": error or "unknown"})
+    return invalid
 
 
 async def compute_factors_for_date(
@@ -664,6 +800,12 @@ async def compute_factors_for_date(
     await seed_factor_definitions(session, commit=False)
     definitions = await _enabled_factor_definitions(session)
     definition_by_name = {row["name"]: row for row in definitions}
+
+    invalid = await validate_all_enabled_expressions(session)
+    if invalid:
+        details = "; ".join(f"{i['name']}: {i['error']}" for i in invalid)
+        raise ValueError(f"invalid factor expression(s): {details}")
+
     await _delete_factor_values_for_date(
         session,
         trade_date=run_date,
@@ -679,39 +821,71 @@ async def compute_factors_for_date(
     kline_rows = await _recent_kline_rows(session, run_date)
     raw_values = _compute_raw_factor_values(fundamentals, kline_rows, definitions)
 
-    factor_rows: list[dict[str, Any]] = []
-    factor_counts: dict[str, int] = {}
-    for factor_name, values in raw_values.items():
-        definition = definition_by_name.get(factor_name)
-        if definition is None:
-            continue
-        normalized = normalize_cross_section(values, int(definition["direction"]))
-        factor_counts[factor_name] = len(normalized)
-        for ts_code, raw_value in values.items():
-            normalized_row = normalized.get(ts_code)
-            if normalized_row is None:
-                continue
-            factor_rows.append(
-                {
-                    "ts_code": ts_code,
-                    "trade_date": run_date,
-                    "factor_name": factor_name,
-                    "value": raw_value,
-                    "normalized_value": normalized_row["normalized_value"],
-                    "percentile_rank": normalized_row["percentile_rank"],
-                }
-            )
-
-    values_written = await _upsert_factor_values(session, trade_date=run_date, rows=factor_rows)
-    rank_written = await _upsert_scoring_rank(
+    ts_codes = sorted(set(kline["ts_code"] for kline in kline_rows))
+    score_run_id = await _create_score_run(
         session,
-        trade_date=run_date,
+        score_date=run_date,
         scope_type=scope_type,
         scope_value=scope_value,
-        factor_rows=factor_rows,
         definitions=definitions,
+        ts_codes=ts_codes,
     )
-    await session.commit()
+
+    try:
+        factor_rows: list[dict[str, Any]] = []
+        factor_counts: dict[str, int] = {}
+        for factor_name, values in raw_values.items():
+            definition = definition_by_name.get(factor_name)
+            if definition is None:
+                continue
+            normalized = normalize_cross_section(values, int(definition["direction"]))
+            factor_counts[factor_name] = len(normalized)
+            for ts_code, raw_value in values.items():
+                normalized_row = normalized.get(ts_code)
+                if normalized_row is None:
+                    continue
+                factor_rows.append(
+                    {
+                        "ts_code": ts_code,
+                        "trade_date": run_date,
+                        "factor_name": factor_name,
+                        "value": raw_value,
+                        "normalized_value": normalized_row["normalized_value"],
+                        "percentile_rank": normalized_row["percentile_rank"],
+                    }
+                )
+
+        values_written = await _upsert_factor_values(
+            session, trade_date=run_date, rows=factor_rows, score_run_id=score_run_id,
+        )
+        rank_written = await _upsert_scoring_rank(
+            session,
+            trade_date=run_date,
+            scope_type=scope_type,
+            scope_value=scope_value,
+            factor_rows=factor_rows,
+            definitions=definitions,
+            score_run_id=score_run_id,
+        )
+
+        if rank_written == 0:
+            raise ValueError(
+                f"factor computation produced zero rank rows for {run_date.isoformat()} "
+                f"(scope={scope_type}/{scope_value or 'all'})"
+            )
+
+        await _complete_score_run(
+            session,
+            score_run_id=score_run_id,
+            coverage={"scope_type": scope_type, "scope_value": scope_value, "stock_count": len(ts_codes)},
+            factor_counts=factor_counts,
+        )
+        await session.commit()
+    except Exception:
+        await _fail_score_run(session, score_run_id=score_run_id)
+        await session.commit()
+        raise
+
     return {
         "trade_date": run_date.isoformat(),
         "factor_count": len(definitions),
@@ -720,6 +894,7 @@ async def compute_factors_for_date(
         "scope_type": scope_type,
         "scope_value": scope_value,
         "factor_counts": factor_counts,
+        "score_run_id": score_run_id,
     }
 
 

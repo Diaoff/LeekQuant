@@ -1,7 +1,7 @@
 """Celery tasks for simulation trading maintenance."""
 from __future__ import annotations
 
-import asyncio
+from app.core.asyncio_runtime import run_async
 from datetime import date, datetime, time
 from typing import Any
 
@@ -47,7 +47,7 @@ async def _is_open_trade_day(session, run_date: date) -> bool:
 @with_beat_lock("app.tasks.trading_tasks.unlock_t1_daily")
 def unlock_t1_daily(self, trade_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else date.today()
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "unlock_t1_daily",
             self.request.id,
@@ -74,7 +74,7 @@ async def _unlock_t1_daily(session, run_date: date) -> dict[str, Any]:
 @with_beat_lock("app.tasks.trading_tasks.snapshot_nav_daily")
 def snapshot_nav_daily(self, nav_date: str | None = None) -> dict[str, Any]:
     run_date = date.fromisoformat(nav_date) if nav_date else date.today()
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "snapshot_nav_daily",
             self.request.id,
@@ -115,7 +115,7 @@ async def _snapshot_nav_daily(session, run_date: date) -> dict[str, Any]:
 @with_beat_lock("app.tasks.trading_tasks.match_pending_orders")
 def match_pending_orders(self, trade_date: str | None = None, match_mode: str = "close") -> dict[str, Any]:
     run_date = date.fromisoformat(trade_date) if trade_date else date.today()
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "match_pending_orders",
             self.request.id,
@@ -186,4 +186,4 @@ def realtime_risk_guard(
             await guard.run_snapshot_polling(trade_date=run_date)
         return {"trade_date": run_date.isoformat(), "status": "stopped"}
 
-    return asyncio.run(run_guard())
+    return run_async(run_guard())

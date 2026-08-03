@@ -95,6 +95,7 @@ kill_port "$FRONTEND_PORT"
 if [[ "$WITH_CELERY" -eq 1 ]]; then
   echo "Stopping celery..."
   kill_pid_file celery-worker
+  kill_pid_file celery-backtest-worker
   kill_pid_file celery-beat
 fi
 

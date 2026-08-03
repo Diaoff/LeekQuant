@@ -5,6 +5,15 @@ import * as monaco from 'monaco-editor'
 import { fetchJson, formatDateTime, formatNumber } from '../lib/utils'
 import { MYTT_FUNCTIONS, MYTT_CATEGORY_LABELS, createCompletionItem, createSignatureHelpProvider } from '../lib/mytt-completions'
 import Skeleton from '../components/Skeleton'
+import BacktestRunModal from '../components/BacktestRunModal'
+import {
+  type BacktestRunParams,
+  type WatchlistGroupOption,
+   buildBatchBacktestRequest,
+  buildSingleBacktestRequest,
+  createDefaultBacktestRunParams,
+  applyLastBacktestRiskParams,
+} from '../lib/backtest-run'
 
 loader.config({ monaco })
 
@@ -84,46 +93,14 @@ interface BacktestListResult {
   win_rate: string | null
   trade_count: number | null
   performance: Record<string, unknown> | null
+  params_snapshot?: unknown
   trade_records: unknown[] | null
   error_message: string | null
   created_at: string
   finished_at: string | null
 }
 
-interface BacktestParams {
-  start_date: string
-  end_date: string
-  initial_cash: number
-  target_type: 'all' | 'market' | 'watchlist_group'
-  target_value: string | string[]
-  exclude_st: boolean
-  exclude_loss_pe: boolean
-  stop_loss_pct: string
-  take_profit_pct: string
-  trailing_stop_pct: string
-  time_stop_days: string
-}
-
-interface WatchlistGroupOption {
-  group_name: string
-  item_count: number
-}
-
-const MARKET_OPTIONS = ['主板', '创业板', '科创板', '北交所'] as const
-
 type ViewKey = 'list' | 'edit'
-type BacktestTargetType = BacktestParams['target_type']
-type MarketOption = typeof MARKET_OPTIONS[number]
-
-function defaultFiltersForTarget(targetType: BacktestTargetType) {
-  const enabled = targetType === 'all' || targetType === 'market'
-  return { exclude_st: enabled, exclude_loss_pe: enabled }
-}
-
-function selectedMarkets(value: BacktestParams['target_value']): MarketOption[] {
-  if (!Array.isArray(value)) return []
-  return value.filter((market): market is MarketOption => MARKET_OPTIONS.includes(market as MarketOption))
-}
 
 const DEFAULT_CODE = `# 双均线策略示例
 # 可用指标: MA, EMA, RSI, MACD, BOLL, KDJ, ATR 等 (MyTT)
@@ -168,18 +145,8 @@ export default function StrategyPage() {
   const [targetStrategy, setTargetStrategy] = React.useState<Strategy | null>(null)
   const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
   const [batchMode, setBatchMode] = React.useState(false)
-  const [backtestParams, setBacktestParams] = React.useState<BacktestParams>({
-    start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
-    end_date: new Date().toISOString().split('T')[0],
-    initial_cash: 100000,
-    target_type: 'all',
-    target_value: '',
-    ...defaultFiltersForTarget('all'),
-    stop_loss_pct: '',
-    take_profit_pct: '',
-    trailing_stop_pct: '',
-    time_stop_days: '',
-  })
+  const [submittingBacktest, setSubmittingBacktest] = React.useState(false)
+  const [backtestParams, setBacktestParams] = React.useState<BacktestRunParams>(() => createDefaultBacktestRunParams())
 
   const loadStrategies = React.useCallback(async () => {
     setLoading(true)
@@ -271,61 +238,24 @@ export default function StrategyPage() {
     }
   }
 
-  const selectTargetType = (targetType: BacktestTargetType) => {
-    setBacktestParams({
-      ...backtestParams,
-      target_type: targetType,
-      target_value: targetType === 'market' ? [] : '',
-      ...defaultFiltersForTarget(targetType),
-    })
-  }
-
-  const toggleMarketTarget = (market: MarketOption) => {
-    const current = selectedMarkets(backtestParams.target_value)
-    const next = current.includes(market)
-      ? current.filter((item) => item !== market)
-      : MARKET_OPTIONS.filter((item) => item === market || current.includes(item))
-    setBacktestParams({ ...backtestParams, target_value: next })
-  }
-
-  const runBacktest = async (strategy: Strategy) => {
+  const runBacktest = (strategy: Strategy) => {
+    setError(null)
     setBatchMode(false)
     setTargetStrategy(strategy)
-    setBacktestParams({
-      start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
-      end_date: new Date().toISOString().split('T')[0],
-      initial_cash: 100000,
-      target_type: 'all',
-      target_value: '',
-      ...defaultFiltersForTarget('all'),
-      stop_loss_pct: '',
-      take_profit_pct: '',
-      trailing_stop_pct: '',
-      time_stop_days: '',
-    })
+    const defaults = createDefaultBacktestRunParams()
+    const lastRunForStrategy = runHistory
+      .filter((r) => r.strategy_id === strategy.id)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+    setBacktestParams(applyLastBacktestRiskParams(defaults, lastRunForStrategy ?? null))
     setShowBacktestModal(true)
   }
 
-  const confirmBatchBacktest = async () => {
+  const confirmBatchBacktest = async (params: BacktestRunParams) => {
     setError(null)
     setNotice(null)
+    setSubmittingBacktest(true)
     try {
-      const config: Record<string, unknown> = {}
-      if (backtestParams.stop_loss_pct) config.stop_loss_pct = parseFloat(backtestParams.stop_loss_pct) / 100
-      if (backtestParams.take_profit_pct) config.take_profit_pct = parseFloat(backtestParams.take_profit_pct) / 100
-      if (backtestParams.trailing_stop_pct) config.trailing_stop_pct = parseFloat(backtestParams.trailing_stop_pct) / 100
-      if (backtestParams.time_stop_days) config.time_stop_days = parseInt(backtestParams.time_stop_days, 10)
-      const body = {
-        strategy_ids: [...selectedIds],
-        start_date: backtestParams.start_date,
-        end_date: backtestParams.end_date,
-        initial_cash: backtestParams.initial_cash,
-        config: Object.keys(config).length > 0 ? config : undefined,
-        target_type: backtestParams.target_type,
-        target_value: backtestParams.target_type === 'all' ? null : backtestParams.target_value,
-        exclude_st: backtestParams.exclude_st,
-        exclude_loss_pe: backtestParams.exclude_loss_pe,
-      }
+      const body = buildBatchBacktestRequest([...selectedIds], params)
       const result = await fetchJson<BatchBacktestSubmitResponse>('/api/backtests/batch', { method: 'POST', body: JSON.stringify(body) })
       setNotice(`已提交 ${result.total} 个回测任务: ${result.strategy_names.join(', ')}`)
       setShowBacktestModal(false)
@@ -334,34 +264,22 @@ export default function StrategyPage() {
       await loadRunHistory()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setSubmittingBacktest(false)
     }
   }
 
-  const confirmBacktest = async () => {
+  const confirmBacktest = async (params: BacktestRunParams) => {
     if (batchMode) {
-      await confirmBatchBacktest()
+      await confirmBatchBacktest(params)
       return
     }
     if (!targetStrategy) return
     setError(null)
     setNotice(null)
+    setSubmittingBacktest(true)
     try {
-      const config: Record<string, unknown> = {}
-      if (backtestParams.stop_loss_pct) config.stop_loss_pct = parseFloat(backtestParams.stop_loss_pct) / 100
-      if (backtestParams.take_profit_pct) config.take_profit_pct = parseFloat(backtestParams.take_profit_pct) / 100
-      if (backtestParams.trailing_stop_pct) config.trailing_stop_pct = parseFloat(backtestParams.trailing_stop_pct) / 100
-      if (backtestParams.time_stop_days) config.time_stop_days = parseInt(backtestParams.time_stop_days, 10)
-      const body = {
-        strategy_id: targetStrategy.id,
-        start_date: backtestParams.start_date,
-        end_date: backtestParams.end_date,
-        initial_cash: backtestParams.initial_cash,
-        config: Object.keys(config).length > 0 ? config : undefined,
-        target_type: backtestParams.target_type,
-        target_value: backtestParams.target_type === 'all' ? null : backtestParams.target_value,
-        exclude_st: backtestParams.exclude_st,
-        exclude_loss_pe: backtestParams.exclude_loss_pe,
-      }
+      const body = buildSingleBacktestRequest(targetStrategy.id, params)
       await fetchJson('/api/backtests', { method: 'POST', body: JSON.stringify(body) })
       setNotice('回测任务已提交')
       setShowBacktestModal(false)
@@ -369,13 +287,10 @@ export default function StrategyPage() {
       await loadRunHistory()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setSubmittingBacktest(false)
     }
   }
-
-  const isBacktestTargetValid =
-    backtestParams.target_type === 'all' ||
-    (backtestParams.target_type === 'market' && selectedMarkets(backtestParams.target_value).length > 0) ||
-    (backtestParams.target_type === 'watchlist_group' && typeof backtestParams.target_value === 'string' && backtestParams.target_value.trim().length > 0)
 
   const toggleSelect = (id: number) => {
     setSelectedIds((prev) => {
@@ -396,28 +311,22 @@ export default function StrategyPage() {
   }
 
   const openBatchBacktest = () => {
+    setError(null)
     setBatchMode(true)
     setTargetStrategy(null)
-    setBacktestParams({
-      start_date: new Date(new Date().setFullYear(new Date().getFullYear() - 1)).toISOString().split('T')[0],
-      end_date: new Date().toISOString().split('T')[0],
-      initial_cash: 100000,
-      target_type: 'all',
-      target_value: '',
-      ...defaultFiltersForTarget('all'),
-      stop_loss_pct: '',
-      take_profit_pct: '',
-      trailing_stop_pct: '',
-      time_stop_days: '',
-    })
+    const defaults = createDefaultBacktestRunParams()
+    const lastRun = runHistory
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0]
+    setBacktestParams(applyLastBacktestRiskParams(defaults, lastRun ?? null))
     setShowBacktestModal(true)
   }
 
   const loadRunHistory = async () => {
     setLoadingRuns(true)
     try {
-      const data = await fetchJson<BacktestListResult[]>('/api/backtests?limit=20')
-      setRunHistory(data)
+      const data = await fetchJson<{ items: BacktestListResult[]; total: number } | BacktestListResult[]>('/api/backtests?limit=20')
+      const items = Array.isArray(data) ? data : data.items
+      setRunHistory(items)
     } catch {
       // ignore
     } finally {
@@ -606,96 +515,16 @@ export default function StrategyPage() {
       )}
 
       {showBacktestModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowBacktestModal(false)}>
-          <div className={`w-full max-w-lg rounded-lg p-6 ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'bg-slate-800 text-slate-100' : 'bg-white text-ink'}`} onClick={(e) => e.stopPropagation()}>
-            <h3 className="mb-4 text-lg font-semibold">{batchMode ? `回测参数设置（${selectedIds.size} 个策略，将依次执行）` : '回测参数设置'}</h3>
-            <div className="space-y-4">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-slate-600">标的范围</label>
-                <div className="grid grid-cols-3 gap-2">
-                  <button type="button" onClick={() => selectTargetType('all')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'all' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>全市场</button>
-                  <button type="button" onClick={() => selectTargetType('market')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'market' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>市场板块</button>
-                  <button type="button" onClick={() => selectTargetType('watchlist_group')} className={`h-10 rounded-md border px-3 text-sm font-medium ${backtestParams.target_type === 'watchlist_group' ? 'border-accent bg-accent text-white' : 'border-line text-slate-700 hover:bg-slate-50'}`}>自选分组</button>
-                </div>
-              </div>
-              {backtestParams.target_type === 'market' && (
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">市场板块</label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {MARKET_OPTIONS.map((market) => {
-                      const checked = selectedMarkets(backtestParams.target_value).includes(market)
-                      return (
-                        <label key={market} className={`flex min-h-10 items-center gap-2 rounded-md border px-3 text-sm font-medium ${checked ? 'border-accent bg-blue-50 text-accent' : document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
-                          <input type="checkbox" checked={checked} onChange={() => toggleMarketTarget(market)} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
-                          <span>{market}</span>
-                        </label>
-                      )
-                    })}
-                  </div>
-                </div>
-              )}
-              {backtestParams.target_type === 'watchlist_group' && (
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">自选股分组</label>
-                  <select value={typeof backtestParams.target_value === 'string' ? backtestParams.target_value : ''} onChange={(e) => setBacktestParams({ ...backtestParams, target_value: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} disabled={watchlistGroups.length === 0}>
-                    <option value="">{watchlistGroups.length === 0 ? '暂无分组' : '请选择'}</option>
-                    {watchlistGroups.map((group) => (
-                      <option key={group.group_name} value={group.group_name}>{group.group_name} ({group.item_count} 只)</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <label className={`flex min-h-11 items-center gap-2 rounded-md border px-3 text-sm font-medium ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
-                  <input type="checkbox" checked={backtestParams.exclude_st} onChange={(e) => setBacktestParams({ ...backtestParams, exclude_st: e.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
-                  <span>排除 ST</span>
-                </label>
-                <label className={`flex min-h-11 items-center gap-2 rounded-md border px-3 text-sm font-medium ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700 text-slate-200' : 'border-line bg-white text-slate-700'}`}>
-                  <input type="checkbox" checked={backtestParams.exclude_loss_pe} onChange={(e) => setBacktestParams({ ...backtestParams, exclude_loss_pe: e.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
-                  <span>排除亏损市盈率 PE&lt;=0</span>
-                </label>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">开始日期</label>
-                  <input type="date" value={backtestParams.start_date} onChange={(e) => setBacktestParams({ ...backtestParams, start_date: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">结束日期</label>
-                  <input type="date" value={backtestParams.end_date} onChange={(e) => setBacktestParams({ ...backtestParams, end_date: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-slate-600">初始资金</label>
-                <input type="number" value={backtestParams.initial_cash} onChange={(e) => setBacktestParams({ ...backtestParams, initial_cash: Number(e.target.value) })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">止损 %（可选）</label>
-                  <input type="number" step="0.1" placeholder="例如 5" value={backtestParams.stop_loss_pct} onChange={(e) => setBacktestParams({ ...backtestParams, stop_loss_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">止盈 %（可选）</label>
-                  <input type="number" step="0.1" placeholder="例如 10" value={backtestParams.take_profit_pct} onChange={(e) => setBacktestParams({ ...backtestParams, take_profit_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">移动止损 %（可选）</label>
-                  <input type="number" step="0.1" placeholder="例如 3" value={backtestParams.trailing_stop_pct} onChange={(e) => setBacktestParams({ ...backtestParams, trailing_stop_pct: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-                <div>
-                  <label className="mb-1 block text-sm font-medium text-slate-600">最大持仓天数（可选）</label>
-                  <input type="number" step="1" placeholder="例如 20" value={backtestParams.time_stop_days} onChange={(e) => setBacktestParams({ ...backtestParams, time_stop_days: e.target.value })} className={`w-full h-10 rounded-md border px-3 text-sm focus:outline-none focus:ring-2 focus:ring-accent ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 bg-slate-700' : 'border-line bg-white'}`} />
-                </div>
-              </div>
-            </div>
-            <div className="mt-6 flex gap-3">
-              <button onClick={() => setShowBacktestModal(false)} className={`flex-1 h-10 rounded-md border px-4 text-sm font-semibold transition ${document.documentElement.getAttribute('data-theme') === 'dark' ? 'border-slate-600 text-slate-300 hover:bg-slate-700' : 'border-line text-slate-700 hover:bg-slate-50'}`}>取消</button>
-              <button onClick={() => void confirmBacktest()} disabled={!isBacktestTargetValid} className="flex-1 h-10 rounded-md bg-accent px-4 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60">确认回测</button>
-            </div>
-          </div>
-        </div>
+        <BacktestRunModal
+          title={batchMode ? `回测参数设置（${selectedIds.size} 个策略，将依次执行）` : '回测参数设置'}
+          submitLabel="确认回测"
+          initialParams={backtestParams}
+          watchlistGroups={watchlistGroups}
+          submitting={submittingBacktest}
+          submitError={error}
+          onCancel={() => { setError(null); setShowBacktestModal(false) }}
+          onSubmit={confirmBacktest}
+        />
       )}
     </>
   )

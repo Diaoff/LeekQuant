@@ -1,9 +1,16 @@
 import React from 'react'
-import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2, GitCompare, ZoomIn, ZoomOut, RotateCcw, ShieldAlert } from 'lucide-react'
+import { AlertTriangle, BarChart3, ArrowLeft, TrendingUp, TrendingDown, Loader2, Target, Percent, DollarSign, Activity, Trash2, GitCompare, ZoomIn, ZoomOut, RotateCcw, ShieldAlert, ChevronDown, Download } from 'lucide-react'
 import { createChart, createSeriesMarkers, ColorType, LineSeries, CandlestickSeries, AreaSeries } from 'lightweight-charts'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { fetchJson, formatNumber, formatDateTime } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
+import BacktestRunModal from '../components/BacktestRunModal'
+import {
+  type BacktestRunParams,
+  type WatchlistGroupOption,
+  buildSingleBacktestRequest,
+  mapHistoricalBacktestRun,
+} from '../lib/backtest-run'
 
 const COMPARE_COLORS = ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899']
 const MAX_COMPARE_COUNT = 6
@@ -85,6 +92,9 @@ interface BacktestResult {
   strategy_id: number
   strategy_name: string | null
   target_label?: string | null
+  target_type?: 'all' | 'market' | 'watchlist_group'
+  target_value?: string | string[] | null
+  benchmark_code: string | null
   start_date: string
   end_date: string
   initial_cash: string
@@ -96,7 +106,8 @@ interface BacktestResult {
   annual_vol: string | null
   win_rate: string | null
   trade_count: number | null
-  performance: Record<string, unknown> | null
+  performance: BacktestPerformance | null
+  params_snapshot?: Record<string, unknown> | string | null
   trade_records: unknown[] | null
   equity_curve: { date: string; total_asset: number; cash: number }[] | null
   daily_returns: number[] | null
@@ -105,6 +116,70 @@ interface BacktestResult {
   error_message: string | null
   created_at: string
   finished_at: string | null
+}
+
+interface ClosedLot {
+  ts_code: string
+  entry_date: string
+  exit_date: string
+  entry_price: number
+  exit_price: number
+  shares: number
+  entry_fee: number
+  exit_fee: number
+  gross_pnl: number
+  net_pnl: number
+  return_rate: number
+  holding_days: number
+  exit_reason: string | null
+}
+
+interface StockRanking {
+  ts_code: string
+  closed_lot_count: number
+  winning_lot_count: number
+  losing_lot_count: number
+  matched_cost: number
+  gross_pnl: number
+  total_fees: number
+  net_pnl: number
+  return_rate: number
+  win_rate: number
+  avg_holding_days: number
+}
+
+interface PnlAnalysis {
+  closed_lot_count: number
+  winning_lot_count: number
+  losing_lot_count: number
+  breakeven_lot_count: number
+  stock_count: number
+  matched_cost: number
+  gross_pnl: number
+  entry_fees: number
+  exit_fees: number
+  total_fees: number
+  net_pnl: number
+  return_rate: number
+  win_rate: number
+  avg_holding_days: number
+  closed_lots: ClosedLot[]
+  stock_rankings: StockRanking[]
+}
+
+interface BacktestPerformance {
+  sortino_ratio?: number
+  calmar_ratio?: number
+  profit_factor?: number
+  win_rate_pct?: number
+  avg_holding_days?: number
+  total_fees?: number
+  max_consecutive_losses?: number
+  risk_config?: Record<string, number>
+  benchmark?: Record<string, unknown>
+  monthly_returns?: Record<string, number>
+  pnl_analysis?: PnlAnalysis
+  stock_rankings?: StockRanking[]
 }
 
 interface EquityPoint {
@@ -150,6 +225,12 @@ export default function BacktestPage() {
   const [compareLoading, setCompareLoading] = React.useState(false)
   const [page, setPage] = React.useState(1)
   const [totalCount, setTotalCount] = React.useState(0)
+  const [watchlistGroups, setWatchlistGroups] = React.useState<WatchlistGroupOption[]>([])
+  const [watchlistGroupsLoading, setWatchlistGroupsLoading] = React.useState(false)
+  const [rerunResult, setRerunResult] = React.useState<BacktestResult | null>(null)
+  const [rerunParams, setRerunParams] = React.useState<BacktestRunParams | null>(null)
+  const [rerunSubmitting, setRerunSubmitting] = React.useState(false)
+  const rerunRequestRef = React.useRef(0)
   const pageSize = 20
 
   const isCompareMode = searchParams.get('ids') !== null
@@ -227,6 +308,46 @@ export default function BacktestPage() {
       setSelected(r)
     } finally {
       setDetailLoading(false)
+    }
+  }
+
+  const openRerun = async (result: BacktestResult) => {
+    const requestId = ++rerunRequestRef.current
+    setError(null)
+    setWatchlistGroups([])
+    setWatchlistGroupsLoading(true)
+    setRerunResult(result)
+    setRerunParams(mapHistoricalBacktestRun(result))
+    try {
+      const groups = await fetchJson<WatchlistGroupOption[]>('/api/watchlist/groups')
+      if (requestId === rerunRequestRef.current) setWatchlistGroups(groups)
+    } catch {
+      if (requestId === rerunRequestRef.current) setWatchlistGroups([])
+    } finally {
+      if (requestId === rerunRequestRef.current) setWatchlistGroupsLoading(false)
+    }
+  }
+
+  const submitRerun = async (params: BacktestRunParams) => {
+    if (!rerunResult) return
+    setError(null)
+    setNotice(null)
+    setRerunSubmitting(true)
+    try {
+      const response = await fetchJson<{ backtest_id: number; strategy_id: number; task_id: string; status: string }>('/api/backtests', {
+        method: 'POST',
+        body: JSON.stringify(buildSingleBacktestRequest(rerunResult.strategy_id, params)),
+      })
+      setRerunResult(null)
+      setRerunParams(null)
+      setSelected(null)
+      setNotice(`回测任务已提交（#${response.backtest_id}）`)
+      if (page === 1) await loadResults()
+      else setPage(1)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught))
+    } finally {
+      setRerunSubmitting(false)
     }
   }
 
@@ -372,19 +493,37 @@ export default function BacktestPage() {
           <div className="overflow-x-auto">
             <table className="min-w-full divide-y divide-line text-left text-sm">
               <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
-                <tr><th className="w-10 px-2 py-3">
+                <tr>
+                  <th className="w-10 px-2 py-3">
                   <input type="checkbox" checked={results.length > 0 && selectedIds.size === results.filter(r => r.status === 'success').length} onChange={toggleSelectAll} className="h-4 w-4 rounded border-slate-300 text-accent focus:ring-accent" />
-                </th><th className="px-4 py-3">策略</th><th className="px-4 py-3">区间</th><th className="px-4 py-3">初始资金</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">收益率</th><th className="px-4 py-3">操作</th></tr>
+                </th>
+                  <th className="px-4 py-3">策略</th>
+                  <th className="px-4 py-3">标的</th>
+                  <th className="px-4 py-3">区间</th>
+                  <th className="px-4 py-3">初始资金</th>
+                  <th className="px-4 py-3">状态</th>
+                  <th className="px-4 py-3">总收益</th>
+                  <th className="px-4 py-3">年化</th>
+                  <th className="px-4 py-3">夏普</th>
+                  <th className="px-4 py-3">最大回撤</th>
+                  <th className="px-4 py-3">交易次数</th>
+                  <th className="px-4 py-3">操作</th>
+                </tr>
               </thead>
               <tbody className="divide-y divide-line">
                 {loading ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-4">
-                      <Skeleton.Table rows={5} columns={6} />
+                    <td colSpan={12} className="px-4 py-4">
+                      <Skeleton.Table rows={5} columns={11} />
                     </td>
                   </tr>
-                ) : results.length === 0 ? <tr><td colSpan={7} className="px-4 py-8 text-center text-muted">暂无回测结果，请先在策略中心运行回测</td></tr> : results.map((r) => {
+                ) : results.length === 0 ? <tr><td colSpan={12} className="px-4 py-8 text-center text-muted">暂无回测结果，请先在策略中心运行回测</td></tr> : results.map((r) => {
                   const totalReturn = r.total_return !== null ? (Number(r.total_return) * 100).toFixed(2) : null
+                  const annualReturn = r.annual_return !== null ? (Number(r.annual_return) * 100).toFixed(2) : null
+                  const maxDd = r.max_drawdown !== null ? (Number(r.max_drawdown) * 100).toFixed(2) : null
+                  const sharpe = r.sharpe_ratio !== null ? Number(r.sharpe_ratio) : null
+                  const returnColor = totalReturn !== null && Number(totalReturn) >= 0 ? 'text-red-600' : totalReturn !== null ? 'text-emerald-600' : ''
+                  const annualColor = annualReturn !== null && Number(annualReturn) >= 0 ? 'text-red-600' : annualReturn !== null ? 'text-emerald-600' : ''
                   return (
                     <tr key={r.id} className="hover:bg-rowHover">
                       <td className="px-4 py-3">
@@ -397,12 +536,20 @@ export default function BacktestPage() {
                         />
                       </td>
                       <td className="px-4 py-3 font-medium">{r.strategy_name ?? '—'}</td>
-                      <td className="whitespace-nowrap px-4 py-3 text-muted">{r.start_date} ~ {r.end_date}</td>
+                      <td className="px-4 py-3 text-muted">{r.target_label ?? '全市场'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 text-muted">
+                        <div>{r.start_date} ~ {r.end_date}</div>
+                        {r.benchmark_code ? <div className="text-[11px] text-muted/70">基准 {r.benchmark_code}</div> : null}
+                      </td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{formatNumber(Number(r.initial_cash), 2)}</td>
                       <td className="px-4 py-3">
-                        <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-line bg-tableHead text-muted'}`}>{r.status}</span>
+                        <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${r.status === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : r.status === 'running' ? 'border-amber-200 bg-amber-50 text-amber-800' : r.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-line bg-tableHead text-muted'}`} title={r.status === 'failed' && r.error_message ? r.error_message : undefined}>{r.status}</span>
                       </td>
-                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums font-medium ${totalReturn !== null && Number(totalReturn) >= 0 ? 'text-red-600' : totalReturn !== null ? 'text-emerald-600' : ''}`}>{totalReturn !== null ? `${totalReturn}%` : '—'}</td>
+                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums font-medium ${returnColor}`}>{totalReturn !== null ? `${totalReturn}%` : '—'}</td>
+                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums ${annualColor}`}>{annualReturn !== null ? `${annualReturn}%` : '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{sharpe !== null ? formatNumber(sharpe, 2) : '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums text-red-600">{maxDd !== null ? `${maxDd}%` : '—'}</td>
+                      <td className="whitespace-nowrap px-4 py-3 tabular-nums">{r.trade_count !== null ? formatNumber(r.trade_count) : '—'}</td>
                        <td className="px-4 py-3 flex items-center gap-2">
                          {r.status === 'success' && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
                          {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600" title={r.error_message}>失败</span>}
@@ -445,8 +592,21 @@ export default function BacktestPage() {
         </section>
       )}
 
-      {selected && <BacktestDetail result={selected} onBack={() => setSelected(null)} />}
+      {selected && <BacktestDetail result={selected} onBack={() => setSelected(null)} onRerun={() => void openRerun(selected)} />}
       {detailLoading && <BacktestDetailSkeleton />}
+      {rerunResult && rerunParams && (
+        <BacktestRunModal
+          title={`重新运行：${rerunResult.strategy_name ?? `回测 #${rerunResult.id}`}`}
+          submitLabel="重新运行"
+          initialParams={rerunParams}
+          watchlistGroups={watchlistGroups}
+          watchlistGroupsLoading={watchlistGroupsLoading}
+          submitting={rerunSubmitting}
+          submitError={error}
+          onCancel={() => { rerunRequestRef.current += 1; setError(null); setRerunResult(null); setRerunParams(null) }}
+          onSubmit={submitRerun}
+        />
+      )}
     </>
   )
 }
@@ -676,10 +836,114 @@ function DrawdownChart({ dailyReturns, dates }: { dailyReturns: number[]; dates:
   return <div ref={ref} className="h-[120px] w-full" />
 }
 
-function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: () => void }) {
-  const perf = result.performance as Record<string, string | number> | null
+type RankingMetric = 'net_pnl' | 'return_rate'
+
+function PnlAnalysisSection({ analysis, rankings, stockNames, onSelectStock }: {
+  analysis: PnlAnalysis
+  rankings: StockRanking[]
+  stockNames: Record<string, string>
+  onSelectStock: (tsCode: string) => void
+}) {
+  const [metric, setMetric] = React.useState<RankingMetric>('net_pnl')
+  const profitable = [...rankings]
+    .filter((ranking) => ranking[metric] > 0)
+    .sort((a, b) => b[metric] - a[metric] || a.ts_code.localeCompare(b.ts_code))
+    .slice(0, 10)
+  const losing = [...rankings]
+    .filter((ranking) => ranking[metric] < 0)
+    .sort((a, b) => a[metric] - b[metric] || a.ts_code.localeCompare(b.ts_code))
+    .slice(0, 10)
+  const metricLabel = metric === 'net_pnl' ? '净盈亏' : '收益率'
+
+  const formatMetric = (ranking: StockRanking) => {
+    const value = ranking[metric]
+    if (metric === 'return_rate') return `${value > 0 ? '+' : ''}${formatNumber(value * 100, 2)}%`
+    return `${value > 0 ? '+' : value < 0 ? '-' : ''}¥${formatNumber(Math.abs(value), 2)}`
+  }
+
+  const renderRanking = (ranking: StockRanking, index: number) => (
+    <button
+      type="button"
+      key={ranking.ts_code}
+      onClick={() => onSelectStock(ranking.ts_code)}
+      className="grid w-full grid-cols-[1.5rem_minmax(0,1fr)_auto] items-center gap-2 border-b border-line px-1 py-2 text-left outline-none transition last:border-b-0 hover:bg-rowHover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+      aria-label={`查看 ${stockNames[ranking.ts_code] ?? ranking.ts_code} 交易 K 线`}
+    >
+      <span className="text-xs tabular-nums text-muted">{index + 1}</span>
+      <span className="min-w-0">
+        <span className="block truncate text-sm font-medium text-ink">{stockNames[ranking.ts_code] ?? '未知股票'}</span>
+        <span className="block font-mono text-[11px] text-muted">{ranking.ts_code}</span>
+      </span>
+      <span className="text-right">
+        <span className={`block text-sm font-semibold tabular-nums ${ranking[metric] > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+          {formatMetric(ranking)}
+        </span>
+        <span className="block whitespace-nowrap text-[11px] text-muted">
+          {ranking.closed_lot_count}笔 · 胜率 {formatNumber(ranking.win_rate * 100, 1)}% · {formatNumber(ranking.avg_holding_days, 1)}天
+        </span>
+      </span>
+    </button>
+  )
+
+  const summaries = [
+    { label: '净盈亏', value: `${analysis.net_pnl > 0 ? '+' : analysis.net_pnl < 0 ? '-' : ''}¥${formatNumber(Math.abs(analysis.net_pnl), 2)}`, tone: analysis.net_pnl >= 0 ? 'text-red-600' : 'text-emerald-600' },
+    { label: '闭合收益率', value: `${analysis.return_rate > 0 ? '+' : ''}${formatNumber(analysis.return_rate * 100, 2)}%`, tone: analysis.return_rate >= 0 ? 'text-red-600' : 'text-emerald-600' },
+    { label: '闭合交易', value: `${analysis.closed_lot_count}笔`, tone: 'text-ink' },
+    { label: '胜率', value: `${formatNumber(analysis.win_rate * 100, 1)}%`, tone: 'text-ink' },
+    { label: '平均持仓', value: `${formatNumber(analysis.avg_holding_days, 1)}天`, tone: 'text-ink' },
+    { label: '总费用', value: `¥${formatNumber(analysis.total_fees, 2)}`, tone: 'text-warn' },
+  ]
+
+  return (
+    <section className="mx-4 mt-2 border-y border-line py-4" aria-labelledby="pnl-analysis-heading">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 id="pnl-analysis-heading" className="text-base font-semibold text-ink">盈亏分析</h3>
+          <p className="mt-0.5 text-xs text-muted">按闭合持仓归因，共 {analysis.stock_count} 只股票</p>
+        </div>
+        <div className="inline-flex rounded-md border border-line bg-tableHead p-0.5" aria-label="排行指标">
+          {(['net_pnl', 'return_rate'] as RankingMetric[]).map((value) => (
+            <button
+              type="button"
+              key={value}
+              onClick={() => setMetric(value)}
+              aria-pressed={metric === value}
+              className={`rounded px-3 py-1.5 text-xs font-medium transition ${metric === value ? 'bg-surface text-ink shadow-sm' : 'text-muted hover:text-ink'}`}
+            >
+              {value === 'net_pnl' ? '净盈亏' : '收益率'}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 border-b border-line pb-4 sm:grid-cols-3 xl:grid-cols-6">
+        {summaries.map((summary) => (
+          <div key={summary.label}>
+            <dt className="text-xs text-muted">{summary.label}</dt>
+            <dd className={`mt-1 text-sm font-semibold tabular-nums ${summary.tone}`}>{summary.value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      <div className="grid gap-5 pt-4 lg:grid-cols-2 lg:gap-8">
+        <div>
+          <h4 className="mb-1 text-sm font-semibold text-red-700">盈利排行 <span className="font-normal text-muted">Top 10 · {metricLabel}</span></h4>
+          {profitable.length > 0 ? profitable.map(renderRanking) : <p className="py-5 text-center text-xs text-muted">暂无盈利股票</p>}
+        </div>
+        <div>
+          <h4 className="mb-1 text-sm font-semibold text-emerald-700">亏损排行 <span className="font-normal text-muted">Top 10 · {metricLabel}</span></h4>
+          {losing.length > 0 ? losing.map(renderRanking) : <p className="py-5 text-center text-xs text-muted">暂无亏损股票</p>}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; onBack: () => void; onRerun: () => void }) {
+  const perf = result.performance
   const trades = (result.trade_records ?? []) as TradeRecord[]
   const [selectedTradeIndex, setSelectedTradeIndex] = React.useState<number | null>(null)
+  const [tradeDetailsOpen, setTradeDetailsOpen] = React.useState(false)
   const [klineCache, setKlineCache] = React.useState<Record<string, KlineBar[]>>(() => result.kline_data ?? {})
   const [klineLoadingTsCode, setKlineLoadingTsCode] = React.useState<string | null>(null)
   const [klineError, setKlineError] = React.useState<string | null>(null)
@@ -694,6 +958,7 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
 
   React.useEffect(() => {
     setSelectedTradeIndex(null)
+    setTradeDetailsOpen(false)
     setKlineCache(result.kline_data ?? {})
     setKlineLoadingTsCode(null)
     setKlineError(null)
@@ -755,7 +1020,7 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
         crosshairMarkerRadius: 4,
       })
       lineSeries.setData(equityCurve.map((d) => ({ time: d.date, value: d.total_asset })))
-      const bmCurve = (result.performance as Record<string, unknown>)?.benchmark as Record<string, unknown> | undefined
+       const bmCurve = result.performance?.benchmark
       if (bmCurve?.benchmark_curve && Array.isArray(bmCurve.benchmark_curve) && bmCurve.benchmark_curve.length > 0) {
         const bmSeries = chart.addSeries(LineSeries, {
           color: '#94a3b8',
@@ -837,7 +1102,7 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
     }
   }, [selectedKlines, selectedTsCode, trades])
 
-  const riskCfg = result.performance?.risk_config as Record<string, number> | undefined
+  const riskCfg = result.performance?.risk_config
   const riskLabel = !riskCfg
     ? '—'
     : [riskCfg.stop_loss_pct, riskCfg.take_profit_pct, riskCfg.trailing_stop_pct, riskCfg.time_stop_days].every(v => !v || Number(v) === 0)
@@ -868,9 +1133,17 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
     perf?.max_consecutive_losses != null ? { label: '最大连亏', value: `${perf.max_consecutive_losses}次` } : null,
   ].filter(Boolean) as Array<{ label: string; value: string }>
 
-  const totalPnl = trades.reduce((sum, t) => sum + (t.pnl || 0), 0)
-  const avgHoldingDays = (() => { const d = trades.filter(t => (t.holding_days ?? 0) > 0); return d.length > 0 ? d.reduce((s, t) => s + (t.holding_days || 0), 0) / d.length : 0 })()
-  const totalFees = trades.reduce((sum, t) => sum + (t.total_fee || 0), 0)
+  const pnlAnalysis = perf?.pnl_analysis
+  const stockRankings = pnlAnalysis?.stock_rankings ?? perf?.stock_rankings ?? []
+
+  const selectRankingTrade = (tsCode: string) => {
+    for (let index = trades.length - 1; index >= 0; index--) {
+      if (trades[index].ts_code === tsCode) {
+        setSelectedTradeIndex(index)
+        return
+      }
+    }
+  }
 
   return (
     <section className="rounded-lg border border-line bg-panel shadow-sm">
@@ -882,6 +1155,15 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
         <h2 className="text-base font-semibold text-ink">{result.strategy_name ?? '回测详情'}</h2>
         <span className="rounded-full border border-line bg-tableHead px-2.5 py-1 text-xs text-muted">{result.target_label ?? '全市场'}</span>
         <span className="text-sm text-muted">{result.start_date} ~ {result.end_date}</span>
+        <button
+          type="button"
+          onClick={onRerun}
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-line px-3 py-1.5 text-xs font-medium text-ink hover:bg-rowHover"
+          aria-label="重新运行"
+        >
+          <RotateCcw className="h-3.5 w-3.5" />
+          重新运行
+        </button>
         <button
           onClick={() => {
             if (!trades.length) return
@@ -896,8 +1178,9 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
             a.click()
             URL.revokeObjectURL(url)
           }}
-          className="ml-auto inline-flex items-center gap-1 rounded-md border border-line px-3 py-1.5 text-xs font-medium text-ink hover:bg-rowHover"
+          className="inline-flex items-center gap-1 rounded-md border border-line px-3 py-1.5 text-xs font-medium text-ink hover:bg-rowHover"
         >
+          <Download className="h-3.5 w-3.5" />
           导出 CSV
         </button>
       </div>
@@ -924,12 +1207,12 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
       {(perf?.benchmark) && (
         <div className="px-4 pb-2">
           <div className="rounded-lg border border-line bg-tableHead p-3">
-            <div className="text-xs font-semibold text-muted mb-2">基准对比 ({(perf.benchmark as Record<string, unknown>).benchmark_code ?? 'CSI300'})</div>
+            <div className="text-xs font-semibold text-muted mb-2">基准对比 ({String((perf.benchmark as Record<string, unknown>).benchmark_code ?? 'CSI300')})</div>
             <div className="grid grid-cols-4 gap-3 text-center text-xs">
               <div><div className="text-muted">Alpha</div><div className={`mt-1 font-mono text-sm ${Number((perf.benchmark as Record<string, unknown>).alpha ?? 0) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{formatNumber(Number((perf.benchmark as Record<string, unknown>).alpha ?? 0) * 100, 2)}%</div></div>
               <div><div className="text-muted">基准收益</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).benchmark_annual_return ?? 0) * 100, 2)}%</div></div>
               <div><div className="text-muted">跟踪误差</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).tracking_error ?? 0) * 100, 2)}%</div></div>
-              <div><div className="text-muted">信息比率</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber((perf.benchmark as Record<string, unknown>).information_ratio ?? 0, 2)}</div></div>
+              <div><div className="text-muted">信息比率</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).information_ratio ?? 0), 2)}</div></div>
             </div>
           </div>
         </div>
@@ -965,28 +1248,21 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
         </div>
       )}
 
-      {trades.length > 0 && (
-        <>
-          <div className="mx-4 mt-2 grid grid-cols-4 gap-2 rounded-lg bg-tableHead p-3">
-            <div className="text-center">
-              <div className="text-[10px] uppercase tracking-wider text-muted">总盈亏</div>
-              <div className={`text-sm font-bold ${totalPnl >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{totalPnl >= 0 ? '+' : ''}{totalPnl.toFixed(2)}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] uppercase tracking-wider text-muted">持仓天</div>
-              <div className="text-sm font-bold text-ink">{avgHoldingDays.toFixed(1)}天</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] uppercase tracking-wider text-muted">手续费</div>
-              <div className="text-sm font-bold text-warn">{totalFees.toFixed(2)}</div>
-            </div>
-            <div className="text-center">
-              <div className="text-[10px] uppercase tracking-wider text-muted">交易笔数</div>
-              <div className="text-sm font-bold text-ink">{trades.length}</div>
-            </div>
-          </div>
+      {pnlAnalysis ? (
+        <PnlAnalysisSection
+          analysis={pnlAnalysis}
+          rankings={stockRankings}
+          stockNames={result.stock_names ?? {}}
+          onSelectStock={selectRankingTrade}
+        />
+      ) : trades.length > 0 ? (
+        <div className="mx-4 border-y border-line py-3 text-sm text-muted">
+          该历史结果暂无精确盈亏归因，重新运行回测后可查看闭合交易和股票盈亏排行。
+        </div>
+      ) : null}
 
-          <div className="px-4 pb-4">
+      {result.equity_curve && result.equity_curve.length > 0 && (
+          <div className="px-4 pt-4 pb-4">
             <div className="mb-2 flex items-center justify-end">
               <ChartToolbar
                 onZoomIn={() => createChartControls(equityChartRef.current, 'in')}
@@ -996,7 +1272,10 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
             </div>
             <div className="h-[300px] overflow-hidden rounded-md border border-line" ref={chartRef} />
           </div>
+      )}
 
+      {trades.length > 0 && (
+        <>
           <div className="px-4 pb-4">
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-base font-semibold text-ink">交易 K 线</h3>
@@ -1034,15 +1313,26 @@ function BacktestDetail({ result, onBack }: { result: BacktestResult; onBack: ()
           </div>
 
           <div className="border-t border-line">
-            <div className="px-4 py-3 flex items-center justify-between">
-              <h3 className="text-base font-semibold text-ink">交易明细 ({trades.length}笔)</h3>
-            </div>
-            <TradeRecordsTable
-              trades={trades}
-              selectedTradeIndex={selectedTradeIndex}
-              onSelectTrade={setSelectedTradeIndex}
-              stockNames={result.stock_names ?? {}}
-            />
+            <button
+              type="button"
+              onClick={() => setTradeDetailsOpen((open) => !open)}
+              aria-expanded={tradeDetailsOpen}
+              aria-controls="backtest-trade-records"
+              className="flex w-full items-center justify-between px-4 py-3 text-left text-ink outline-none transition hover:bg-rowHover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+            >
+              <span className="text-base font-semibold">交易明细 ({trades.length}笔)</span>
+              <ChevronDown className={`h-4 w-4 text-muted transition-transform ${tradeDetailsOpen ? 'rotate-180' : ''}`} />
+            </button>
+            {tradeDetailsOpen && (
+              <div id="backtest-trade-records">
+                <TradeRecordsTable
+                  trades={trades}
+                  selectedTradeIndex={selectedTradeIndex}
+                  onSelectTrade={setSelectedTradeIndex}
+                  stockNames={result.stock_names ?? {}}
+                />
+              </div>
+            )}
           </div>
         </>
       )}

@@ -10,6 +10,7 @@ BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-4}"
+BACKTEST_CELERY_CONCURRENCY="${BACKTEST_CELERY_CONCURRENCY:-1}"
 REALTIME_RISK_GUARD_INTERVAL="${REALTIME_RISK_GUARD_INTERVAL:-15}"
 
 WITH_CELERY=0
@@ -32,6 +33,7 @@ Environment:
   FRONTEND_HOST      Frontend bind host, default 127.0.0.1.
   FRONTEND_PORT      Frontend port, default 5173.
   CELERY_CONCURRENCY Celery worker concurrency, default 4.
+  BACKTEST_CELERY_CONCURRENCY Dedicated backtest worker concurrency, default 1.
   REALTIME_RISK_GUARD_INTERVAL Realtime risk polling interval seconds, default 15.
 EOF
 }
@@ -75,6 +77,7 @@ BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-4}"
+BACKTEST_CELERY_CONCURRENCY="${BACKTEST_CELERY_CONCURRENCY:-1}"
 REALTIME_RISK_GUARD_INTERVAL="${REALTIME_RISK_GUARD_INTERVAL:-15}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
 
@@ -115,6 +118,27 @@ wait_http() {
   if [[ -f "$log_file" ]]; then
     echo "Last $name log lines:" >&2
     tail -80 "$log_file" >&2 || true
+  fi
+  exit 1
+}
+
+wait_backtest_worker() {
+  local attempts="${1:-30}"
+
+  for _ in $(seq 1 "$attempts"); do
+    if (
+      cd "$ROOT_DIR/backend"
+      "$PYTHON_BIN" -c 'from app.api.backtests import _backtest_worker_available; raise SystemExit(0 if _backtest_worker_available() else 1)'
+    ) >/dev/null 2>&1; then
+      echo "Backtest worker is ready"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Backtest worker failed to become ready" >&2
+  if [[ -f "$LOG_DIR/celery-backtest-worker.log" ]]; then
+    tail -80 "$LOG_DIR/celery-backtest-worker.log" >&2 || true
   fi
   exit 1
 }
@@ -254,8 +278,15 @@ start_celery() {
   echo "Starting celery worker with concurrency=$CELERY_CONCURRENCY"
   (
     cd "$ROOT_DIR/backend"
-    start_detached "$LOG_DIR/celery-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$CELERY_CONCURRENCY" -Q default,data,backtest,factor,trading \
+    start_detached "$LOG_DIR/celery-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$CELERY_CONCURRENCY" -Q default,data,factor,trading \
       > "$PID_DIR/celery-worker.pid"
+  )
+
+  echo "Starting dedicated backtest worker with concurrency=$BACKTEST_CELERY_CONCURRENCY"
+  (
+    cd "$ROOT_DIR/backend"
+    start_detached "$LOG_DIR/celery-backtest-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$BACKTEST_CELERY_CONCURRENCY" -Q backtest --hostname "backtest@%h" \
+      > "$PID_DIR/celery-backtest-worker.pid"
   )
 
   echo "Starting celery beat"
@@ -285,6 +316,7 @@ fi
 
 if [[ "$WITH_CELERY" -eq 1 ]]; then
   kill_pid_file celery-worker
+  kill_pid_file celery-backtest-worker
   kill_pid_file celery-beat
   kill_pid_file realtime-risk-guard
   kill_celery_processes worker " worker"
@@ -297,6 +329,7 @@ fi
 
 if [[ "$WITH_CELERY" -eq 1 ]]; then
   start_celery
+  wait_backtest_worker
 fi
 
 if [[ "$SKIP_FRONTEND" -eq 0 ]]; then

@@ -27,21 +27,42 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+# Track the PID of the process that created the event loop.  After fork(), the
+# child inherits the parent's loop object (including its kqueue selector fd).
+# Using a selector fd opened in a different process causes OSError: [Errno 9]
+# Bad file descriptor once either process closes the shared fd.  We detect the
+# fork by comparing PID and create a fresh loop with a new selector.
+_loop_pid: int | None = None
 
 
 def get_loop() -> asyncio.AbstractEventLoop:
     """Return the process-wide event loop, creating/setting one if needed."""
+    global _loop_pid
+    current_pid = os.getpid()
+
+    if _loop_pid is not None and _loop_pid != current_pid:
+        # Fork detected -- the inherited loop's selector (kqueue fd) is shared
+        # with the parent and will become invalid once either side closes it.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _loop_pid = current_pid
+        return loop
+
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        _loop_pid = current_pid
         return loop
     if loop.is_closed():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+    _loop_pid = current_pid
     return loop
 
 
@@ -76,6 +97,23 @@ def _cancel_stray_tasks(loop: asyncio.AbstractEventLoop) -> None:
         pass
 
 
+def _renew_selector_if_stale(loop: asyncio.AbstractEventLoop) -> None:
+    """Replace the loop's selector if its fd is stale (e.g. after fork)."""
+    import selectors
+    selector = getattr(loop, "_selector", None)
+    if selector is None:
+        return
+    try:
+        selector.get_map()
+    except (OSError, ValueError):
+        pass
+    else:
+        return  # selector is healthy
+    new_selector = selectors.DefaultSelector()
+    loop._selector = new_selector
+    logger.debug("Replaced stale selector for pid %d", os.getpid())
+
+
 def run_async(coro):
     """Run a coroutine to completion on the process-wide loop (no loop close).
 
@@ -87,6 +125,7 @@ def run_async(coro):
         asyncio.get_running_loop()
     except RuntimeError:
         loop = get_loop()
+        _renew_selector_if_stale(loop)
         try:
             result = loop.run_until_complete(coro)
         finally:

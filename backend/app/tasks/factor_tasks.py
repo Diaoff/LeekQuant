@@ -1,11 +1,12 @@
 """Celery tasks for factor computation and IC/IR analysis."""
 from __future__ import annotations
 
-import asyncio
+from app.core.asyncio_runtime import run_async
 from datetime import date
 from typing import Any
 
 from app.data.providers import DataProviderError
+from app.factor.backfill import backfill_factor_scores
 from app.factor.service import analyze_factor_icir, compute_factors_for_date
 from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
@@ -34,7 +35,7 @@ def compute_daily_factors(
         raise ValueError("scope_type must be 'all' or 'watchlist_group'")
 
     run_date = date.fromisoformat(trade_date) if trade_date else None
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "compute_daily_factors",
             self.request.id,
@@ -67,7 +68,7 @@ def analyze_factor_icir_task(
 ) -> dict[str, Any]:
     start = date.fromisoformat(period_start)
     end = date.fromisoformat(period_end)
-    return asyncio.run(
+    return run_async(
         _run_tracked(
             "analyze_factor_icir",
             self.request.id,
@@ -83,6 +84,51 @@ def analyze_factor_icir_task(
                 period_start=start,
                 period_end=end,
                 forward_days=forward_days,
+            ),
+        )
+    )
+
+
+@celery_app.task(
+    name="app.tasks.factor_tasks.backfill_factor_scores",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.factor_tasks.backfill_factor_scores")
+def backfill_factor_scores_task(
+    self,
+    period_start: str,
+    period_end: str,
+    scope_type: str = "all",
+    scope_value: str | None = None,
+) -> dict[str, Any]:
+    if scope_type not in {"all", "watchlist_group"}:
+        raise ValueError("scope_type must be 'all' or 'watchlist_group'")
+    if scope_type == "watchlist_group" and not scope_value:
+        raise ValueError("scope_value is required for watchlist_group scope")
+
+    start = date.fromisoformat(period_start)
+    end = date.fromisoformat(period_end)
+    return run_async(
+        _run_tracked(
+            "backfill_factor_scores",
+            self.request.id,
+            {
+                "period_start": start,
+                "period_end": end,
+                "scope_type": scope_type,
+                "scope_value": scope_value,
+            },
+            with_session(
+                backfill_factor_scores,
+                period_start=start,
+                period_end=end,
+                scope_type=scope_type,
+                scope_value=scope_value,
             ),
         )
     )

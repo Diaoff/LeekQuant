@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from datetime import date
 from typing import Any, Literal
 from uuid import uuid4
@@ -23,6 +24,30 @@ router = APIRouter(prefix="/api/backtests", tags=["backtests"])
 
 MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
 MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
+
+
+def _backtest_worker_available() -> bool:
+    try:
+        active_queues = celery_app.control.inspect(timeout=1.0).active_queues()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"backtest worker health check failed: {exc}",
+        ) from exc
+
+    return any(
+        queue.get("name") == "backtest"
+        for queues in (active_queues or {}).values()
+        for queue in queues or []
+    )
+
+
+async def _ensure_backtest_worker_available() -> None:
+    if not await asyncio.to_thread(_backtest_worker_available):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no celery worker is consuming the backtest queue; restart the backtest worker",
+        )
 
 
 def _extract_user_id(request: Request) -> int:
@@ -240,6 +265,7 @@ async def submit_backtest(
     request: BacktestCreateRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    await _ensure_backtest_worker_available()
     user_id = _extract_user_id(req)
     strategy = await session.execute(
         text("SELECT id FROM strategies WHERE id = :id AND user_id = :user_id"),
@@ -310,6 +336,7 @@ async def submit_batch_backtest(
     request: BatchBacktestRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    await _ensure_backtest_worker_available()
     user_id = _extract_user_id(req)
 
     strategies = await session.execute(
@@ -462,6 +489,12 @@ async def get_backtest(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
 
     payload = _with_target_fields(dict(row))
+    performance = payload.get("performance")
+    if isinstance(performance, str):
+        performance = json.loads(performance)
+        payload["performance"] = performance
+    if isinstance(performance, dict):
+        payload["daily_returns"] = performance.get("daily_returns", [])
 
     raw_trades = payload.get("trade_records")
     trades = raw_trades

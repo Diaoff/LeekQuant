@@ -28,7 +28,7 @@ from app.preferences.service import get_full_kline_sync_concurrency
 from app.tasks.beat_lock import get_beat_lock
 from app.tasks.celery_app import celery_app
 from app.tasks.data_tasks import kline_sync_dispatch, sync_fundamentals_task, sync_sample_kline
-from app.tasks.factor_tasks import analyze_factor_icir_task, compute_daily_factors
+from app.tasks.factor_tasks import analyze_factor_icir_task, backfill_factor_scores_task, compute_daily_factors
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -91,6 +91,25 @@ class FactorAnalyzeTaskRequest(BaseModel):
     forward_days: int = Field(default=5, ge=1, le=60)
 
 
+class FactorBackfillTaskRequest(BaseModel):
+    period_start: date
+    period_end: date
+    scope_type: str = Field(default="all", pattern="^(all|watchlist_group)$")
+    scope_value: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "FactorBackfillTaskRequest":
+        if self.period_start > self.period_end:
+            raise ValueError("period_start must be before or equal to period_end")
+        if self.scope_type == "all":
+            self.scope_value = None
+            return self
+        if not self.scope_value or not self.scope_value.strip():
+            raise ValueError("scope_value is required for watchlist_group scope")
+        self.scope_value = self.scope_value.strip()
+        return self
+
+
 def _celery_inspector():
     try:
         return celery_app.control.inspect(timeout=1.0)
@@ -103,7 +122,7 @@ def _celery_inspector():
 
 def _active_celery_worker_names() -> list[str]:
     try:
-        stats = _celery_inspector().stats()
+        active_queues = _celery_inspector().active_queues()
     except HTTPException:
         raise
     except Exception as exc:
@@ -111,9 +130,13 @@ def _active_celery_worker_names() -> list[str]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"celery worker health check failed: {exc}",
         ) from exc
-    if not stats:
+    if not active_queues:
         return []
-    return sorted(stats)
+    return sorted(
+        worker_name
+        for worker_name, queues in active_queues.items()
+        if any(queue.get("name") == "data" for queue in queues or [])
+    )
 
 
 def _celery_task_ids_by_state() -> set[str]:
@@ -486,6 +509,35 @@ async def start_factor_analyze_task(
     )
     try:
         analyze_factor_icir_task.apply_async(kwargs=payload, task_id=task_id)
+    except OperationalError as exc:
+        await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.post("/factors/backfill")
+async def start_factor_backfill_task(
+    request: FactorBackfillTaskRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    task_id = uuid4().hex
+    payload = {
+        "period_start": request.period_start.isoformat(),
+        "period_end": request.period_end.isoformat(),
+        "scope_type": request.scope_type,
+        "scope_value": request.scope_value,
+    }
+    await create_pending_task_run(
+        session,
+        task_name="backfill_factor_scores",
+        task_id=task_id,
+        payload=payload,
+    )
+    try:
+        backfill_factor_scores_task.apply_async(kwargs=payload, task_id=task_id)
     except OperationalError as exc:
         await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
         raise HTTPException(

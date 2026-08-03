@@ -285,3 +285,98 @@ def execute_script_strategy(source_code: str, ctx: Any, *, allow_inline: bool = 
         raise StrategyExecutionError("script strategy must define on_bar(ctx)")
 
     on_bar(ctx)
+
+
+def compile_strategy(source_code: str) -> dict[str, Any]:
+    """Compile user strategy source code once and return a callable functions dict.
+
+    Separates compilation from execution so the compiled strategy can be cached
+    and reused across many stock/day iterations without re-exec() on every call.
+
+    Returns a dict with a 'generate_signal' key if the function was defined,
+    plus any other user-defined callable symbols from the strategy.
+    """
+    import numpy as np
+
+    from app.libs import MyTT
+
+    sandbox: dict[str, Any] = {"__builtins__": SAFE_BUILTINS}
+    sandbox["np"] = np
+    sandbox["numpy"] = np
+    for name in dir(MyTT):
+        if not name.startswith("_"):
+            sandbox[name] = getattr(MyTT, name)
+
+    try:
+        exec(compile(source_code, "<strategy>", "exec"), sandbox)  # noqa: S102
+    except SyntaxError as exc:
+        raise StrategyExecutionError(f"strategy syntax error: {exc}") from exc
+
+    compiled: dict[str, Any] = {}
+    for name, value in sandbox.items():
+        if name.startswith("__"):
+            continue
+        if callable(value):
+            compiled[name] = value
+    return compiled
+
+
+def execute_compiled_signal(
+    compiled: dict[str, Any],
+    ctx: Any,
+    *,
+    timeout_seconds: float | None = None,
+) -> StrategyExecutionResult:
+    """Execute a pre-compiled strategy's generate_signal function.
+
+    Args:
+        compiled: Output of compile_strategy() -- a dict of callable symbols.
+        ctx: BacktestContext or ScriptContext instance.
+        timeout_seconds: Optional per-call timeout (not enforced at this level).
+
+    Returns:
+        StrategyExecutionResult with the signal dict or error details.
+    """
+    started = time.perf_counter()
+    try:
+        func = compiled.get("generate_signal")
+        if func is None:
+            return StrategyExecutionResult(
+                ok=True,
+                signal=None,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        result = func(ctx)
+        return StrategyExecutionResult(
+            ok=True,
+            signal=result if isinstance(result, dict) else None,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+    except BaseException as exc:
+        return StrategyExecutionResult(
+            ok=False,
+            error_type=exc.__class__.__name__,
+            error_message=str(exc),
+            traceback=_truncate(traceback_mod.format_exc(), _runtime_options(timeout_seconds).traceback_chars),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            timed_out=False,
+        )
+
+
+def execute_compiled_script(
+    compiled: dict[str, Any],
+    ctx: Any,
+) -> None:
+    """Execute a pre-compiled script strategy's on_bar() callback.
+
+    Args:
+        compiled: Output of compile_strategy() -- a dict of callable symbols.
+        ctx: ScriptContext instance.
+
+    Raises:
+        StrategyExecutionError if on_bar is not defined.
+    """
+    on_bar = compiled.get("on_bar")
+    if on_bar is None:
+        raise StrategyExecutionError("script strategy must define on_bar(ctx)")
+    on_bar(ctx)

@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.adapter import BacktestConfig, BacktestRunner, KBar
+from app.backtest.kline_cache import get_cached_klines, set_cached_klines
 from app.backtest.cost import FeeConfig, build_fee_config
 from app.db.session import async_session_factory
 from app.preferences.service import get_trading_fee_config
@@ -197,7 +198,7 @@ async def _factor_scores_by_date(
     result = await session.execute(
         text(
             """
-            SELECT trade_date, ts_code, total_score, rank
+            SELECT trade_date, ts_code, total_score, rank, score_run_id
             FROM scoring_rank
             WHERE scope_type = 'all'
               AND scope_value IS NULL
@@ -219,6 +220,7 @@ async def _factor_scores_by_date(
         scores.setdefault(trade_date, {})[row["ts_code"]] = {
             "total_score": row["total_score"],
             "rank": row["rank"],
+            "score_run_id": row["score_run_id"],
         }
     return scores
 
@@ -373,6 +375,13 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
     """Execute a backtest by running user strategy code against historical K-line data."""
 
     async def _run() -> dict[str, Any]:
+        # ---- Phase 1: load config + fetch all data (short-lived session) ----
+        # IMPORTANT: this session is closed BEFORE the long pure-Python backtest
+        # run. Previously the SAME connection (with an open transaction) was held
+        # for the whole ~14-minute compute; Postgres' idle_in_transaction_session_timeout
+        # (30s) then killed the idle-in-transaction connection, and the failure only
+        # surfaced at the final write as ConnectionDoesNotExistError. A fresh session
+        # is opened in Phase 3 for writing results.
         async with async_session_factory() as session:
             bt = await session.execute(
                 text(
@@ -412,8 +421,15 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no stocks available for selected target"}
 
-            all_klines: dict[str, list[KBar]] = {}
-            for code in stock_codes:
+            # Try Redis cache first, then fall back to DB query.
+            # This avoids redundant DB hits when the same stock pool + date
+            # range is backtested repeatedly (e.g., strategy parameter tuning).
+            cached = await get_cached_klines(
+                stock_codes, bt_row["start_date"], bt_row["end_date"]
+            )
+            if cached is None:
+                # Cache miss — batch load raw rows from DB.
+                all_klines_raw: dict[str, list[dict[str, Any]]] = {}
                 kline_result = await session.execute(
                     text(
                         """
@@ -421,20 +437,38 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                                volume, amount, adj_factor, is_suspended,
                                is_limit_up, is_limit_down
                         FROM daily_kline
-                        WHERE ts_code = :ts_code
+                        WHERE ts_code = ANY(CAST(:codes AS VARCHAR[]))
                           AND trade_date BETWEEN :start_date AND :end_date
-                        ORDER BY trade_date
+                        ORDER BY ts_code, trade_date
                         """
                     ),
                     {
-                        "ts_code": code,
+                        "codes": stock_codes,
                         "start_date": bt_row["start_date"],
                         "end_date": bt_row["end_date"],
                     },
                 )
-                rows = [dict(r) for r in kline_result.mappings().all()]
-                if rows:
-                    all_klines[code] = _parse_kline_rows(rows)
+                for row in kline_result.mappings().all():
+                    row_dict = dict(row)
+                    all_klines_raw.setdefault(row_dict["ts_code"], []).append(row_dict)
+                # Cache the raw row dicts (robust against any dataclass/slots
+                # pickle round-trip corruption). The engine always receives
+                # freshly rebuilt KBar objects via _parse_kline_rows, identical
+                # to the non-cached path.
+                if all_klines_raw:
+                    await set_cached_klines(
+                        stock_codes, bt_row["start_date"], bt_row["end_date"], all_klines_raw
+                    )
+                all_klines = {
+                    code: _parse_kline_rows(rows)
+                    for code, rows in all_klines_raw.items()
+                }
+            else:
+                # Cache hit — rebuild engine-ready KBar objects from raw rows.
+                all_klines = {
+                    code: _parse_kline_rows(rows)
+                    for code, rows in cached.items()
+                }
 
             if not all_klines:
                 await session.execute(
@@ -474,18 +508,40 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 take_profit_pct=float(risk_cfg.get("take_profit_pct", 0.0)),
                 trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0.0)),
                 trailing_activation_pct=float(risk_cfg.get("trailing_activation_pct", 0.0)),
-                time_stop_days=int(risk_cfg.get("time_stop_days", 0)),
-                slippage_pct=float(risk_cfg.get("slippage_pct", 0.001)),
+               time_stop_days=int(risk_cfg.get("time_stop_days", 0)),
+               slippage_pct=float(risk_cfg.get("slippage_pct", 0.001)),
+                rebalance_mode=str(strategy_config.get("rebalance_mode", "disabled")),
+                max_positions=int(strategy_config.get("max_positions", 0)),
+                rebalance_version=int(strategy_config.get("rebalance_version", 1)),
+                rebalance_frequency=str(strategy_config.get("rebalance_frequency", "weekly")),
+                weighting_method=str(strategy_config.get("weighting_method", "equal")),
+                rank_buffer_pct=float(strategy_config.get("rank_buffer_pct", 0.2)),
+                score_max_age_sessions=int(strategy_config.get("score_max_age_sessions", 5)),
                 factor_scores_by_date=factor_scores,
             )
 
-            try:
-                runner = BacktestRunner(config)
-                results = runner.run(all_klines)
+            benchmark_code = bt_row.get("benchmark_code")
+            start_date = bt_row["start_date"]
+            end_date = bt_row["end_date"]
+            # Close the transaction + return the connection to the pool before the
+            # long compute so it is never left idle-in-transaction.
+            await session.commit()
 
-                benchmark_code = bt_row.get("benchmark_code")
+        # ---- Phase 2: pure-Python backtest run (NO DB access) ----
+        results: dict[str, Any] | None = None
+        compute_error: str | None = None
+        try:
+            runner = BacktestRunner(config)
+            results = runner.run(all_klines)
+        except Exception as exc:
+            import traceback as _tb
+            compute_error = f"{exc.__class__.__name__}: {exc}\n{_tb.format_exc()}"
+
+        # ---- Phase 3: attach benchmark metrics + write results (fresh session) ----
+        async with async_session_factory() as session:
+            if results is not None:
                 if benchmark_code:
-                    bm_rows = await _fetch_benchmark_klines(session, benchmark_code, bt_row["start_date"], bt_row["end_date"])
+                    bm_rows = await _fetch_benchmark_klines(session, benchmark_code, start_date, end_date)
                     if bm_rows:
                         strategy_dates = [e["date"] for e in results.get("equity_curve", [])]
                         strategy_values = [e["total_asset"] for e in results.get("equity_curve", [])]
@@ -498,6 +554,11 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 engine = "python_native"
                 results["engine"] = engine
                 if "performance" in results and isinstance(results["performance"], dict):
+                    results["performance"].update({
+                        "monthly_returns": results.get("monthly_returns", {}),
+                        "daily_returns": results.get("daily_returns", []),
+                        "pnl_analysis": results.get("pnl_analysis", {}),
+                    })
                     results["performance"]["engine"] = engine
                     results["performance"]["filters"] = filters
                     results["performance"]["risk_config"] = results.get("execution_assumptions", {})
@@ -505,23 +566,27 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                         results["performance"]["strategy_errors"] = results["strategy_errors"]
                     results["performance"].update(_stock_scope_diagnostics(list(all_klines.keys())))
 
-                if results.get("strategy_errors") and not results.get("trade_records") and not results.get("signal_log"):
-                    first_error = results["strategy_errors"][0]
-                    err_msg = (
-                        f"{first_error.get('error_type') or 'StrategyExecutionError'}: "
-                        f"{first_error.get('error_message') or 'strategy produced no valid signal'}"
-                    )
-                    await session.execute(
-                        text(
-                            "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
-                        ),
-                        {"err": err_msg, "id": backtest_id},
-                    )
-                    await session.commit()
-                    return {"error": err_msg, "strategy_errors": results["strategy_errors"]}
-            except Exception as exc:
-                import traceback
-                err_msg = f"{exc.__class__.__name__}: {exc}\n{traceback.format_exc()}"
+            if compute_error is not None:
+                await session.execute(
+                    text(
+                        "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
+                    ),
+                    {"err": compute_error, "id": backtest_id},
+                )
+                await session.commit()
+                return {"error": compute_error}
+
+            if (
+                results is not None
+                and results.get("strategy_errors")
+                and not results.get("trade_records")
+                and not results.get("signal_log")
+            ):
+                first_error = results["strategy_errors"][0]
+                err_msg = (
+                    f"{first_error.get('error_type') or 'StrategyExecutionError'}: "
+                    f"{first_error.get('error_message') or 'strategy produced no valid signal'}"
+                )
                 await session.execute(
                     text(
                         "UPDATE backtest_results SET status = 'failed', error_message = :err, finished_at = NOW() WHERE id = :id"
@@ -529,7 +594,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     {"err": err_msg, "id": backtest_id},
                 )
                 await session.commit()
-                return {"error": err_msg}
+                return {"error": err_msg, "strategy_errors": results["strategy_errors"]}
 
             await session.execute(
                 text(
