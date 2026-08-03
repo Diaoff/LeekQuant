@@ -78,6 +78,10 @@ FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
 CELERY_CONCURRENCY="${CELERY_CONCURRENCY:-4}"
 BACKTEST_CELERY_CONCURRENCY="${BACKTEST_CELERY_CONCURRENCY:-1}"
+# Prefetch must be >= concurrency, otherwise the worker pulls only one task
+# at a time (worker_prefetch_multiplier is 1 globally for safety) and serializes
+# all backtests regardless of BACKTEST_CELERY_CONCURRENCY. Default = concurrency + 1.
+BACKTEST_PREFETCH_MULTIPLIER="${BACKTEST_PREFETCH_MULTIPLIER:-$((BACKTEST_CELERY_CONCURRENCY + 1))}"
 REALTIME_RISK_GUARD_INTERVAL="${REALTIME_RISK_GUARD_INTERVAL:-15}"
 VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://$BACKEND_HOST:$BACKEND_PORT}"
 
@@ -282,10 +286,10 @@ start_celery() {
       > "$PID_DIR/celery-worker.pid"
   )
 
-  echo "Starting dedicated backtest worker with concurrency=$BACKTEST_CELERY_CONCURRENCY"
+  echo "Starting dedicated backtest worker with concurrency=$BACKTEST_CELERY_CONCURRENCY prefetch=$BACKTEST_PREFETCH_MULTIPLIER"
   (
     cd "$ROOT_DIR/backend"
-    start_detached "$LOG_DIR/celery-backtest-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$BACKTEST_CELERY_CONCURRENCY" -Q backtest --hostname "backtest@%h" \
+    start_detached "$LOG_DIR/celery-backtest-worker.log" "$CELERY_BIN" -A app.tasks.celery_app:celery_app worker --loglevel=INFO --concurrency "$BACKTEST_CELERY_CONCURRENCY" --prefetch-multiplier "$BACKTEST_PREFETCH_MULTIPLIER" -Q backtest --hostname "backtest@%h" \
       > "$PID_DIR/celery-backtest-worker.pid"
   )
 

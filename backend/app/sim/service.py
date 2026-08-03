@@ -1578,6 +1578,15 @@ async def unlock_t1_positions(session: AsyncSession, *, trade_date: date) -> int
 async def snapshot_daily_nav(session: AsyncSession, *, account_id: int, nav_date: date) -> dict[str, Any]:
     await refresh_position_market_values(session, account_id=account_id, nav_date=nav_date)
 
+    account_info = await session.execute(
+        text("SELECT user_id FROM sim_accounts WHERE id = :account_id"),
+        {"account_id": account_id},
+    )
+    account_row = account_info.mappings().one_or_none()
+    if account_row is None:
+        return {"error": "account not found"}
+    user_id = account_row["user_id"]
+
     stopped = await check_stop_conditions(session, account_id=account_id, nav_date=nav_date)
     for s in stopped:
         order_signal = SignalOrderRequest(
@@ -1587,7 +1596,7 @@ async def snapshot_daily_nav(session: AsyncSession, *, account_id: int, nav_date
         )
         await generate_order_from_signal(
             session,
-            user_id=0,
+            user_id=user_id,
             account_id=account_id,
             request=order_signal,
             exit_reason_override=s["exit_reason"],

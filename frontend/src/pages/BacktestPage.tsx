@@ -551,8 +551,8 @@ export default function BacktestPage() {
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums text-red-600">{maxDd !== null ? `${maxDd}%` : '—'}</td>
                       <td className="whitespace-nowrap px-4 py-3 tabular-nums">{r.trade_count !== null ? formatNumber(r.trade_count) : '—'}</td>
                        <td className="px-4 py-3 flex items-center gap-2">
-                         {r.status === 'success' && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
-                         {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600" title={r.error_message}>失败</span>}
+                          {(r.status === 'success' || r.status === 'failed') && <button onClick={() => openResult(r)} className="text-sm font-medium text-accent hover:underline">查看</button>}
+                          {r.status === 'failed' && r.error_message && <span className="text-xs text-red-600 ml-1" title={r.error_message}>失败</span>}
                          <button
                            onClick={() => void handleDelete(r)}
                            disabled={deleting === r.id}
