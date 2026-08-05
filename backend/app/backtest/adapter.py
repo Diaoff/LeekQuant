@@ -205,6 +205,16 @@ class BacktestContext:
         return self._klines[-1].trade_date if self._klines else date.today()
 
     @property
+    def bar_count(self) -> int:
+        """Number of bars accumulated so far (len of the current window).
+
+        Useful for cooldown/timing logic in user strategies (e.g. "add only
+        once every N bars"). The value equals ``len(self._klines)``, i.e. the
+        window length at the current bar.
+        """
+        return len(self._klines)
+
+    @property
     def current_position(self) -> float:
         return self._current_position
 

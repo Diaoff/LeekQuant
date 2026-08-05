@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.backtest.adapter import BacktestConfig, BacktestRunner, KBar
 from app.backtest.kline_cache import get_cached_klines, set_cached_klines
 from app.backtest.cost import FeeConfig, build_fee_config
-from app.db.session import async_session_factory
+from app.db.session import async_session_factory, engine as db_engine
 from app.preferences.service import get_trading_fee_config
 from app.core.asyncio_runtime import run_async
 from app.tasks.celery_app import celery_app
@@ -337,6 +337,15 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
     """Execute a backtest by running user strategy code against historical K-line data."""
 
     async def _run() -> dict[str, Any]:
+        # ---- Phase 0: dispose stale engine connections ----
+        # The async engine is created at module import time, before any event loop
+        # is active. When run_async() creates a new event loop (no running loop in
+        # the Celery worker thread), the pooled connections from the import-time
+        # initialization are bound to the wrong loop, causing asyncpg
+        # "connection is closed" on the first query. Disposing forces fresh
+        # connections created in the current loop context.
+        await db_engine.dispose()
+
         # ---- Phase 1: load config + fetch all data (short-lived session) ----
         # IMPORTANT: this session is closed BEFORE the long pure-Python backtest
         # run. Previously the SAME connection (with an open transaction) was held
@@ -383,12 +392,18 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no stocks available for selected target"}
 
+            # Prepend a warmup window before start_date so technical indicators
+            # (MA20/MACD/BOLL/KDJ/Donchian, lookback=60 bars in the engine) are
+            # already primed on the first backtest day. Without it the first ~1
+            # month produced no trades because the indicator window had too few
+            # bars. Execution stays gated to [start_date, end_date] by the engine.
+            WARMUP_CALENDAR_DAYS = 180  # ≈ 120 trading days, covers max lookback
+            warmup_start = bt_row["start_date"] - timedelta(days=WARMUP_CALENDAR_DAYS)
+
             # Try Redis cache first, then fall back to DB query.
             # This avoids redundant DB hits when the same stock pool + date
             # range is backtested repeatedly (e.g., strategy parameter tuning).
-            cached = await get_cached_klines(
-                stock_codes, bt_row["start_date"], bt_row["end_date"]
-            )
+            cached = await get_cached_klines(stock_codes, warmup_start, bt_row["end_date"])
             if cached is None:
                 # Cache miss — batch load raw rows from DB.
                 all_klines_raw: dict[str, list[dict[str, Any]]] = {}
@@ -406,7 +421,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     ),
                     {
                         "codes": stock_codes,
-                        "start_date": bt_row["start_date"],
+                        "start_date": warmup_start,
                         "end_date": bt_row["end_date"],
                     },
                 )
@@ -419,7 +434,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 # to the non-cached path.
                 if all_klines_raw:
                     await set_cached_klines(
-                        stock_codes, bt_row["start_date"], bt_row["end_date"], all_klines_raw
+                        stock_codes, warmup_start, bt_row["end_date"], all_klines_raw
                     )
                 all_klines = {
                     code: _parse_kline_rows(rows)
@@ -493,6 +508,16 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             compute_error = f"{exc.__class__.__name__}: {exc}\n{_tb.format_exc()}"
 
         # ---- Phase 3: attach benchmark metrics + write results (fresh session) ----
+        # The pure-Python compute above can run for many minutes (complex
+        # strategies), during which every pooled asyncpg connection idles and may
+        # be closed by the server (idle timeout / TCP keepalive) or go stale
+        # past pool_recycle. `pool_pre_ping` alone does not always catch a
+        # connection that is closed *after* the ping but *before* statement
+        # prepare, surfacing as asyncpg "connection is closed". Disposing the
+        # whole pool forces fresh connections for the result-write phase and
+        # eliminates that stale-connection failure — independent of any strategy
+        # code. We only dispose once, between compute and write.
+        await db_engine.dispose()
         async with async_session_factory() as session:
             if results is not None:
                 if benchmark_code:
