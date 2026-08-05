@@ -77,26 +77,6 @@ def _run_in_new_loop(coro):
         loop.close()
 
 
-def _cancel_stray_tasks(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel any tasks left pending after a coroutine completed.
-
-    Mirrors the cleanup ``asyncio.run`` performs (minus closing the loop) so
-    stray tasks don't leak across invocations on this long-lived loop.
-    """
-    try:
-        tasks = asyncio.all_tasks(loop)
-    except RuntimeError:
-        return
-    if not tasks:
-        return
-    for task in tasks:
-        task.cancel()
-    try:
-        loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-    except Exception:  # pragma: no cover - best-effort hygiene
-        pass
-
-
 def _renew_selector_if_stale(loop: asyncio.AbstractEventLoop) -> None:
     """Replace the loop's selector if its fd is stale (e.g. after fork)."""
     import selectors
@@ -126,10 +106,25 @@ def run_async(coro):
     except RuntimeError:
         loop = get_loop()
         _renew_selector_if_stale(loop)
+        # Wrap the coroutine in a single task so we can track and clean up only
+        # *this* invocation's work. We must NOT cancel every task on the loop
+        # (the previous _cancel_stray_tasks did), because the process-wide
+        # asyncpg connection pool keeps background reader tasks registered on
+        # this same loop — cancelling them silently kills pooled connections and
+        # raises ConnectionDoesNotExistError / no running loop on the next call.
+        main_task = asyncio.ensure_future(coro, loop=loop)
         try:
-            result = loop.run_until_complete(coro)
-        finally:
-            _cancel_stray_tasks(loop)
+            result = loop.run_until_complete(main_task)
+        except BaseException:
+            # Ensure the main coroutine is not left pending (leaking across
+            # invocations). Only cancel our own task, never the loop-global ones.
+            if not main_task.done():
+                main_task.cancel()
+                try:
+                    loop.run_until_complete(asyncio.gather(main_task, return_exceptions=True))
+                except Exception:  # pragma: no cover - best-effort hygiene
+                    pass
+            raise
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:

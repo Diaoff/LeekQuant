@@ -50,6 +50,7 @@ def _make_bar(
         is_suspended=is_suspended,
         is_limit_up=is_limit_up,
         is_limit_down=is_limit_down,
+        turnover_rate=None,
     )
 
 
@@ -110,11 +111,8 @@ class TestT1LotLevelCheck:
         assert blocked is False, f"应允许卖出 day1 的 lot，但被阻塞: {reason}"
         assert reason == ""
 
-    def test_t1_blocks_selling_same_day_purchase(self) -> None:
-        """day1 买 100 + day1 卖 100 → 阻塞。
-
-        所有 lot 的 entry_date == td，无 lot 满足 entry_date < td。
-        """
+    def test_signal_rules_defer_t1_until_fill_date_is_known(self) -> None:
+        """The signal stage must not reject an order before its fill date is known."""
         runner = _make_runner()
         ts_code = "000001.SZ"
         day1 = date(2026, 5, 4)
@@ -129,8 +127,8 @@ class TestT1LotLevelCheck:
 
         reason, blocked = _apply_sell_rules(runner, ts_code, day1)
 
-        assert blocked is True, "当日买入的 lot 应被 T+1 阻塞"
-        assert "T+1" in reason, f"应提示 T+1 原因，实际: {reason}"
+        assert blocked is False
+        assert reason == ""
 
     def test_t1_blocks_selling_more_than_unlocked_shares(self) -> None:
         """day1 买 100 + day2 卖 200 → 阻塞在 _apply_rules 后续阶段。
@@ -163,8 +161,8 @@ class TestT1LotLevelCheck:
         # 数量校验由 _execute_action 的 volume = pos.shares 兜底
         assert runner.positions[ts_code].shares == 100
 
-    def test_t1_blocks_when_all_lots_from_today_even_with_multiple_lots(self) -> None:
-        """多 lot 但全部今日买入 → 阻塞（无 lot 满足 entry_date < td）。"""
+    def test_signal_rules_defer_multiple_same_day_lots_to_execution(self) -> None:
+        """Multiple same-day lots are validated against the eventual fill date."""
         runner = _make_runner()
         ts_code = "000001.SZ"
         today = date(2026, 5, 4)
@@ -180,19 +178,11 @@ class TestT1LotLevelCheck:
 
         reason, blocked = _apply_sell_rules(runner, ts_code, today)
 
-        assert blocked is True
-        assert "T+1" in reason
+        assert blocked is False
+        assert reason == ""
 
-    def test_t1_no_open_lots_with_position_allows_sell_defensively(self) -> None:
-        """持仓存在但 _open_lots 为空（异常状态）→ 保守放行。
-
-        边界情况：buy 路径必 append lot，所以 _open_lots 与 positions
-        应同步。但若因历史数据迁移导致 _open_lots 缺失，旧逻辑用
-        _entry_dates.get() 返回 None 也放行。新逻辑保持相同行为：
-        sellable_shares = 0 → 阻塞。这是更安全的选择（避免误卖）。
-
-        本测试验证该保守行为：阻塞并提示 T+1。
-        """
+    def test_signal_rules_defer_missing_lot_state_to_execution(self) -> None:
+        """Missing lot state is blocked by execution after the fill date is known."""
         runner = _make_runner()
         ts_code = "000001.SZ"
         day1 = date(2026, 5, 4)
@@ -205,9 +195,8 @@ class TestT1LotLevelCheck:
 
         reason, blocked = _apply_sell_rules(runner, ts_code, day1)
 
-        # _open_lots.get(ts_code, []) → []，sellable_shares = 0 → 阻塞
-        assert blocked is True
-        assert "T+1" in reason
+        assert blocked is False
+        assert reason == ""
 
     def test_t1_unlocked_lot_allows_partial_sell_after_friday_to_monday_gap(self) -> None:
         """跨周末场景：周五买 + 周一卖 → 通过。
@@ -231,3 +220,133 @@ class TestT1LotLevelCheck:
 
         assert blocked is False
         assert reason == ""
+
+    @pytest.mark.parametrize(
+        ("action", "target_position"),
+        [("SELL_ALL", 0.0), ("SELL_PARTIAL", 0.2)],
+    )
+    def test_mixed_age_sell_caps_execution_to_unlocked_lots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        action: str,
+        target_position: float,
+    ) -> None:
+        runner = _make_runner()
+        monkeypatch.setattr(runner, "_fill_price_mode", lambda: "current_close")
+        ts_code = "000001.SZ"
+        yesterday = date(2026, 5, 4)
+        today = date(2026, 5, 5)
+        runner.cash = Decimal("1000")
+        runner.positions[ts_code] = Position(
+            ts_code=ts_code, shares=300, avg_cost=Decimal("10.6666666667")
+        )
+        runner._open_lots[ts_code] = [
+            _LotEntry(
+                ts_code=ts_code,
+                shares=100,
+                cost=Decimal("10"),
+                entry_date=yesterday,
+                entry_fee=Decimal("5.0100"),
+            ),
+            _LotEntry(
+                ts_code=ts_code,
+                shares=200,
+                cost=Decimal("11"),
+                entry_date=today,
+                entry_fee=Decimal("5.0220"),
+            ),
+        ]
+        runner._entry_dates[ts_code] = today
+        runner._entry_prices[ts_code] = Decimal("11")
+        balance_before = runner._book_asset()
+
+        blocked_reason = runner._execute_action(
+            SignalOutput(action=action, target_position=target_position),  # type: ignore[arg-type]
+            ts_code,
+            _make_bar(ts_code, today, base_price=Decimal("12")),
+            Decimal("4200"),
+        )
+
+        assert blocked_reason is None
+        trade = runner.trades[-1]
+        expected_amount = trade.price * 100
+        expected_fee = runner.calculator.calculate("卖出", expected_amount).total_fee
+        assert trade.volume == 100
+        assert trade.amount == expected_amount
+        assert trade.cost.total_fee == expected_fee
+        assert trade.balance_before == balance_before
+        assert runner.cash == Decimal("1000") + expected_amount - expected_fee
+        assert runner.positions[ts_code].shares == 200
+        assert trade.balance_after == runner._book_asset()
+
+        assert len(runner._closed_lots) == 1
+        closed = runner._closed_lots[0]
+        assert closed.entry_date == yesterday
+        assert closed.shares == 100
+        assert closed.entry_fee == Decimal("5.0100")
+        assert closed.exit_fee == expected_fee
+        assert trade.pnl == closed.net_pnl
+
+        assert len(runner._open_lots[ts_code]) == 1
+        same_day_lot = runner._open_lots[ts_code][0]
+        assert same_day_lot.entry_date == today
+        assert same_day_lot.shares == 200
+        assert same_day_lot.entry_fee == Decimal("5.0220")
+
+    def test_execute_sell_blocks_when_no_lots_are_unlocked(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = _make_runner()
+        monkeypatch.setattr(runner, "_fill_price_mode", lambda: "current_close")
+        ts_code = "000001.SZ"
+        today = date(2026, 5, 5)
+        runner.positions[ts_code] = Position(ts_code, 100, Decimal("10"))
+        runner._open_lots[ts_code] = [
+            _LotEntry(ts_code, 100, Decimal("10"), today, Decimal("5.0100"))
+        ]
+
+        reason = runner._execute_action(
+            SignalOutput(action="SELL_ALL", target_position=0),
+            ts_code,
+            _make_bar(ts_code, today, base_price=Decimal("12")),
+            Decimal("100000"),
+        )
+
+        assert reason == "T+1 当日买入不可卖出"
+        assert runner.trades == []
+        assert runner.positions[ts_code].shares == 100
+        assert runner.cash == runner.config.initial_cash
+
+    def test_same_day_sell_signal_can_fill_at_next_open(self) -> None:
+        runner = _make_runner()
+        ts_code = "000001.SZ"
+        signal_day = date(2026, 5, 5)
+        fill_day = date(2026, 5, 6)
+        runner.positions[ts_code] = Position(ts_code, 100, Decimal("10"))
+        runner._open_lots[ts_code] = [
+            _LotEntry(ts_code, 100, Decimal("10"), signal_day, Decimal("5.0100"))
+        ]
+
+        action = SignalOutput(action="SELL_ALL", target_position=0)
+        reason, blocked = runner._apply_rules(
+            action,
+            ts_code,
+            _make_bar(ts_code, signal_day),
+            runner.positions[ts_code],
+            signal_day,
+        )
+        execution_reason = runner._execute_action(
+            action,
+            ts_code,
+            _make_bar(ts_code, signal_day),
+            Decimal("100000"),
+            fill_bar=_make_bar(ts_code, fill_day, base_price=Decimal("12")),
+        )
+
+        assert blocked is False
+        assert reason == ""
+        assert execution_reason is None
+        assert len(runner.trades) == 1
+        assert runner.trades[0].trade_date == fill_day
+        assert runner.trades[0].volume == 100
+        assert ts_code not in runner.positions

@@ -51,6 +51,7 @@ for i in range(30):
         is_suspended=False,
         is_limit_up=False,
         is_limit_down=False,
+        turnover_rate=None,
     ))
 
 all_klines['000001.SZ'] = klines

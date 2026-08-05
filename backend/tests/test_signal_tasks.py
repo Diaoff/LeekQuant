@@ -134,7 +134,6 @@ async def test_generate_all_signals_logs_strategy_signal_without_account():
             FakeResult([]),
             FakeResult(kline_rows()),
             FakeResult([]),
-            FakeResult([]),
             FakeResult([{"id": 77}]),
         ]
     )
@@ -259,7 +258,6 @@ async def test_generate_all_signals_creates_order_for_bound_account(monkeypatch)
             FakeResult([{"id": 5, "user_id": 1}]),
             FakeResult(kline_rows()),
             FakeResult([]),
-            FakeResult([]),
             FakeResult([{"id": 77}]),
         ]
     )
@@ -296,7 +294,6 @@ async def test_generate_all_signals_records_skipped_order_reason(monkeypatch):
             FakeResult([]),
             FakeResult([{"id": 5, "user_id": 1}]),
             FakeResult(kline_rows()),
-            FakeResult([]),
             FakeResult([]),
             FakeResult([{"id": 77}]),
         ]
@@ -340,7 +337,7 @@ async def test_generate_all_signals_uses_saved_concurrency_preference():
 
 
 @pytest.mark.asyncio
-async def test_generate_all_signals_prioritizes_sell_then_confidence_then_factor_score(monkeypatch):
+async def test_generate_all_signals_prioritizes_sell_then_confidence(monkeypatch):
     from app.tasks import signal_tasks
 
     calls = []
@@ -380,11 +377,6 @@ def generate_signal(ctx):
             FakeResult([]),
             FakeResult([{"id": 5, "user_id": 1}]),
             FakeResult(batch_kline_rows("000001.SZ", "000002.SZ", "000003.SZ", "000004.SZ")),
-            FakeResult([
-                {"ts_code": "000001.SZ", "trade_date": date(2026, 5, 20), "total_score": Decimal("0.99"), "rank": 1},
-                {"ts_code": "000002.SZ", "trade_date": date(2026, 5, 20), "total_score": Decimal("0.20"), "rank": 3},
-                {"ts_code": "000003.SZ", "trade_date": date(2026, 5, 20), "total_score": Decimal("0.80"), "rank": 2},
-            ]),
             FakeResult([]),
             FakeResult([{"id": 77}]),
             FakeResult([]),
@@ -400,11 +392,12 @@ def generate_signal(ctx):
 
     assert result["signals_logged"] == 4
     assert result["orders_created"] == 4
+    # Sell signal (000004.SZ) first, then buys sorted by confidence descending
     assert [call["ts_code"] for call in calls] == ["000004.SZ", "000002.SZ", "000001.SZ", "000003.SZ"]
     assert calls[1]["priority_source"] == "confidence"
     assert calls[1]["priority_score"] == "0.9"
-    assert calls[3]["priority_source"] == "factor_score"
-    assert calls[3]["priority_score"] == "0.80"
+    assert calls[3]["priority_source"] == "default"
+    assert calls[3]["priority_score"] == "0"
 
 
 @pytest.mark.asyncio
@@ -435,7 +428,6 @@ def generate_signal(ctx):
             FakeResult([]),
             FakeResult([{"id": 5, "user_id": 1}]),
             FakeResult(batch_kline_rows("000002.SZ", "000001.SZ", "000003.SZ")),
-            FakeResult([]),
             FakeResult([]),
             FakeResult([{"id": 77}]),
             FakeResult([]),

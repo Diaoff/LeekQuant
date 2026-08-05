@@ -27,6 +27,7 @@ def generate_signal(ctx):
 | `signal` | str | 是 | 五档信号之一：`买入` `增持` `减仓` `卖出` `观望` |
 | `reason` | str | 推荐 | 信号原因描述，会记录到回测和信号日志中 |
 | `target_position` | float | 否 | 目标仓位 0.0~1.0，不填则使用信号状态机默认值 |
+| `confidence` | float | 否 | 信号置信度 0.0~1.0，用于信号排序与展示；不填则按默认处理 |
 
 ## ctx 上下文 API
 
@@ -111,17 +112,21 @@ def generate_signal(ctx):
     ma10 = MA(close, 10)
     ma30 = MA(close, 30)
 
+    # 趋势强度：短期均线与长期均线的相对距离，作为置信度
+    dist = (ma10[-1] - ma30[-1]) / ma30[-1]
+    conf = float(max(0.0, min(1.0, abs(dist) * 20)))
+
     if CROSS(ma10, ma30)[-1]:
-        return {"signal": "买入", "reason": "10日均线上穿30日均线"}
+        return {"signal": "买入", "reason": "10日均线上穿30日均线", "confidence": round(conf, 2)}
     if CROSS(ma30, ma10)[-1]:
-        return {"signal": "卖出", "reason": "10日均线下穿30日均线"}
+        return {"signal": "卖出", "reason": "10日均线下穿30日均线", "confidence": round(conf, 2)}
 
     if close[-1] > ma10[-1]:
-        return {"signal": "增持", "reason": "价格在均线上方"}
+        return {"signal": "增持", "reason": "价格在均线上方", "confidence": round(conf, 2)}
     if close[-1] < ma10[-1]:
-        return {"signal": "减仓", "reason": "价格在均线下方"}
+        return {"signal": "减仓", "reason": "价格在均线下方", "confidence": round(conf, 2)}
 
-    return {"signal": "观望", "reason": "无信号"}
+    return {"signal": "观望", "reason": "无信号", "confidence": 0.0}
 ```
 
 ### MACD 金叉策略
@@ -132,12 +137,15 @@ def generate_signal(ctx):
     close = ctx.close(code)
     dif, dea, macd = MACD(close)
 
-    if CROSS(dif, dea)[-1] and macd[-1] > 0:
-        return {"signal": "买入", "reason": "MACD零轴上金叉"}
-    if CROSS(dea, dif)[-1] and macd[-1] < 0:
-        return {"signal": "卖出", "reason": "MACD零轴下死叉"}
+    # 柱强绝对值越大，置信度越高
+    conf = float(max(0.0, min(1.0, abs(macd[-1]) * 5)))
 
-    return {"signal": "观望", "reason": "无信号"}
+    if CROSS(dif, dea)[-1] and macd[-1] > 0:
+        return {"signal": "买入", "reason": "MACD零轴上金叉", "confidence": round(conf, 2)}
+    if CROSS(dea, dif)[-1] and macd[-1] < 0:
+        return {"signal": "卖出", "reason": "MACD零轴下死叉", "confidence": round(conf, 2)}
+
+    return {"signal": "观望", "reason": "无信号", "confidence": 0.0}
 ```
 
 ### RSI 超买超卖

@@ -59,6 +59,7 @@ def _parse_kbar(row: dict[str, Any]) -> KBar:
         pre_close=_dec(row.get("pre_close")),
         volume=int(row.get("volume") or 0),
         amount=_dec(row.get("amount")),
+        turnover_rate=_dec(row.get("turnover_rate")) if row.get("turnover_rate") is not None else None,
         adj_factor=_dec(row.get("adj_factor")) if row.get("adj_factor") is not None else None,
         is_suspended=bool(row.get("is_suspended", False)),
         is_limit_up=bool(row.get("is_limit_up", False)),
@@ -296,33 +297,6 @@ async def _batch_klines(session, trade_date: date) -> dict[str, list[KBar]]:
     return bars
 
 
-async def _latest_factor_scores(session, trade_date: date, ts_codes: list[str]) -> dict[str, dict[str, Any]]:
-    if not ts_codes:
-        return {}
-    result = await session.execute(
-        text(
-            """
-            WITH latest_rank_date AS (
-                SELECT MAX(trade_date) AS trade_date
-                FROM scoring_rank
-                WHERE scope_type = 'all'
-                  AND scope_value IS NULL
-                  AND trade_date <= :trade_date
-                  AND ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))
-            )
-            SELECT sr.ts_code, sr.trade_date, sr.total_score, sr.rank, sr.score_run_id
-            FROM scoring_rank sr
-            JOIN latest_rank_date lrd ON lrd.trade_date = sr.trade_date
-            WHERE sr.scope_type = 'all'
-              AND sr.scope_value IS NULL
-              AND sr.ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))
-            """
-        ),
-        {"trade_date": trade_date, "ts_codes": ts_codes},
-    )
-    return {row["ts_code"]: dict(row) for row in result.mappings().all()}
-
-
 async def _upsert_strategy_signal(
     session,
     *,
@@ -489,59 +463,37 @@ async def _evaluate_strategy_signals(
 
 def _enrich_and_sort_signals(
     evaluated_signals: list[tuple[str, SignalOrderRequest, Decimal]],
-    factor_scores: dict[str, dict[str, Any]],
 ) -> list[tuple[str, SignalOrderRequest, Decimal]]:
-    enriched: list[tuple[str, SignalOrderRequest, Decimal, Decimal, str | None, int | None]] = []
+    enriched: list[tuple[str, SignalOrderRequest, Decimal, Decimal]] = []
     for ts_code, request, current_position in evaluated_signals:
         priority_score = Decimal("0")
-        priority_source: str | None = None
-        factor_rank: int | None = None
-        factor_score = factor_scores.get(ts_code)
+        priority_source = "default"
+        if request.signal_type in BUY_SIGNAL_TYPES and request.confidence is not None:
+            priority_score = request.confidence
+            priority_source = "confidence"
 
         if request.signal_type in BUY_SIGNAL_TYPES:
-            if request.confidence is not None:
-                priority_score = request.confidence
-                priority_source = "confidence"
-            elif factor_score is not None:
-                priority_score = _dec(factor_score.get("total_score"))
-                priority_source = "factor_score"
+            snapshot = dict(request.snapshot or {})
+            snapshot.update(
+                {
+                    "buy_priority_score": str(priority_score),
+                    "buy_priority_source": priority_source,
+                }
+            )
+            request = replace(request, snapshot=snapshot)
 
-            if factor_score is not None:
-                factor_rank = int(factor_score["rank"]) if factor_score.get("rank") is not None else None
-                snapshot = dict(request.snapshot or {})
-                snapshot.update(
-                    {
-                        "buy_priority_score": str(priority_score),
-                        "buy_priority_source": priority_source or "default",
-                        "factor_score": str(_dec(factor_score.get("total_score"))),
-                        "factor_rank": factor_rank,
-                        "factor_trade_date": factor_score.get("trade_date"),
-                    }
-                )
-                request = replace(request, snapshot=snapshot)
-            else:
-                snapshot = dict(request.snapshot or {})
-                snapshot.update(
-                    {
-                        "buy_priority_score": str(priority_score),
-                        "buy_priority_source": priority_source or "default",
-                    }
-                )
-                request = replace(request, snapshot=snapshot)
+        enriched.append((ts_code, request, current_position, priority_score))
 
-        enriched.append((ts_code, request, current_position, priority_score, priority_source, factor_rank))
-
-    def sort_key(item: tuple[str, SignalOrderRequest, Decimal, Decimal, str | None, int | None]) -> tuple[int, int, Decimal, Decimal, str]:
-        ts_code, request, _current_position, priority_score, _priority_source, _factor_rank = item
+    def sort_key(item: tuple[str, SignalOrderRequest, Decimal, Decimal]) -> tuple[int, int, Decimal, Decimal, str]:
+        ts_code, request, _current_position, priority_score = item
         if request.signal_type in EXIT_SIGNAL_TYPES:
             group = 0
         elif request.signal_type in BUY_SIGNAL_TYPES:
             group = 1
         else:
             group = 2
-        source_order = {"confidence": 0, "factor_score": 1}.get(_priority_source or "", 2)
         target_position = request.target_position if request.target_position is not None else Decimal("0")
-        return group, source_order, -priority_score, -target_position, ts_code
+        return group, 0, -priority_score, -target_position, ts_code
 
     return [(ts_code, request, current_position) for ts_code, request, current_position, *_ in sorted(enriched, key=sort_key)]
 
@@ -585,12 +537,7 @@ async def generate_all_signals_for_date(session, *, trade_date: date | None = No
             concurrency=effective_concurrency,
         )
         stats["errors"].extend(eval_errors)
-        factor_scores = await _latest_factor_scores(
-            session,
-            run_date,
-            [ts_code for ts_code, request, _current_position in evaluated_signals if request.signal_type in BUY_SIGNAL_TYPES],
-        )
-        evaluated_signals = _enrich_and_sort_signals(evaluated_signals, factor_scores)
+        evaluated_signals = _enrich_and_sort_signals(evaluated_signals)
 
         for ts_code, request, current_position in evaluated_signals:
             try:

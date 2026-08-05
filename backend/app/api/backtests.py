@@ -463,6 +463,7 @@ async def get_backtest(
     backtest_id: int,
     req: Request,
     include_kline: bool = Query(default=False),
+    detail_limit: int = Query(default=20000, ge=1, le=200000),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     user_id = _extract_user_id(req)
@@ -493,13 +494,30 @@ async def get_backtest(
     if isinstance(performance, str):
         performance = json.loads(performance)
         payload["performance"] = performance
-    if isinstance(performance, dict):
-        payload["daily_returns"] = performance.get("daily_returns", [])
+    if not isinstance(performance, dict):
+        performance = {}
+        payload["performance"] = performance
 
-    raw_trades = payload.get("trade_records")
-    trades = raw_trades
-    if isinstance(trades, str):
-        trades = json.loads(trades)
+    # 从规范化子表分页读取明细，拼装回前端期望的结构
+    trades = await _load_backtest_trades(session, backtest_id, detail_limit)
+    if not trades:
+        # 回退兼容：规范化改造前（子表为空）的历史回测，逐笔明细仍存于
+        # backtest_results.trade_records（完整 JSON），直接复用以免历史记录丢失。
+        legacy = payload.get("trade_records")
+        if isinstance(legacy, str):
+            try:
+                legacy = json.loads(legacy)
+            except (ValueError, TypeError):
+                legacy = None
+        if isinstance(legacy, list):
+            trades = legacy[:detail_limit]
+    payload["trade_records"] = trades
+    payload["daily_returns"] = performance.get("daily_returns", [])
+
+    if isinstance(performance.get("pnl_analysis"), dict):
+        pnl = performance["pnl_analysis"]
+        pnl["closed_lots"] = await _load_backtest_closed_lots(session, backtest_id, detail_limit)
+        pnl["stock_rankings"] = await _load_backtest_stock_rankings(session, backtest_id, detail_limit)
 
     if trades:
         all_ts_codes = sorted({t.get("ts_code") for t in trades if t.get("ts_code")})
@@ -525,6 +543,118 @@ async def get_backtest(
                 payload["kline_data"] = kline_data
 
     return payload
+
+
+async def _load_backtest_trades(session: AsyncSession, backtest_id: int, limit: int) -> list[dict[str, Any]]:
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT ts_code, trade_date, direction, price, volume, amount,
+                       fee, stamp_tax, transfer_fee, slippage, signal_type, action,
+                       signal_reason, target_position, position_before, position_after,
+                       pnl, balance_before, balance_after, holding_days, exit_reason
+                FROM backtest_trades
+                WHERE backtest_id = :id
+                ORDER BY seq
+                LIMIT :limit
+                """
+            ),
+            {"id": backtest_id, "limit": limit},
+        )
+    ).mappings().all()
+    return [
+        {
+            "ts_code": r["ts_code"],
+            "trade_date": str(r["trade_date"]),
+            "direction": r["direction"],
+            "price": float(r["price"]),
+            "volume": r["volume"],
+            "amount": float(r["amount"]),
+            "commission": float(r["fee"]),
+            "stamp_tax": float(r["stamp_tax"]),
+            "transfer_fee": float(r["transfer_fee"]),
+            "total_fee": float(r["fee"] + r["stamp_tax"] + r["transfer_fee"] + r["slippage"]),
+            "action": r["action"],
+            "signal_reason": r["signal_reason"],
+            "target_position": float(r["target_position"]),
+            "position_before": float(r["position_before"]),
+            "position_after": float(r["position_after"]),
+            "pnl": float(r["pnl"]),
+            "balance_before": float(r["balance_before"]),
+            "balance_after": float(r["balance_after"]),
+            "holding_days": r["holding_days"],
+            "exit_reason": r["exit_reason"],
+        }
+        for r in rows
+    ]
+
+
+async def _load_backtest_closed_lots(session: AsyncSession, backtest_id: int, limit: int) -> list[dict[str, Any]]:
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT ts_code, shares, entry_price, entry_date, exit_price, exit_date,
+                       entry_fee, exit_fee, gross_pnl, net_pnl, return_rate,
+                       holding_days, exit_reason
+                FROM backtest_closed_lots
+                WHERE backtest_id = :id
+                ORDER BY seq
+                LIMIT :limit
+                """
+            ),
+            {"id": backtest_id, "limit": limit},
+        )
+    ).mappings().all()
+    return [
+        {
+            "ts_code": r["ts_code"],
+            "entry_date": str(r["entry_date"]),
+            "exit_date": str(r["exit_date"]),
+            "entry_price": float(r["entry_price"]),
+            "exit_price": float(r["exit_price"]),
+            "shares": r["shares"],
+            "entry_fee": float(r["entry_fee"]),
+            "exit_fee": float(r["exit_fee"]),
+            "gross_pnl": float(r["gross_pnl"]),
+            "net_pnl": float(r["net_pnl"]),
+            "return_rate": float(r["return_rate"]),
+            "holding_days": r["holding_days"],
+            "exit_reason": r["exit_reason"],
+        }
+        for r in rows
+    ]
+
+
+async def _load_backtest_stock_rankings(session: AsyncSession, backtest_id: int, limit: int) -> list[dict[str, Any]]:
+    rows = (
+        await session.execute(
+            text(
+                """
+                SELECT ts_code, trade_count, total_pnl, win_rate, avg_return,
+                       max_profit, max_loss
+                FROM backtest_stock_rankings
+                WHERE backtest_id = :id
+                ORDER BY seq
+                LIMIT :limit
+                """
+            ),
+            {"id": backtest_id, "limit": limit},
+        )
+    ).mappings().all()
+    return [
+        {
+            "ts_code": r["ts_code"],
+            "closed_lot_count": r["trade_count"],
+            "net_pnl": float(r["total_pnl"]),
+            "win_rate": float(r["win_rate"]),
+            "return_rate": float(r["avg_return"]),
+            "max_profit": float(r["max_profit"]),
+            "max_loss": float(r["max_loss"]),
+        }
+        for r in rows
+    ]
 
 
 @router.get("/{backtest_id}/klines")

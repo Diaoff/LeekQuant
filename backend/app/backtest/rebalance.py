@@ -2,7 +2,7 @@
 
 Provides the WeeklyRebalancePlanner class that generates and executes
 weekly portfolio rebalance decisions using signal-qualified candidates,
-factor scores, and an equal-weight buffer-zone approach.
+recent return rates, and an equal-weight buffer-zone approach.
 """
 from __future__ import annotations
 
@@ -15,13 +15,11 @@ from app.backtest.adapter import BacktestConfig, KBar, SignalOutput
 
 
 @dataclass
-class ScoreInfo:
+class RankInfo:
     ts_code: str
-    score: Decimal
+    return_rate: Decimal
     rank: int
     score_date: date
-    score_run_id: int | None
-    age_sessions: int
 
 
 @dataclass
@@ -32,7 +30,7 @@ class HoldingInfo:
     avg_cost: Decimal
     entry_date: date
     exit_reason: str | None
-    score: ScoreInfo | None
+    rank: RankInfo | None
 
 
 @dataclass
@@ -41,7 +39,7 @@ class CandidateInfo:
     signal_type: str
     first_signal_date: date
     latest_signal_date: date
-    score: ScoreInfo | None
+    rank: RankInfo | None
     exited: bool = False
 
 
@@ -71,9 +69,6 @@ class RebalanceDecision:
     decision_date: date
     information_date: date
     fill_date: date | None = None
-    score_run_id: int | None = None
-    score_date: date | None = None
-    score_age_sessions: int | None = None
     score_coverage: float = 0.0
     candidate_count: int = 0
     holding_count_before: int = 0
@@ -112,7 +107,7 @@ class WeeklyRebalancePlanner:
                 self.candidate_pool[ts_code] = CandidateInfo(
                     ts_code=ts_code, signal_type=signal_type,
                     first_signal_date=td, latest_signal_date=td,
-                    score=None, exited=False,
+                    rank=None, exited=False,
                 )
 
     def on_exit(self, ts_code: str, exit_reason: str) -> None:
@@ -130,40 +125,50 @@ class WeeklyRebalancePlanner:
         next_td = trading_dates[idx + 1]
         return next_td.isocalendar()[1] != td.isocalendar()[1]
 
-    def _find_score(
+    def _find_return_rate(
         self,
         ts_code: str,
         td: date,
-        factor_scores: dict,
-        trading_dates: list[date],
-    ) -> ScoreInfo | None:
-        idx = trading_dates.index(td) if td in trading_dates else -1
-        if idx < 0:
+        all_klines: dict,
+        lookback_window: int = 20,
+    ) -> RankInfo | None:
+        """Find recent return rate (N-day) for a stock on a given date.
+
+        Uses the past N-day return computed from K-line data.
+        Returns None if there's not enough data.
+        """
+        klines = all_klines.get(ts_code, [])
+        if not klines:
             return None
-        max_age = getattr(self.config, 'score_max_age_sessions', 5)
-        for i in range(max_age):
-            if idx - i < 0:
+
+        # Find the K-bar index for target date
+        current_idx = None
+        for i, k in enumerate(klines):
+            if k.trade_date == td:
+                current_idx = i
                 break
-            check_date = trading_dates[idx - i]
-            scores_on_date = factor_scores.get(check_date, {})
-            if ts_code in scores_on_date:
-                sd = scores_on_date[ts_code]
-                return ScoreInfo(
-                    ts_code=ts_code,
-                    score=Decimal(str(sd.get("total_score", 0))),
-                    rank=int(sd.get("rank", 999999)),
-                    score_date=check_date,
-                    score_run_id=sd.get("score_run_id"),
-                    age_sessions=i,
-                )
-        return None
+
+        if current_idx is None or current_idx < lookback_window:
+            return None
+
+        past_k = klines[current_idx - lookback_window]
+        curr_k = klines[current_idx]
+        if past_k.close <= 0:
+            return None
+
+        return_rate = (curr_k.close - past_k.close) / past_k.close
+        return RankInfo(
+            ts_code=ts_code,
+            return_rate=Decimal(str(return_rate)),
+            rank=999999,
+            score_date=td,
+        )
 
     def plan(
         self,
         td: date,
         all_klines: dict,
         total_asset: Decimal,
-        factor_scores: dict,
         trading_dates: list[date],
     ) -> RebalanceDecision | None:
         """Generate the weekly rebalance plan. Returns None if no rebalance needed."""
@@ -183,7 +188,7 @@ class WeeklyRebalancePlanner:
             holdings[ts_code] = HoldingInfo(
                 ts_code=ts_code, shares=pos.shares, market_value=market_value,
                 avg_cost=pos.avg_cost, entry_date=entry_date,
-                exit_reason=None, score=None,
+                exit_reason=None, rank=None,
             )
 
         # 2. Merge candidate pool, remove exited ones
@@ -194,43 +199,43 @@ class WeeklyRebalancePlanner:
         if not active_candidates and not holdings:
             return None
 
-        # 3. Fetch scores for all eligible stocks (max 5 sessions old)
-        candidate_scores: dict[str, ScoreInfo | None] = {}
+        # 3. Fetch return rates for all eligible stocks
+        candidate_ranks: dict[str, RankInfo | None] = {}
         for ts_code in active_candidates:
-            score = self._find_score(ts_code, td, factor_scores, trading_dates)
-            candidate_scores[ts_code] = score
+            rank = self._find_return_rate(ts_code, td, all_klines)
+            candidate_ranks[ts_code] = rank
 
-        # Also score current holdings that are not in the candidate pool
+        # Also rank current holdings that are not in the candidate pool
         for ts_code in holdings:
-            if ts_code not in candidate_scores:
-                score = self._find_score(ts_code, td, factor_scores, trading_dates)
-                candidate_scores[ts_code] = score
-                holdings[ts_code].score = score
+            if ts_code not in candidate_ranks:
+                rank = self._find_return_rate(ts_code, td, all_klines)
+                candidate_ranks[ts_code] = rank
+                holdings[ts_code].rank = rank
 
-        # 4. Rank by score DESC, rank ASC, then ts_code
+        # 4. Rank by return_rate DESC, then ts_code
         union_set = set(active_candidates.keys()) | set(holdings.keys())
-        scored_items = []
+        ranked_items = []
         for ts_code in union_set:
-            score = candidate_scores.get(ts_code)
-            if score is not None:
-                scored_items.append((ts_code, score))
+            rank = candidate_ranks.get(ts_code)
+            if rank is not None:
+                ranked_items.append((ts_code, rank))
             else:
-                scored_items.append((ts_code, ScoreInfo(
-                    ts_code=ts_code, score=Decimal("0"), rank=999999,
-                    score_date=td, score_run_id=None, age_sessions=999,
+                ranked_items.append((ts_code, RankInfo(
+                    ts_code=ts_code, return_rate=Decimal("0"), rank=999999,
+                    score_date=td,
                 )))
 
-        scored_items.sort(key=lambda x: (-x[1].score, x[1].rank, x[0]))
+        ranked_items.sort(key=lambda x: (-x[1].return_rate, x[0]))
 
         # 5. Apply 20% buffer zone
         max_pos = self.config.max_positions
         if max_pos <= 0:
-            max_pos = max(len(scored_items), 1)
+            max_pos = max(len(ranked_items), 1)
         buffer_size = max(1, int(max_pos * getattr(self.config, 'rank_buffer_pct', 0.2)))
 
         # Top N = core, next buffer = buffer zone
-        core_set = set(item[0] for item in scored_items[:max_pos])
-        buffer_set = set(item[0] for item in scored_items[max_pos:max_pos + buffer_size])
+        core_set = set(item[0] for item in ranked_items[:max_pos])
+        buffer_set = set(item[0] for item in ranked_items[max_pos:max_pos + buffer_size])
 
         # Current holdings in core or buffer zone -> keep
         keep_set = set()
@@ -292,18 +297,15 @@ class WeeklyRebalancePlanner:
                     planned_shares=buy_shares,
                 ))
 
-        # 9. Calculate score coverage
+        # 9. Calculate return rate coverage
         score_coverage = 0.0
         if active_candidates:
-            covered = sum(1 for s in candidate_scores.values() if s is not None)
+            covered = sum(1 for s in candidate_ranks.values() if s is not None)
             score_coverage = covered / len(active_candidates)
 
         return RebalanceDecision(
             decision_date=td,
             information_date=td,
-            score_run_id=None,
-            score_date=None,
-            score_age_sessions=None,
             score_coverage=score_coverage,
             candidate_count=len(active_candidates),
             holding_count_before=len(holdings),

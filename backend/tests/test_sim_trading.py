@@ -1657,6 +1657,7 @@ async def test_daily_sim_trading_buy_t1_sell_nav_closed_loop():
             FakeResult([]),
             FakeResult([]),
             FakeResult([], rowcount=1),
+            FakeResult([{"user_id": 1}]),
             FakeResult([]),
             FakeResult([]),
             FakeResult([account_row(available_cash=Decimal("101877.5152"), total_asset=Decimal("101877.5152"))]),
@@ -1756,6 +1757,7 @@ async def test_nav_snapshot_upserts_total_asset_and_returns_serialized_values():
     session = ScriptedSession(
         [
             FakeResult([], rowcount=1),
+            FakeResult([{"user_id": 1}]),
             FakeResult([]),
             FakeResult([]),
             FakeResult([account_row(total_asset=Decimal("101000.0000"))]),
@@ -1782,9 +1784,9 @@ async def test_nav_snapshot_upserts_total_asset_and_returns_serialized_values():
     result = await snapshot_daily_nav(session, account_id=1, nav_date=date(2026, 5, 21))
 
     assert result["total_asset"] == "101000.0000"
-    assert session.params[6]["daily_return"] == Decimal("0.01000000")
+    assert session.params[7]["daily_return"] == Decimal("0.01000000")
     assert "FROM daily_kline dk" in session.statements[0]
-    assert "ON CONFLICT (account_id, nav_date)" in session.statements[6]
+    assert "ON CONFLICT (account_id, nav_date)" in session.statements[7]
 
 
 @pytest.mark.asyncio
@@ -1792,6 +1794,7 @@ async def test_nav_snapshot_refreshes_positions_from_daily_close_before_account_
     session = ScriptedSession(
         [
             FakeResult([], rowcount=2),
+            FakeResult([{"user_id": 1}]),
             FakeResult([]),
             FakeResult([]),
             FakeResult([account_row(total_asset=Decimal("110000.0000"))]),
@@ -1821,7 +1824,7 @@ async def test_nav_snapshot_refreshes_positions_from_daily_close_before_account_
     assert "current_price = dk.close" in session.statements[0]
     assert "market_value = p.shares * dk.close" in session.statements[0]
     assert "profit_rate = CASE" in session.statements[0]
-    assert "UPDATE sim_accounts" in session.statements[2]
+    assert "UPDATE sim_accounts" in session.statements[3]
 
 
 @pytest.mark.asyncio
@@ -1829,6 +1832,7 @@ async def test_nav_snapshot_keeps_old_position_value_when_daily_kline_missing():
     session = ScriptedSession(
         [
             FakeResult([], rowcount=0),
+            FakeResult([{"user_id": 1}]),
             FakeResult([]),
             FakeResult([]),
             FakeResult([account_row(total_asset=Decimal("105000.0000"))]),

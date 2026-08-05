@@ -66,6 +66,7 @@ def generate_klines(
             is_suspended=False,
             is_limit_up=False,
             is_limit_down=False,
+            turnover_rate=None,
         ))
         pre_close = close
 
@@ -479,7 +480,7 @@ def generate_signal(ctx):
                 assert trade["direction"] == "部分卖出"
 
     def test_sell_pnl_calculation_correct(self):
-        """Sell PnL should be calculated as (price - avg_cost) * volume - total_fee."""
+        """Sell PnL is authoritative net closed P/L including matched entry fees."""
         runner, result = self.setup_sell_scenario()
 
         sell_trades = [t for t in result["trade_records"] if t["direction"] in ("全部卖出", "部分卖出")]
@@ -487,14 +488,24 @@ def generate_signal(ctx):
             trade = sell_trades[0]
             assert "pnl" in trade, "Sell trade should have pnl field"
             assert isinstance(trade["pnl"], float), "pnl should be a float value"
+            assert isinstance(trade["balance_before"], float)
+            assert isinstance(trade["balance_after"], float)
 
-            buy_trades = [t for t in result["trade_records"] if t["direction"] == "买入"]
-            if len(buy_trades) > 0:
-                avg_buy_price = sum(t["price"] * t["volume"] for t in buy_trades) / \
-                               sum(t["volume"] for t in buy_trades)
-                expected_pnl = (trade["price"] - avg_buy_price) * trade["volume"] - trade["total_fee"]
-                assert abs(trade["pnl"] - expected_pnl) < 0.01, \
-                    f"PnL mismatch: expected {expected_pnl}, got {trade['pnl']}"
+            closed_lots = result["performance"]["pnl_analysis"]["closed_lots"]
+            matched_lots = [
+                lot for lot in closed_lots
+                if lot["ts_code"] == trade["ts_code"] and lot["exit_date"] == trade["trade_date"]
+            ]
+            assert sum(lot["shares"] for lot in matched_lots) == trade["volume"]
+            assert sum(lot["exit_fee"] for lot in matched_lots) == pytest.approx(trade["total_fee"])
+
+            expected_pnl = sum(
+                (trade["price"] - lot["entry_price"]) * lot["shares"]
+                - lot["entry_fee"]
+                - lot["exit_fee"]
+                for lot in matched_lots
+            )
+            assert trade["pnl"] == pytest.approx(expected_pnl, abs=0.01)
 
     def test_sell_holding_days_positive(self):
         """Sell trades should have holding_days > 0 reflecting actual holding period."""

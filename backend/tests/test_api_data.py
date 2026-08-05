@@ -349,6 +349,19 @@ def test_sync_all_kline_rejects_invalid_concurrency() -> None:
     assert response.status_code == 422
 
 
+def test_active_worker_names_only_counts_data_consumers(monkeypatch) -> None:
+    from app.api import tasks as task_api
+
+    inspector = Mock()
+    inspector.active_queues.return_value = {
+        "general@host": [{"name": "default"}, {"name": "data"}],
+        "backtest@host": [{"name": "backtest"}],
+    }
+    monkeypatch.setattr(task_api, "_celery_inspector", lambda: inspector)
+
+    assert task_api._active_celery_worker_names() == ["general@host"]
+
+
 def test_fundamentals_rejects_without_active_worker(monkeypatch) -> None:
     from app.api import tasks as task_api
 

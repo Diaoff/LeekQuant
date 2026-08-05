@@ -47,6 +47,7 @@ for i in range(20):
         is_suspended=False,
         is_limit_up=False,
         is_limit_down=False,
+        turnover_rate=None,
     ))
 
 # 后10天：价格从8.2上升到11（MA5会穿过MA20形成金叉）
@@ -68,6 +69,7 @@ for i in range(10):
         is_suspended=False,
         is_limit_up=False,
         is_limit_down=False,
+        turnover_rate=None,
     ))
 
 all_klines['000001.SZ'] = klines

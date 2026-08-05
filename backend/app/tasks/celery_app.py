@@ -25,7 +25,6 @@ celery_app = Celery(
         "app.backtest.tasks",
         "app.tasks.trading_tasks",
         "app.tasks.signal_tasks",
-        "app.tasks.factor_tasks",
     ],
 )
 celery_app.conf.update(
@@ -40,13 +39,11 @@ celery_app.conf.update(
         Queue("default"),
         Queue("data"),
         Queue("backtest"),
-        Queue("factor"),
         Queue("trading"),
     ),
     task_routes={
         "app.tasks.data_tasks.*": {"queue": "data"},
         "app.tasks.run_backtest": {"queue": "backtest"},
-        "app.tasks.factor_tasks.*": {"queue": "factor"},
         "app.tasks.trading_tasks.*": {"queue": "trading"},
         "app.tasks.signal_tasks.*": {"queue": "trading"},
     },
@@ -85,10 +82,6 @@ celery_app.conf.update(
         "generate-signals-daily": {
             "task": "app.tasks.signal_tasks.generate_all_signals",
             "schedule": crontab(hour=12, minute=0),
-        },
-        "compute-factors-daily": {
-            "task": "app.tasks.factor_tasks.compute_daily_factors",
-            "schedule": crontab(hour=17, minute=30),
         },
         "update-fundamentals-daily": {
             "task": "app.tasks.data_tasks.sync_fundamentals",

@@ -92,6 +92,7 @@ def _make_bar(
         is_suspended=is_suspended,
         is_limit_up=is_limit_up,
         is_limit_down=is_limit_down,
+        turnover_rate=None,
     )
 
 
@@ -171,25 +172,22 @@ class TestSignalUsesPreviousDayWindow:
 
         capturing_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     # Stash ctx.close[-1] into a module-level list via __capture__
     __capture__(ctx.close[-1])
     return None
 '''
 
-        def fake_execute_strategy(
-            source_code: str, ctx: BacktestContext, **_kwargs: Any
+        def fake_execute_signal(
+            compiled: dict[str, Any], ctx: BacktestContext, **_kwargs: Any
         ) -> StrategyExecutionResult:
-            sandbox: dict[str, Any] = {"ctx": ctx, "__capture__": captured_last_closes.append}
-            for name in dir(MyTT):
-                if not name.startswith("_"):
-                    sandbox[name] = getattr(MyTT, name)
+            if len(ctx.close) > 0:
+                captured_last_closes.append(ctx.close[-1])
+            func = compiled.get("generate_signal")
+            if func is None:
+                return StrategyExecutionResult(ok=True, signal=None)
             try:
-                exec(source_code, sandbox)
-                func = sandbox.get("generate_signal")
-                if func is None:
-                    return StrategyExecutionResult(ok=True, signal=None)
                 result = func(ctx)
                 return StrategyExecutionResult(
                     ok=True, signal=result if isinstance(result, dict) else None
@@ -202,7 +200,7 @@ def generate_signal(ctx):
                     traceback="test traceback",
                 )
 
-        monkeypatch.setattr(adapter_module, "execute_strategy", fake_execute_strategy)
+        monkeypatch.setattr(adapter_module, "execute_compiled_signal", fake_execute_signal)
 
         runner = _make_runner(
             source_code=capturing_strategy,
@@ -235,14 +233,14 @@ def generate_signal(ctx):
         """
         call_count = 0
 
-        def fake_execute_strategy(
-            source_code: str, ctx: BacktestContext, **_kwargs: Any
+        def fake_execute_signal(
+            compiled: dict[str, Any], ctx: BacktestContext, **_kwargs: Any
         ) -> StrategyExecutionResult:
             nonlocal call_count
             call_count += 1
             return StrategyExecutionResult(ok=True, signal=None)
 
-        monkeypatch.setattr(adapter_module, "execute_strategy", fake_execute_strategy)
+        monkeypatch.setattr(adapter_module, "execute_compiled_signal", fake_execute_signal)
 
         runner = _make_runner(
             source_code="def generate_signal(ctx): return None",
@@ -285,7 +283,7 @@ class TestFillPriceUsesNextOpen:
         """
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -325,7 +323,7 @@ def generate_signal(ctx):
         """
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -364,7 +362,7 @@ def generate_signal(ctx):
         """
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -410,7 +408,7 @@ class TestFillPriceModeCurrentClose:
         """
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -457,7 +455,7 @@ class TestFillPriceModeCurrentIntraday:
         """Bullish candle (close >= open): BUY fills at low (price_path[1])."""
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -490,7 +488,7 @@ def generate_signal(ctx):
         """Bearish candle (close < open): BUY fills at open (price_path[0])."""
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''
@@ -593,7 +591,7 @@ class TestLotEntryDateUsesFillBarDate:
         """_open_lots[ts_code][-1].entry_date == fill_bar.trade_date."""
         buy_strategy = '''
 def generate_signal(ctx):
-    if not ctx.close:
+    if len(ctx.close) == 0:
         return None
     return {"signal_type": "买入", "current_position": 0, "target_position": 1.0}
 '''

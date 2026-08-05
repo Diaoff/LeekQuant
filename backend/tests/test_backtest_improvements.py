@@ -1,6 +1,7 @@
 """Tests for backtest module improvements."""
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -15,7 +16,7 @@ from app.backtest.adapter import (
     _ClosedLot,
 )
 from app.backtest.cost import FeeConfig
-from app.backtest.signals import apply_cn_rules, map_signal_to_action, SignalInput
+from app.backtest.signals import SignalInput, SignalOutput, apply_cn_rules, map_signal_to_action
 
 
 def _make_kbar(
@@ -46,6 +47,7 @@ def _make_kbar(
         is_suspended=is_suspended,
         is_limit_up=is_limit_up,
         is_limit_down=is_limit_down,
+        turnover_rate=None,
     )
 
 
@@ -100,6 +102,82 @@ def test_lot_tracking_on_sell_fifo() -> None:
     assert lots[0].shares == 150
 
 
+def test_fifo_partial_exit_allocates_entry_and_exit_fees_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = BacktestRunner(BacktestConfig(
+        strategy_id=1,
+        source_code="",
+        stock_pool=["000001.SZ"],
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 10),
+        slippage_pct=0,
+    ))
+    monkeypatch.setattr(runner, "_fill_price_mode", lambda: "current_close")
+    runner.positions["000001.SZ"] = Position("000001.SZ", 300, Decimal("10.6666666667"))
+    runner._entry_dates["000001.SZ"] = date(2026, 1, 1)
+    runner._open_lots["000001.SZ"] = [
+        _LotEntry("000001.SZ", 100, Decimal("10"), date(2026, 1, 1), Decimal("5.0100")),
+        _LotEntry("000001.SZ", 200, Decimal("11"), date(2026, 1, 2), Decimal("5.0220")),
+    ]
+    bar = _make_kbar(trade_date=date(2026, 1, 10), close=Decimal("12"))
+
+    runner._execute_action(
+        SignalOutput(action="SELL_PARTIAL", target_position=0.25),
+        "000001.SZ",
+        bar,
+        Decimal("3200"),
+        exit_reason="止盈",
+    )
+
+    assert [lot.shares for lot in runner._closed_lots] == [100, 100]
+    assert runner._open_lots["000001.SZ"][0].shares == 100
+    assert runner._open_lots["000001.SZ"][0].entry_fee == Decimal("2.5110")
+    assert sum(lot.entry_fee for lot in runner._closed_lots) == Decimal("7.5210")
+    sell_fee = runner.trades[-1].cost.total_fee
+    assert sum(lot.exit_fee for lot in runner._closed_lots) == sell_fee
+    for lot in runner._closed_lots:
+        assert lot.net_pnl == lot.gross_pnl - lot.entry_fee - lot.exit_fee
+    assert runner.trades[-1].pnl == sum(lot.net_pnl for lot in runner._closed_lots)
+    assert all(lot.exit_reason == "止盈" for lot in runner._closed_lots)
+
+
+def test_pnl_analysis_aggregates_and_ranks_stocks() -> None:
+    runner = BacktestRunner(BacktestConfig(
+        strategy_id=1,
+        source_code="",
+        stock_pool=[],
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 1, 10),
+    ))
+    runner._closed_lots = [
+        _ClosedLot("000001.SZ", 100, Decimal("10"), date(2026, 1, 1), Decimal("12"), date(2026, 1, 6), Decimal("5"), Decimal("6"), Decimal("200"), Decimal("189"), Decimal("0.189"), 5, "策略信号"),
+        _ClosedLot("000001.SZ", 100, Decimal("11"), date(2026, 1, 2), Decimal("10"), date(2026, 1, 8), Decimal("5"), Decimal("6"), Decimal("-100"), Decimal("-111"), Decimal("-0.100909"), 6, "止损"),
+        _ClosedLot("600000.SH", 200, Decimal("8"), date(2026, 1, 3), Decimal("8.5"), date(2026, 1, 10), Decimal("5"), Decimal("6"), Decimal("100"), Decimal("89"), Decimal("0.055625"), 7, "策略信号"),
+    ]
+
+    analysis = runner._build_pnl_analysis()
+
+    assert analysis["closed_lot_count"] == 3
+    assert analysis["matched_cost"] == 3700.0
+    assert analysis["gross_pnl"] == 200.0
+    assert analysis["total_fees"] == 33.0
+    assert analysis["net_pnl"] == 167.0
+    assert analysis["stock_rankings"][0]["ts_code"] == "600000.SH"
+    first_stock = next(row for row in analysis["stock_rankings"] if row["ts_code"] == "000001.SZ")
+    assert first_stock == {
+        "ts_code": "000001.SZ",
+        "winning_lot_count": 1,
+        "losing_lot_count": 1,
+        "matched_cost": 2100.0,
+        "gross_pnl": 100.0,
+        "total_fees": 22.0,
+        "net_pnl": 78.0,
+        "closed_lot_count": 2,
+        "return_rate": pytest.approx(78 / 2100),
+        "win_rate": 0.5,
+        "avg_holding_days": 5.5,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Auto T+1 enforcement
 # ---------------------------------------------------------------------------
@@ -147,8 +225,8 @@ def test_compute_results_includes_new_metrics() -> None:
         {"date": "2026-01-03", "total_asset": 101000, "cash": 101000},
     ]
     runner._closed_lots = [
-        _ClosedLot("000001.SZ", 100, Decimal("10"), date(2026, 1, 1), Decimal("10.5"), date(2026, 1, 2), Decimal("50"), 1, "策略信号"),
-        _ClosedLot("000001.SZ", 100, Decimal("10.5"), date(2026, 1, 2), Decimal("10.3"), date(2026, 1, 3), Decimal("-20"), 1, "策略信号"),
+        _ClosedLot("000001.SZ", 100, Decimal("10"), date(2026, 1, 1), Decimal("10.5"), date(2026, 1, 2), Decimal("0"), Decimal("0"), Decimal("50"), Decimal("50"), Decimal("0.05"), 1, "策略信号"),
+        _ClosedLot("000001.SZ", 100, Decimal("10.5"), date(2026, 1, 2), Decimal("10.3"), date(2026, 1, 3), Decimal("0"), Decimal("0"), Decimal("-20"), Decimal("-20"), Decimal("-0.019047619"), 1, "策略信号"),
     ]
 
     results = runner._compute_results()
@@ -163,6 +241,15 @@ def test_compute_results_includes_new_metrics() -> None:
     assert "total_fees" in results
     assert "monthly_returns" in results
     assert "daily_returns" in results
+    assert results["performance"]["monthly_returns"] == results["monthly_returns"]
+    assert results["performance"]["daily_returns"] == results["daily_returns"]
+    assert results["performance"]["pnl_analysis"] == results["pnl_analysis"]
+    assert "closed_lots" not in results["performance"]
+    assert "stock_rankings" not in results["performance"]
+    persisted = json.loads(json.dumps(results["performance"], ensure_ascii=False))
+    assert persisted["monthly_returns"] == results["monthly_returns"]
+    assert persisted["daily_returns"] == results["daily_returns"]
+    assert persisted["pnl_analysis"]["stock_rankings"] == results["stock_rankings"]
     assert results["win_rate"] == 0.5
     assert results["profit_factor"] > 0
 

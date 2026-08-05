@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -186,45 +186,6 @@ def _stock_scope_diagnostics(stock_codes: list[str]) -> dict[str, Any]:
     }
 
 
-async def _factor_scores_by_date(
-    session: AsyncSession,
-    *,
-    start_date: date,
-    end_date: date,
-    stock_codes: list[str],
-) -> dict[date, dict[str, dict[str, Any]]]:
-    if not stock_codes:
-        return {}
-    result = await session.execute(
-        text(
-            """
-            SELECT trade_date, ts_code, total_score, rank, score_run_id
-            FROM scoring_rank
-            WHERE scope_type = 'all'
-              AND scope_value IS NULL
-              AND trade_date BETWEEN :start_date AND :end_date
-              AND ts_code = ANY(CAST(:stock_codes AS VARCHAR[]))
-            """
-        ),
-        {
-            "start_date": start_date,
-            "end_date": end_date,
-            "stock_codes": stock_codes,
-        },
-    )
-    scores: dict[date, dict[str, dict[str, Any]]] = {}
-    for row in result.mappings().all():
-        trade_date = row["trade_date"]
-        if not isinstance(trade_date, date):
-            trade_date = date.fromisoformat(str(trade_date))
-        scores.setdefault(trade_date, {})[row["ts_code"]] = {
-            "total_score": row["total_score"],
-            "rank": row["rank"],
-            "score_run_id": row["score_run_id"],
-        }
-    return scores
-
-
 def _normalize_market_targets(value: Any) -> list[str]:
     raw_values = value if isinstance(value, list) else [value]
     selected = {
@@ -361,6 +322,7 @@ def _parse_kline_rows(rows: list[dict[str, Any]]) -> list[KBar]:
             pre_close=Decimal(str(r["pre_close"])) if r.get("pre_close") is not None else Decimal("0"),
             volume=r["volume"] or 0,
             amount=Decimal(str(r["amount"])) if r.get("amount") is not None else Decimal("0"),
+            turnover_rate=Decimal(str(r["turnover_rate"])) if r.get("turnover_rate") is not None else None,
             adj_factor=Decimal(str(r["adj_factor"])) if r.get("adj_factor") is not None else None,
             is_suspended=bool(r.get("is_suspended", False)),
             is_limit_up=bool(r.get("is_limit_up", False)),
@@ -434,7 +396,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     text(
                         """
                         SELECT ts_code, trade_date, open, high, low, close, pre_close,
-                               volume, amount, adj_factor, is_suspended,
+                               volume, amount, turnover_rate, adj_factor, is_suspended,
                                is_limit_up, is_limit_down
                         FROM daily_kline
                         WHERE ts_code = ANY(CAST(:codes AS VARCHAR[]))
@@ -487,12 +449,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
 
             global_fee_cfg = await get_trading_fee_config(session, bt_row["user_id"])
             fee_cfg = _merge_fee_config(global_fee_cfg, strategy_config.get("fee_config"))
-            factor_scores = await _factor_scores_by_date(
-                session,
-                start_date=bt_row["start_date"],
-                end_date=bt_row["end_date"],
-                stock_codes=list(all_klines.keys()),
-            )
 
             risk_cfg = strategy_config.get("risk_config", {})
             config = BacktestConfig(
@@ -517,7 +473,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 weighting_method=str(strategy_config.get("weighting_method", "equal")),
                 rank_buffer_pct=float(strategy_config.get("rank_buffer_pct", 0.2)),
                 score_max_age_sessions=int(strategy_config.get("score_max_age_sessions", 5)),
-                factor_scores_by_date=factor_scores,
             )
 
             benchmark_code = bt_row.get("benchmark_code")
@@ -624,11 +579,19 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     "win_rate": results["win_rate"],
                     "trade_count": results["trade_count"],
                     "performance": json.dumps(results["performance"], ensure_ascii=False, default=str),
-                    "trade_records": json.dumps(results["trade_records"], ensure_ascii=False, default=str),
+                    # trade_records 保持向后兼容：仅存计数占位，明细写入 backtest_trades 表
+                    "trade_records": json.dumps(
+                        {"count": len(results.get("trade_records", [])), "note": "see backtest_trades table"},
+                        ensure_ascii=False,
+                    ),
                     "equity_curve": json.dumps(results["equity_curve"], ensure_ascii=False, default=str),
                     "id": backtest_id,
                 },
             )
+
+            # 批量写入规范化明细表，避免单值 JSONB 超过 256MB 限制
+            await _persist_backtest_details(session, backtest_id, results)
+
             await session.commit()
             return results
 
@@ -681,3 +644,165 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
             logger.exception("Failed to mark backtest %s as failed after unhandled error", backtest_id)
 
         return {"error": err_msg}
+
+
+_BATCH_SIZE = 2000
+
+
+def _as_date(value: Any) -> "date | None":
+    """归一化日期：date/datetime 原样返回；ISO/紧凑字符串解析为 date。
+
+    adapter 在组装 trade_records / closed_lots 时已把日期 isoformat 成字符串，
+    而子表日期列为 DATE，asyncpg 不接受裸字符串，直接传入会抛
+    AttributeError: 'str'（见回测 #149 写入失败）。这里统一转回 date 对象。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (date,)) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+async def _persist_backtest_details(session: AsyncSession, backtest_id: int, results: dict[str, Any]) -> None:
+    """批量写入回测明细到规范化子表，规避单值 JSONB 256MB 限制。
+
+    - trade_records -> backtest_trades
+    - pnl_analysis.closed_lots -> backtest_closed_lots
+    - pnl_analysis.stock_rankings -> backtest_stock_rankings
+    """
+    trade_records: list[dict[str, Any]] = results.get("trade_records") or []
+    closed_lots: list[dict[str, Any]] = results.get("closed_lots") or []
+    stock_rankings: list[dict[str, Any]] = results.get("stock_rankings") or []
+
+    # 成交明细
+    if trade_records:
+        trade_rows = [
+            {
+                "backtest_id": backtest_id,
+                "seq": i,
+                "ts_code": t["ts_code"],
+                "trade_date": _as_date(t["trade_date"]),
+                "direction": t["direction"],
+                "price": t["price"],
+                "volume": t["volume"],
+                "amount": t["amount"],
+                "fee": t.get("commission", 0),
+                "stamp_tax": t.get("stamp_tax", 0),
+                "transfer_fee": t.get("transfer_fee", 0),
+                "slippage": 0,
+                "signal_type": t.get("signal_type", "") or t.get("action", ""),
+                "action": t.get("action", ""),
+                "signal_reason": t.get("signal_reason", ""),
+                "target_position": t.get("target_position", 0),
+                "position_before": t.get("position_before", 0),
+                "position_after": t.get("position_after", 0),
+                "pnl": t.get("pnl", 0),
+                "balance_before": t.get("balance_before", 0),
+                "balance_after": t.get("balance_after", 0),
+                "holding_days": t.get("holding_days", 0),
+                "exit_reason": t.get("exit_reason", ""),
+            }
+            for i, t in enumerate(trade_records)
+        ]
+        for start in range(0, len(trade_rows), _BATCH_SIZE):
+            batch = trade_rows[start:start + _BATCH_SIZE]
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO backtest_trades (
+                        backtest_id, seq, ts_code, trade_date, direction, price, volume,
+                        amount, fee, stamp_tax, transfer_fee, slippage, signal_type, action,
+                        signal_reason, target_position, position_before, position_after,
+                        pnl, balance_before, balance_after, holding_days, exit_reason
+                    ) VALUES (
+                        :backtest_id, :seq, :ts_code, :trade_date, :direction, :price, :volume,
+                        :amount, :fee, :stamp_tax, :transfer_fee, :slippage, :signal_type, :action,
+                        :signal_reason, :target_position, :position_before, :position_after,
+                        :pnl, :balance_before, :balance_after, :holding_days, :exit_reason
+                    )
+                    """
+                ),
+                batch,
+            )
+
+    # 平仓明细
+    if closed_lots:
+        lot_rows = [
+            {
+                "backtest_id": backtest_id,
+                "seq": i,
+                "ts_code": lot["ts_code"],
+                "shares": lot["shares"],
+                "entry_price": lot["entry_price"],
+                "entry_date": _as_date(lot["entry_date"]),
+                "exit_price": lot["exit_price"],
+                "exit_date": _as_date(lot["exit_date"]),
+                "entry_fee": lot["entry_fee"],
+                "exit_fee": lot["exit_fee"],
+                "gross_pnl": lot["gross_pnl"],
+                "net_pnl": lot["net_pnl"],
+                "return_rate": lot["return_rate"],
+                "holding_days": lot["holding_days"],
+                "exit_reason": lot["exit_reason"],
+            }
+            for i, lot in enumerate(closed_lots)
+        ]
+        for start in range(0, len(lot_rows), _BATCH_SIZE):
+            batch = lot_rows[start:start + _BATCH_SIZE]
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO backtest_closed_lots (
+                        backtest_id, seq, ts_code, shares, entry_price, entry_date,
+                        exit_price, exit_date, entry_fee, exit_fee, gross_pnl, net_pnl,
+                        return_rate, holding_days, exit_reason
+                    ) VALUES (
+                        :backtest_id, :seq, :ts_code, :shares, :entry_price, :entry_date,
+                        :exit_price, :exit_date, :entry_fee, :exit_fee, :gross_pnl, :net_pnl,
+                        :return_rate, :holding_days, :exit_reason
+                    )
+                    """
+                ),
+                batch,
+            )
+
+    # 个股归因排行
+    if stock_rankings:
+        rank_rows = [
+            {
+                "backtest_id": backtest_id,
+                "seq": i,
+                "ts_code": r["ts_code"],
+                "trade_count": r.get("closed_lot_count", 0),
+                "total_pnl": r.get("net_pnl", 0),
+                "win_rate": r.get("win_rate", 0),
+                "avg_return": r.get("return_rate", 0),
+                "max_profit": r.get("max_profit", 0),
+                "max_loss": r.get("max_loss", 0),
+            }
+            for i, r in enumerate(stock_rankings)
+        ]
+        for start in range(0, len(rank_rows), _BATCH_SIZE):
+            batch = rank_rows[start:start + _BATCH_SIZE]
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO backtest_stock_rankings (
+                        backtest_id, seq, ts_code, trade_count, total_pnl, win_rate,
+                        avg_return, max_profit, max_loss
+                    ) VALUES (
+                        :backtest_id, :seq, :ts_code, :trade_count, :total_pnl, :win_rate,
+                        :avg_return, :max_profit, :max_loss
+                    )
+                    """
+                ),
+                batch,
+            )

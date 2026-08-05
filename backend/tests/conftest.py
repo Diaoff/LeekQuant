@@ -67,6 +67,7 @@ def sample_kbar(
     pre_close: float = 10.0,
     volume: int = 1000000,
     amount: float = 10200000.0,
+    turnover_rate: Decimal | None = None,
     is_suspended: bool = False,
     is_limit_up: bool = False,
     is_limit_down: bool = False,
@@ -86,6 +87,7 @@ def sample_kbar(
         is_suspended=is_suspended,
         is_limit_up=is_limit_up,
         is_limit_down=is_limit_down,
+        turnover_rate=turnover_rate,
     )
 
 

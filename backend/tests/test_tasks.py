@@ -703,7 +703,7 @@ def test_run_tracked_rolls_back_before_recording_failed_status(monkeypatch) -> N
                 await session.execute(text("SELECT broken_business_sql"))
             return {"ok": True}
 
-        return await _run_tracked("compute_daily_factors", "task-failed", {}, fail)
+        return await _run_tracked("kline_sync_dispatch", "task-failed", {}, fail)
 
     with pytest.raises(RuntimeError, match="business SQL failed"):
         asyncio.run(run())

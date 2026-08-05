@@ -19,6 +19,8 @@ from app.backtest.tasks import (
     _target_from_snapshot,
 )
 
+REAL_BACKTEST_WORKER_AVAILABLE = backtests._backtest_worker_available
+
 
 class FakeResult:
     def __init__(self, rows=None, rowcount=1):
@@ -59,6 +61,44 @@ class CaptureSession:
 class FakeRequest:
     headers = {"X-User-ID": "1"}
     query_params = {}
+
+
+@pytest.fixture(autouse=True)
+def available_backtest_worker(monkeypatch) -> None:
+    async def available() -> None:
+        return None
+
+    monkeypatch.setattr(backtests, "_ensure_backtest_worker_available", available)
+
+
+def test_backtest_worker_preflight_accepts_dedicated_consumer(monkeypatch) -> None:
+    inspector = type(
+        "Inspector",
+        (),
+        {"active_queues": lambda self: {"backtest@host": [{"name": "backtest"}]}},
+    )()
+    monkeypatch.setattr(
+        backtests.celery_app.control,
+        "inspect",
+        lambda timeout: inspector,
+    )
+
+    assert REAL_BACKTEST_WORKER_AVAILABLE() is True
+
+
+def test_backtest_worker_preflight_rejects_missing_consumer(monkeypatch) -> None:
+    inspector = type(
+        "Inspector",
+        (),
+        {"active_queues": lambda self: {"general@host": [{"name": "data"}]}},
+    )()
+    monkeypatch.setattr(
+        backtests.celery_app.control,
+        "inspect",
+        lambda timeout: inspector,
+    )
+
+    assert REAL_BACKTEST_WORKER_AVAILABLE() is False
 
 
 @pytest.mark.asyncio

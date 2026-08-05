@@ -22,6 +22,7 @@ def generate_klines(base_price: float = 10.0, days: int = 20, **flags) -> list[K
             is_suspended=flags.get("is_suspended", False),
             is_limit_up=False,
             is_limit_down=False,
+            turnover_rate=None,
         )
         for d in range(1, days + 1)
     ]

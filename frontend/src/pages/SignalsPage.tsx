@@ -416,12 +416,12 @@ export default function SignalsPage() {
             </div>
           </div>
           {loading ? (
-            <div className="p-4"><Skeleton.Table rows={8} columns={8} /></div>
+            <div className="p-4"><Skeleton.Table rows={8} columns={9} /></div>
           ) : signals.length === 0 ? (
             <div className="p-8 text-center text-sm text-muted">暂无信号</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[980px] w-full text-left text-sm">
+              <table className="min-w-[1060px] w-full text-left text-sm">
                 <thead className="bg-tableHead text-xs text-muted">
                   <tr>
                     <th className="w-12 px-4 py-3 font-medium">
@@ -438,6 +438,7 @@ export default function SignalsPage() {
                     <th className="px-4 py-3 font-medium">信号</th>
                     <th className="px-4 py-3 font-medium">动作</th>
                     <th className="px-4 py-3 font-medium">目标仓位</th>
+                    <th className="px-4 py-3 font-medium">置信度</th>
                     <th className="px-4 py-3 font-medium">策略</th>
                     <th className="px-4 py-3 font-medium">原因</th>
                   </tr>
@@ -471,6 +472,7 @@ export default function SignalsPage() {
                       </td>
                       <td className={`px-4 py-3 font-medium ${actionTone(signal.action)}`}>{signal.action ?? '暂无'}</td>
                       <td className="px-4 py-3 text-muted">{formatNumber(Number(signal.target_position) * 100, 2)}%</td>
+                      <td className="px-4 py-3 text-muted">{signal.confidence != null ? formatNumber(Number(signal.confidence) * 100, 2) + '%' : '暂无'}</td>
                       <td className="px-4 py-3 text-muted">
                         <div>{signal.strategy_name ?? '未绑定策略'}</div>
                       </td>

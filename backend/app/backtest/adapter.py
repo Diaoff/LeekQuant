@@ -35,6 +35,7 @@ class KBar:
     is_suspended: bool
     is_limit_up: bool
     is_limit_down: bool
+    turnover_rate: Decimal | None = None
 
 
 @dataclass(slots=True)
@@ -142,7 +143,6 @@ class BacktestConfig:
     execution_timeframe: str = "1D"
     signal_timeframe: str = "1D"
     strategy_mode: str = "signal"
-    factor_scores_by_date: dict[date, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -154,8 +154,7 @@ class _SignalCandidate:
     exit_reason: str | None = None
     buy_priority_score: Decimal = Decimal("0")
     buy_priority_source: str = "default"
-    factor_score: Decimal | None = None
-    factor_rank: int | None = None
+    turnover_rate: Decimal | None = None
     fill_bar: KBar | None = None  # next day's bar for fill price (None = fallback)
 
 
@@ -340,29 +339,50 @@ class BacktestRunner:
         else:
             return [open_, high, low, close]
 
-    def _check_exit_conditions(self, ts_code: str, price: Decimal, bar: KBar) -> str | None:
+    def _check_exit_conditions(
+        self,
+        ts_code: str,
+        day_high: Decimal,
+        day_low: Decimal,
+        bar: KBar,
+    ) -> str | None:
+        """Check risk-exit triggers for an open position on signal day `bar`.
+
+        Triggers are evaluated against the day's intraday high/low so that a
+        stop is fired when price *touches* the threshold during the session,
+        not only when the open happens to gap past it (the previous behavior
+        used bar.open and could miss intraday touches). The actual fill price
+        is still resolved later at the next day's open (next_open mode), so the
+        decision date (td) and the fill date (td+1) stay consistent with the
+        no-lookahead execution model.
+        """
         entry_price = self._entry_prices.get(ts_code)
         if entry_price is None or entry_price <= 0:
             return None
         if self.config.stop_loss_pct > 0:
-            loss_pct = float((entry_price - price) / entry_price)
+            # Touched the stop when the day's low fell enough below entry.
+            loss_pct = float((entry_price - day_low) / entry_price)
             if loss_pct >= self.config.stop_loss_pct:
                 return "止损"
         if self.config.take_profit_pct > 0:
-            profit_pct = float((price - entry_price) / entry_price)
+            # Touched the target when the day's high rose enough above entry.
+            profit_pct = float((day_high - entry_price) / entry_price)
             if profit_pct >= self.config.take_profit_pct:
                 return "止盈"
         if self.config.trailing_stop_pct > 0 and self.config.trailing_activation_pct > 0:
             highest = self._highest_since_entry.get(ts_code, entry_price)
             activated = float((highest - entry_price) / entry_price) >= self.config.trailing_activation_pct
             if activated:
-                trail_pct = float((highest - price) / highest)
+                # Trail fires when price retracts from the peak by the trail %,
+                # using the day's low as the worst intraday point.
+                trail_pct = float((highest - day_low) / highest)
                 if trail_pct >= self.config.trailing_stop_pct:
                     return "移动止盈"
         if self.config.time_stop_days > 0:
             entry_date = self._entry_dates.get(ts_code)
             if entry_date is not None and (bar.trade_date - entry_date).days >= self.config.time_stop_days:
-                pnl_pct = float((price - entry_price) / entry_price)
+                # Time stop only fires while still underwater (floating loss).
+                pnl_pct = float((day_low - entry_price) / entry_price)
                 if pnl_pct <= 0:
                     return "时间止损"
         return None
@@ -461,7 +481,7 @@ class BacktestRunner:
                     self._highest_since_entry[ts_code] = max(cur_high, bar.high)
                     self._lowest_since_entry[ts_code] = min(cur_low, bar.low)
 
-                exit_reason = self._check_exit_conditions(ts_code, price_path[0], bar)
+                exit_reason = self._check_exit_conditions(ts_code, bar.high, bar.low, bar)
                 if exit_reason:
                     if self.rebalance_planner is not None:
                         self.rebalance_planner.on_exit(ts_code, exit_reason)
@@ -608,7 +628,7 @@ class BacktestRunner:
 
             # ---- Phase 4: weekly rebalance check (v2) ----
             if self.rebalance_planner is not None and self.rebalance_planner.should_run_weekly(td, trading_dates):
-                plan = self.rebalance_planner.plan(td, all_klines, total_asset, self.config.factor_scores_by_date, trading_dates)
+                plan = self.rebalance_planner.plan(td, all_klines, total_asset, trading_dates)
                 if plan is not None:
                     plan.fill_date = next_td
                     self._stored_rebalance_plan = plan
@@ -626,23 +646,12 @@ class BacktestRunner:
     ) -> _SignalCandidate:
         priority_score = Decimal("0")
         priority_source = "default"
-        factor_score: Decimal | None = None
-        factor_rank: int | None = None
 
         if signal.get("signal_type") in ("买入", "增持"):
-            factor = self.config.factor_scores_by_date.get(td, {}).get(ts_code)
-            if factor is not None:
-                factor_score = self._decimal_or_none(factor.get("total_score"))
-                if factor.get("rank") is not None:
-                    factor_rank = int(factor["rank"])
-
             confidence = self._decimal_or_none(signal.get("confidence"))
             if confidence is not None:
                 priority_score = confidence
                 priority_source = "confidence"
-            elif factor_score is not None:
-                priority_score = factor_score
-                priority_source = "factor_score"
 
         return _SignalCandidate(
             ts_code=ts_code,
@@ -651,8 +660,7 @@ class BacktestRunner:
             signal=signal,
             buy_priority_score=priority_score,
             buy_priority_source=priority_source,
-            factor_score=factor_score,
-            factor_rank=factor_rank,
+            turnover_rate=bar.turnover_rate,
             fill_bar=fill_bar,
         )
 
@@ -663,7 +671,7 @@ class BacktestRunner:
         return Decimal(str(value))
 
     @staticmethod
-    def _candidate_sort_key(candidate: _SignalCandidate) -> tuple[int, int, Decimal, Decimal, str]:
+    def _candidate_sort_key(candidate: _SignalCandidate) -> tuple[int, int, Decimal, Decimal, Decimal, str]:
         signal_type = candidate.signal.get("signal_type") if candidate.signal else candidate.exit_reason
         if candidate.exit_reason or signal_type in ("卖出", "减仓"):
             group = 0
@@ -676,9 +684,10 @@ class BacktestRunner:
         elif group == 0:
             source_order = 1
         else:
-            source_order = {"confidence": 0, "factor_score": 1}.get(candidate.buy_priority_source, 2)
+            source_order = 0 if candidate.buy_priority_source == "confidence" else 1
         target_position = Decimal(str(candidate.action.target_position or 0))
-        return group, source_order, -candidate.buy_priority_score, -target_position, candidate.ts_code
+        turnover = -candidate.turnover_rate if candidate.turnover_rate is not None else Decimal("-1")
+        return group, source_order, -candidate.buy_priority_score, turnover, -target_position, candidate.ts_code
 
     @staticmethod
     def _candidate_signal_record(candidate: _SignalCandidate) -> dict[str, Any]:
@@ -696,8 +705,7 @@ class BacktestRunner:
             record.update({
                 "buy_priority_score": str(candidate.buy_priority_score),
                 "buy_priority_source": candidate.buy_priority_source,
-                "factor_score": str(candidate.factor_score) if candidate.factor_score is not None else None,
-                "factor_rank": candidate.factor_rank,
+                "turnover_rate": str(candidate.turnover_rate) if candidate.turnover_rate is not None else None,
             })
         return record
 
@@ -790,15 +798,9 @@ class BacktestRunner:
     def _position_score(self, ts_code: str, td: date) -> Decimal:
         """Return a score for an existing position on day *td*.
 
-        Priority:
-          1. Current day's factor_score from factor_scores_by_date.
-          2. Decimal("0") — lowest score, making it a replacement candidate.
+        Uses the buy_priority_score from the latest available signal.
+        Defaults to Decimal("0") — lowest score, making it a replacement candidate.
         """
-        factor = self.config.factor_scores_by_date.get(td, {}).get(ts_code)
-        if factor is not None:
-            raw = factor.get("total_score")
-            if raw is not None:
-                return Decimal(str(raw))
         return Decimal("0")
 
     def _rebalance_for_buys(
@@ -1360,7 +1362,23 @@ class BacktestRunner:
                 "strategy_error_count": len(self.strategy_errors),
                 "monthly_returns": {k: round(v, 6) for k, v in monthly_returns.items()},
                 "daily_returns": [round(r, 6) for r in daily_returns],
-                "pnl_analysis": pnl_analysis,
+                # 仅保留标量汇总，closed_lots / stock_rankings 已拆分到独立表
+                "pnl_analysis": {
+                    "closed_lot_count": pnl_analysis["closed_lot_count"],
+                    "winning_lot_count": pnl_analysis["winning_lot_count"],
+                    "losing_lot_count": pnl_analysis["losing_lot_count"],
+                    "breakeven_lot_count": pnl_analysis["breakeven_lot_count"],
+                    "stock_count": pnl_analysis["stock_count"],
+                    "matched_cost": pnl_analysis["matched_cost"],
+                    "gross_pnl": pnl_analysis["gross_pnl"],
+                    "entry_fees": pnl_analysis["entry_fees"],
+                    "exit_fees": pnl_analysis["exit_fees"],
+                    "total_fees": pnl_analysis["total_fees"],
+                    "net_pnl": pnl_analysis["net_pnl"],
+                    "return_rate": pnl_analysis["return_rate"],
+                    "win_rate": pnl_analysis["win_rate"],
+                    "avg_holding_days": pnl_analysis["avg_holding_days"],
+                },
             },
             "trade_records": [
                 {

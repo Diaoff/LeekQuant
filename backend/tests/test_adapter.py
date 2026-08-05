@@ -43,14 +43,9 @@ def patch_backtest_context_position_setter(monkeypatch):
         nonlocal _position_value
         _position_value = value
 
-    def fake_execute_strategy(source_code, ctx, **_kwargs):
-        sandbox = {"ctx": ctx}
-        for name in dir(MyTT):
-            if not name.startswith("_"):
-                sandbox[name] = getattr(MyTT, name)
+    def fake_execute_strategy(compiled, ctx, **_kwargs):
         try:
-            exec(source_code, sandbox)
-            func = sandbox.get("generate_signal")
+            func = compiled.get("generate_signal") if isinstance(compiled, dict) else None
             if func is None:
                 return StrategyExecutionResult(ok=True, signal=None)
             result = func(ctx)
@@ -64,7 +59,7 @@ def patch_backtest_context_position_setter(monkeypatch):
             )
 
     BacktestContext.current_position = property(getter, setter)
-    monkeypatch.setattr(adapter_module, "execute_strategy", fake_execute_strategy)
+    monkeypatch.setattr(adapter_module, "execute_compiled_signal", fake_execute_strategy)
     yield
     BacktestContext.current_position = original_current_position
 
@@ -78,6 +73,7 @@ def generate_klines(
     is_suspended: bool = False,
     is_limit_up: bool = False,
     is_limit_down: bool = False,
+    turnover_rate: Decimal | None = None,
 ) -> list[KBar]:
     """Generate consecutive K-line data for testing.
 
@@ -89,6 +85,7 @@ def generate_klines(
         is_suspended: Whether all bars are suspended
         is_limit_up: Whether all bars are limit-up
         is_limit_down: Whether all bars are limit-down
+        turnover_rate: Turnover rate for all bars (default: None)
     """
     start = start_date or date(2026, 5, 1)
     klines = []
@@ -111,6 +108,7 @@ def generate_klines(
             is_suspended=is_suspended,
             is_limit_up=is_limit_up,
             is_limit_down=is_limit_down,
+            turnover_rate=turnover_rate,
         ))
         pre_close = close
 
@@ -667,60 +665,44 @@ def generate_signal(ctx):
         assert buy_signals[0]["buy_priority_source"] == "confidence"
         assert buy_signals[0]["buy_priority_score"] == "0.9"
 
-    def test_factor_score_orders_buy_signals_without_confidence(self):
+    def test_turnover_rate_orders_buy_signals_without_confidence(self):
         strategy = '''
 def generate_signal(ctx):
     return {"signal_type": "买入", "target_position": 0.4}
 '''
-        # Step 5: signal generates on td=May 2 (window=[bar1]), so
-        # factor_scores_by_date must be keyed by May 2.
-        trade_date = date(2026, 5, 2)
-        config = sample_backtest_config(
+        runner = BacktestRunner(sample_backtest_config(
             source_code=strategy,
             stock_pool=["000001.SZ", "000002.SZ"],
             initial_cash=Decimal("20000"),
-            factor_scores_by_date={
-                trade_date: {
-                    "000001.SZ": {"total_score": Decimal("0.20"), "rank": 2},
-                    "000002.SZ": {"total_score": Decimal("0.95"), "rank": 1},
-                }
-            },
-        )
-        runner = BacktestRunner(config)
+        ))
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=2),
-            "000002.SZ": generate_klines("000002.SZ", days=2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, turnover_rate=Decimal("0.05")),
+            "000002.SZ": generate_klines("000002.SZ", days=2, turnover_rate=Decimal("0.15")),
         })
 
+        # Higher turnover rate should be bought first
         assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
-        assert runner.signals[0]["factor_rank"] == 1
 
-    def test_confidence_source_precedes_factor_score_source(self):
+    def test_confidence_takes_priority_over_turnover_rate(self):
         strategy = '''
 def generate_signal(ctx):
     if ctx.close[-1] == 10.1:
-        return {"signal_type": "买入", "target_position": 0.4}
-    return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.10}
+        return {"signal_type": "买入", "target_position": 0.4, "confidence": 0.10}
+    return {"signal_type": "买入", "target_position": 0.4}
 '''
-        # Step 5: signal generates on td=May 2 (window=[bar1]).
-        trade_date = date(2026, 5, 2)
-        config = sample_backtest_config(
+        runner = BacktestRunner(sample_backtest_config(
             source_code=strategy,
             stock_pool=["000001.SZ", "000002.SZ"],
             initial_cash=Decimal("20000"),
-            factor_scores_by_date={
-                trade_date: {
-                    "000001.SZ": {"total_score": Decimal("0.99"), "rank": 1},
-                }
-            },
-        )
-        runner = BacktestRunner(config)
+        ))
         result = runner.run({
-            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1),
-            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2),
+            "000001.SZ": generate_klines("000001.SZ", days=2, base_price=10.1, turnover_rate=Decimal("0.99")),
+            "000002.SZ": generate_klines("000002.SZ", days=2, base_price=10.2, turnover_rate=Decimal("0.01")),
         })
 
-        assert [t["ts_code"] for t in result["trade_records"]] == ["000002.SZ", "000001.SZ"]
+        # Stock with confidence (even low 0.10) should be bought before stock without confidence
+        # (even if the latter has much higher turnover_rate)
+        assert [t["ts_code"] for t in result["trade_records"]] == ["000001.SZ", "000002.SZ"]
 
     def test_sell_signals_execute_before_buys(self):
         strategy = '''
@@ -916,6 +898,103 @@ class TestTimeStop:
 
         time_stop_trades = [t for t in result["trade_records"] if t.get("exit_reason") == "时间止损"]
         assert len(time_stop_trades) >= 1
+
+
+@pytest.mark.backtest
+class TestKlineIndexGapAndCacheConsistency:
+    """Regression tests for the _stock_day_index (O(1) lookup) fix.
+
+    The monotonic forward pointer must never raise IndexError for stocks
+    whose data starts after the backtest start date, has intra-range gaps,
+    or is empty — and must correctly resume once data appears. The cache
+    round-trip test pins down the root-cause fix: caching raw row dicts and
+    rebuilding KBar via _parse_kline_rows yields byte-identical engine input
+    to the DB path.
+    """
+
+    def test_late_listing_stock_does_not_index_error(self):
+        """股票数据晚于回测起点：早期无数据日不得抛 IndexError，且上市后才交易"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            stock_pool=["000001.SZ", "000002.SZ"],
+            initial_cash=Decimal("200000"),
+        )
+        runner = BacktestRunner(config)
+        full = generate_klines("000001.SZ", days=15)  # 2026-05-01..05-15
+        # 000002.SZ 仅在 2026-05-10 之后才有数据（晚于起点 9 个交易日）
+        late = generate_klines("000002.SZ", start_date=date(2026, 5, 10), days=6)
+        result = runner.run({"000001.SZ": full, "000002.SZ": late})
+
+        assert len(result["equity_curve"]) == 15
+        late_trades = [t for t in result["trade_records"] if t["ts_code"] == "000002.SZ"]
+        assert late_trades, "late-listing stock should trade once it has data"
+        assert all(t["trade_date"] >= "2026-05-10" for t in late_trades)
+
+    def test_intra_range_gap_resumes_correctly(self):
+        """区间内缺口：缺口日跳过，缺口后数据日应被正确定位并处理"""
+        config = sample_backtest_config(
+            source_code=ALWAYS_BUY_STRATEGY,
+            stock_pool=["000001.SZ"],
+            initial_cash=Decimal("100000"),
+        )
+        runner = BacktestRunner(config)
+        klines = generate_klines("000001.SZ", days=15)
+        # 删除第 8 天（2026-05-08）制造缺口
+        klines = [k for k in klines if k.trade_date != date(2026, 5, 8)]
+        result = runner.run({"000001.SZ": klines})
+
+        # 缺口日没有任何股票数据，本身就不是交易日 → 不出现在曲线中
+        eq_dates = [e["date"] for e in result["equity_curve"]]
+        assert "2026-05-08" not in eq_dates
+        assert len(eq_dates) == 14  # 15 − 1 个缺口日
+        post_gap = [t for t in result["trade_records"] if t["trade_date"] >= "2026-05-09"]
+        assert post_gap, "pointer should resume after an intra-range gap"
+
+    def test_empty_klines_skipped(self):
+        """空 K 线列表直接跳过，不抛异常"""
+        config = sample_backtest_config(source_code=ALWAYS_BUY_STRATEGY)
+        runner = BacktestRunner(config)
+        klines = generate_klines(days=10)
+        result = runner.run({"000001.SZ": klines, "999999.SZ": []})
+
+        assert len(result["equity_curve"]) == 10
+
+    def test_cache_roundtrip_rebuilds_identical_kbars(self):
+        """缓存往返：raw dict -> pickle -> 重建 必须与 DB 直查路径完全一致
+
+        这是修复1的根基：缓存改存原始 row dict，命中后统一用
+        _parse_kline_rows 重建 KBar，彻底规避 slots=True/pickle 结构损坏。
+        """
+        from app.backtest.tasks import _parse_kline_rows
+        from app.backtest.kline_cache import _encode_klines, _decode_klines
+
+        rows = [
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": date(2026, 5, 1),
+                "open": 9.9, "high": 10.2, "low": 9.8, "close": 10.0,
+                "pre_close": 9.8, "volume": 1000000, "amount": 1.0e7,
+                "adj_factor": None,
+                "is_suspended": False, "is_limit_up": False, "is_limit_down": False,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": date(2026, 5, 2),
+                "open": 10.0, "high": 10.5, "low": 9.9, "close": 10.3,
+                "pre_close": 10.0, "volume": 1100000, "amount": 1.1e7,
+                "adj_factor": Decimal("1.0"),
+                "is_suspended": False, "is_limit_up": True, "is_limit_down": False,
+            },
+        ]
+        direct = _parse_kline_rows(rows)
+        encoded = _encode_klines({"000001.SZ": rows})
+        decoded = _decode_klines(encoded)
+        rebuilt = _parse_kline_rows(decoded["000001.SZ"])
+
+        assert rebuilt == direct
+        assert len(rebuilt) == 2
+        assert rebuilt[1].is_limit_up is True
+        assert rebuilt[1].adj_factor == Decimal("1.0")
 
 
 @pytest.mark.backtest

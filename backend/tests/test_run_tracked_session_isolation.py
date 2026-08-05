@@ -163,7 +163,7 @@ async def test_task_body_failure_still_records_failed_status(monkeypatch):
         return {"ok": True}
 
     with pytest.raises(RuntimeError, match="business SQL failed"):
-        await _run_tracked("compute_daily_factors", "task-fail", {}, task_body)
+        await _run_tracked("kline_sync_dispatch", "task-fail", {}, task_body)
 
     # tracker_session must record failure (rollback + failed status).
     assert tracker_session.rollbacks == 1
