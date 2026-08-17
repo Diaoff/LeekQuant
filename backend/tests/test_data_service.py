@@ -249,6 +249,7 @@ async def test_sync_kline_keeps_serial_transaction_when_commit_each_is_false(mon
 
 async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatch) -> None:
     import app.data.service as service
+    from app.data import quality as _quality
 
     class MissingAdjProvider:
         name = "quality"
@@ -281,6 +282,8 @@ async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatc
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
+    # _create_kline_quality_alert now lives in app.data.quality, so patch there too
+    monkeypatch.setattr(_quality, "create_alert", fake_create_alert)
 
     result = await sync_kline(
         StAwareSession(),
@@ -298,6 +301,7 @@ async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatc
 
 async def test_sync_kline_writes_quality_alert_for_abnormal_price_change(monkeypatch) -> None:
     import app.data.service as service
+    from app.data import quality as _quality
 
     class AbnormalChangeProvider:
         name = "quality"
@@ -330,6 +334,8 @@ async def test_sync_kline_writes_quality_alert_for_abnormal_price_change(monkeyp
 
     monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
     monkeypatch.setattr(service, "create_alert", fake_create_alert)
+    # _create_kline_quality_alert now lives in app.data.quality, so patch there too
+    monkeypatch.setattr(_quality, "create_alert", fake_create_alert)
 
     await sync_kline(
         StAwareSession(),

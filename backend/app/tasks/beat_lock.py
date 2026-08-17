@@ -120,12 +120,14 @@ class BeatLock:
         try:
             return self._client.get(self._key(task_name)) is not None
         except RedisError:
+            logger.debug("silent except in is_locked")
             return False
 
     def close(self) -> None:
         try:
             self._client.close()
         except Exception:
+            logger.debug("silent except in close")
             pass
 
 

@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.cost import FeeConfig, build_fee_config, fee_config_to_dict
 from app.core.config import get_settings
+import logging
+logger = logging.getLogger(__name__)
 
 GLOBAL_PREFERENCE_USER_ID = 0
 TRADING_FEE_KEY = "trading_fee"
@@ -40,6 +42,7 @@ async def get_preference(
         try:
             decoded = json.loads(value)
         except json.JSONDecodeError:
+            logger.debug("silent except in get_preference")
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
@@ -96,6 +99,7 @@ def normalize_full_kline_sync_concurrency(value: Any | None) -> int:
     try:
         normalized = int(value)
     except (TypeError, ValueError):
+        logger.debug("silent except in normalize_full_kline_sync_concurrency")
         return fallback
     if not 1 <= normalized <= 8:
         return fallback

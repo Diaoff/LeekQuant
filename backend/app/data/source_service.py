@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.data.fetcher import configure_providers
 from app.data.source_repository import get_source_configs, replace_source_configs
 from app.data.providers import METHOD_CAPABILITIES, PROVIDER_REGISTRY, provider_metadata, provider_supports
+import logging
+logger = logging.getLogger(__name__)
 
 CHECK_METHODS = [
     ("fetch_daily_kline", ("000001.SZ",)),
@@ -68,6 +70,7 @@ async def check_source(name: str) -> dict[str, Any]:
         try:
             records = method(*args)
         except Exception as exc:
+            logger.warning("silent except in check_source (exc)", exc_info=True)
             errors.append(f"{capability}: {exc}")
             continue
 

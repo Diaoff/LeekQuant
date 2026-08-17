@@ -7,20 +7,13 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependencies import current_user_id
 from app.db.session import get_session
 from app.preferences.service import get_kline_sync_payload, get_trading_fee_payload, save_kline_sync_payload, save_trading_fee_payload
 
 router = APIRouter(prefix="/api/preferences", tags=["preferences"])
 
 
-def _extract_user_id(request: Request) -> int:
-    raw = request.headers.get("X-User-ID") or request.query_params.get("user_id")
-    if raw:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 1
-    return 1
 
 
 class TradingFeePreference(BaseModel):
@@ -47,7 +40,7 @@ async def get_trading_fee(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, str | bool]:
-    return await get_trading_fee_payload(session, _extract_user_id(req))
+    return await get_trading_fee_payload(session, current_user_id(req))
 
 
 @router.put("/trading-fee")
@@ -58,7 +51,7 @@ async def update_trading_fee(
 ) -> dict[str, str | bool]:
     return await save_trading_fee_payload(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         payload=request.model_dump(),
     )
 

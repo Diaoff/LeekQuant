@@ -27,6 +27,7 @@ from app.db.session import get_session
 from app.preferences.service import get_full_kline_sync_concurrency
 from app.tasks.beat_lock import get_beat_lock
 from app.tasks.celery_app import celery_app
+from app.core.celery_health import cached_active_queues
 from app.tasks.data_tasks import kline_sync_dispatch, sync_fundamentals_task, sync_sample_kline
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -78,15 +79,7 @@ def _celery_inspector():
 
 
 def _active_celery_worker_names() -> list[str]:
-    try:
-        active_queues = _celery_inspector().active_queues()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"celery worker health check failed: {exc}",
-        ) from exc
+    active_queues = cached_active_queues()
     if not active_queues:
         return []
     return sorted(
@@ -201,6 +194,7 @@ async def _guard_beat_lock_free(task_name: str) -> None:
     except RedisError:
         # Fail-open: if we can't reach Redis, let the dispatch proceed and let the
         # task itself handle lock contention (it will raise BeatLockSkipped).
+        logger.debug("silent except in _guard_beat_lock_free")
         pass
 
 

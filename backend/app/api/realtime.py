@@ -57,8 +57,10 @@ async def realtime_snapshot(ts_codes: str) -> dict[str, Any]:
         provider = realtime_provider_factory(codes)
         ticks = await provider.fetch_snapshot()
     except ValueError as exc:
+        logger.debug("silent except in realtime_snapshot (exc): %s", exc)
         return {"items": [], "errors": [str(exc)]}
     except DataProviderError as exc:
+        logger.debug("silent except in realtime_snapshot (exc): %s", exc)
         return {"items": [], "errors": [str(exc)]}
     return {"items": [tick.to_payload() for tick in ticks], "errors": []}
 
@@ -148,6 +150,7 @@ async def _pump_ticks(
             try:
                 queue.put_nowait(None)
             except asyncio.QueueFull:
+                logger.debug("silent except in producer")
                 pass
 
     async def consumer() -> None:
@@ -205,6 +208,7 @@ async def _safe_close(websocket: WebSocket, code: int, send_lock: asyncio.Lock) 
         async with send_lock:
             await websocket.close(code=code)
     except RuntimeError:
+        logger.debug("silent except in _safe_close")
         return
 
 
@@ -215,6 +219,7 @@ async def _stop_pump(pump_task: asyncio.Task[None] | None) -> None:
     try:
         await pump_task
     except (asyncio.CancelledError, RealtimeUnavailable):
+        logger.debug("silent except in _stop_pump")
         pass
 
 
@@ -274,6 +279,7 @@ async def realtime_websocket(
     try:
         subscription = await bus.open_subscription(replay_from=replay_from)
     except RealtimeUnavailable as exc:
+        logger.warning("silent except in realtime_websocket (exc)", exc_info=True)
         await _safe_send_json(websocket, {"type": "error", "detail": str(exc)}, send_lock)
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
         return
@@ -310,6 +316,7 @@ async def realtime_websocket(
             try:
                 message = receive_task.result()
             except WebSocketDisconnect:
+                logger.debug("silent except in realtime_websocket")
                 break
             if not isinstance(message, dict):
                 if not await _safe_send_json(websocket, {"type": "error", "detail": "message must be a JSON object"}, send_lock):
@@ -319,6 +326,7 @@ async def realtime_websocket(
             try:
                 codes = _parse_codes(message)
             except ValueError as exc:
+                logger.warning("silent except in realtime_websocket (exc)", exc_info=True)
                 if not await _safe_send_json(websocket, {"type": "error", "detail": str(exc)}, send_lock):
                     break
                 continue
@@ -352,6 +360,7 @@ async def realtime_websocket(
                 if not await _safe_send_json(websocket, {"type": "error", "detail": "action must be subscribe or unsubscribe"}, send_lock):
                     break
     except RealtimeUnavailable as exc:
+        logger.warning("silent except in realtime_websocket (exc)", exc_info=True)
         await _safe_send_json(websocket, {"type": "error", "detail": str(exc)}, send_lock)
     finally:
         stop_event.set()
@@ -361,6 +370,7 @@ async def realtime_websocket(
             try:
                 await heartbeat_task
             except (asyncio.CancelledError, Exception):
+                logger.debug("silent except in realtime_websocket")
                 pass
         await subscription.close()
 
@@ -402,6 +412,7 @@ async def _redis_channel_pump(
         try:
             await pubsub.unsubscribe(channel)
         except Exception:
+            logger.debug("silent except in _redis_channel_pump")
             pass
         await pubsub.close()
         await client.close()
@@ -437,6 +448,7 @@ def _create_websocket_handler(channel: str):
                 try:
                     message = receive_task.result()
                 except WebSocketDisconnect:
+                    logger.debug("silent except in handler")
                     break
                 if not isinstance(message, dict):
                     if not await _safe_send_json(websocket, {"type": "error", "detail": "message must be a JSON object"}, send_lock):
@@ -449,6 +461,7 @@ def _create_websocket_handler(channel: str):
                         try:
                             await pump_task
                         except asyncio.CancelledError:
+                            logger.debug("silent except in handler")
                             pass
                     if not await _safe_send_json(websocket, {"type": "subscribed", "channel": channel}, send_lock):
                         break
@@ -459,6 +472,7 @@ def _create_websocket_handler(channel: str):
                         try:
                             await pump_task
                         except asyncio.CancelledError:
+                            logger.debug("silent except in handler")
                             pass
                     pump_task = None
                     if not await _safe_send_json(websocket, {"type": "unsubscribed", "channel": channel}, send_lock):
@@ -473,12 +487,14 @@ def _create_websocket_handler(channel: str):
                 try:
                     await pump_task
                 except asyncio.CancelledError:
+                    logger.debug("silent except in handler")
                     pass
             if heartbeat_task is not None and not heartbeat_task.done():
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
                 except (asyncio.CancelledError, Exception):
+                    logger.debug("silent except in handler")
                     pass
     return handler
 

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependencies import current_user_id
 from app.data.repository import create_pending_task_run, mark_task_run_queue_failed
 from app.db.session import get_session
 from app.sim.service import serialize_rows
@@ -41,14 +42,6 @@ async def trigger_signal_generation(
     return {"task_id": task_id, "status": "pending"}
 
 
-def _extract_user_id(request: Request) -> int:
-    raw = request.headers.get("X-User-ID") or request.query_params.get("user_id")
-    if raw:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 1
-    return 1
 
 
 @router.delete("/clear")
@@ -56,7 +49,7 @@ async def clear_signals(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     result = await session.execute(
         text("DELETE FROM signal_log WHERE user_id = :user_id"),
         {"user_id": user_id},
@@ -77,7 +70,7 @@ async def list_signals(
     page_size: int = Query(default=50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     clauses = ["sl.user_id = :user_id", "sl.account_id IS NULL"]
     params: dict[str, Any] = {"user_id": user_id}
     if strategy_id is not None:

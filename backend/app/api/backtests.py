@@ -16,9 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from celery import chain
 
 from app.backtest.tasks import run_backtest_task
+from app.core.celery_health import cached_active_queues
+from app.core.dependencies import current_user_id
 from app.data.stock_service import get_klines
 from app.db.session import get_session
 from app.tasks.celery_app import celery_app
+import logging
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backtests", tags=["backtests"])
 
@@ -27,14 +31,7 @@ MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
 
 
 def _backtest_worker_available() -> bool:
-    try:
-        active_queues = celery_app.control.inspect(timeout=1.0).active_queues()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"backtest worker health check failed: {exc}",
-        ) from exc
-
+    active_queues = cached_active_queues()
     return any(
         queue.get("name") == "backtest"
         for queues in (active_queues or {}).values()
@@ -50,25 +47,6 @@ async def _ensure_backtest_worker_available() -> None:
         )
 
 
-def _extract_user_id(request: Request) -> int:
-    user_id: int | None = None
-
-    user_id_header = request.headers.get("X-User-ID")
-    if user_id_header:
-        try:
-            user_id = int(user_id_header)
-        except (ValueError, TypeError):
-            pass
-
-    if user_id is None:
-        user_id_query = request.query_params.get("user_id")
-        if user_id_query:
-            try:
-                user_id = int(user_id_query)
-            except (ValueError, TypeError):
-                pass
-
-    return user_id or 1
 
 
 def _serialize_kline_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,6 +104,7 @@ def _decode_json_dict(value: Any) -> dict[str, Any]:
         try:
             decoded = json.loads(value)
         except json.JSONDecodeError:
+            logger.debug("silent except in _decode_json_dict")
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
@@ -266,7 +245,7 @@ async def submit_backtest(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     await _ensure_backtest_worker_available()
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     strategy = await session.execute(
         text("SELECT id FROM strategies WHERE id = :id AND user_id = :user_id"),
         {"id": request.strategy_id, "user_id": user_id},
@@ -337,7 +316,7 @@ async def submit_batch_backtest(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     await _ensure_backtest_worker_available()
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
 
     strategies = await session.execute(
         text("SELECT id, name FROM strategies WHERE id = ANY(:ids) AND user_id = :user_id"),
@@ -422,7 +401,7 @@ async def list_backtests(
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     clauses = ["b.user_id = :user_id"]
     params: dict[str, Any] = {"user_id": user_id, "limit": limit, "offset": offset}
     if strategy_id:
@@ -466,7 +445,7 @@ async def get_backtest(
     detail_limit: int = Query(default=20000, ge=1, le=200000),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     result = await session.execute(
         text(
             """
@@ -508,6 +487,7 @@ async def get_backtest(
             try:
                 legacy = json.loads(legacy)
             except (ValueError, TypeError):
+                logger.debug("silent except in get_backtest")
                 legacy = None
         if isinstance(legacy, list):
             trades = legacy[:detail_limit]
@@ -664,7 +644,7 @@ async def get_backtest_klines(
     ts_code: str = Query(..., min_length=1),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     result = await session.execute(
         text(
             """
@@ -689,7 +669,7 @@ async def delete_backtest(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     result = await session.execute(
         text("DELETE FROM backtest_results WHERE id = :id AND user_id = :user_id"),
         {"id": backtest_id, "user_id": user_id},
@@ -711,7 +691,7 @@ async def backtest_status(
     Celery 任务会同步把终态（running/success/failed）写入 backtest_results，
     因此直接读该行，而不是查 Celery result backend（它的 key 是 uuid task_id，不是 DB id）。
     """
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
     row = (
         await session.execute(
             text(
@@ -751,7 +731,7 @@ async def cancel_backtest(
     """
     # `backtest_id` here is the Celery task_id (string), per the /status endpoint convention
     task_id = backtest_id
-    user_id = _extract_user_id(req)
+    user_id = current_user_id(req)
 
     row = (await session.execute(
         text(
@@ -774,6 +754,7 @@ async def cancel_backtest(
         celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
     except Exception as exc:
         # Fall through to mark DB as cancelled even if revoke failed (e.g. broker down)
+        logger.debug("silent except in cancel_backtest (exc): %s", exc)
         pass
 
     await session.execute(

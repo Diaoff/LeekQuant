@@ -13,6 +13,8 @@ from app.sim.service import match_order, snapshot_daily_nav, unlock_t1_positions
 from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
 from app.tasks.tracking import _run_tracked, with_session
+import logging
+logger = logging.getLogger(__name__)
 
 A_SHARE_REALTIME_WINDOWS = (
     (time(9, 25), time(11, 30)),
@@ -155,6 +157,7 @@ async def _match_pending_orders(session, run_date: date, match_mode: str = "clos
             else:
                 pending += 1
         except Exception as exc:
+            logger.warning("silent except in _match_pending_orders (exc)", exc_info=True)
             failed.append({"order_id": row["id"], "error": str(exc)})
     return {"trade_date": run_date.isoformat(), "match_mode": match_mode, "matched": matched, "pending": pending, "failed": failed}
 

@@ -22,6 +22,9 @@ from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
 from app.tasks.tracking import _run_tracked, with_session
 from app.core.asyncio_runtime import run_async
+from app.core.convert import _dec
+import logging
+logger = logging.getLogger(__name__)
 
 LOOKBACK_BARS = 60
 MAX_SIGNAL_CONCURRENCY = 4
@@ -40,12 +43,6 @@ class StrategySignalExecutionError(RuntimeError):
     def __init__(self, result: StrategyExecutionResult):
         super().__init__(result.error_summary())
         self.result = result
-
-
-def _dec(value: Any, default: str = "0") -> Decimal:
-    if value is None:
-        return Decimal(default)
-    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def _parse_kbar(row: dict[str, Any]) -> KBar:
@@ -92,6 +89,7 @@ async def _fetch_midday_quotes(stock_codes: list[str]) -> dict[str, Decimal]:
     try:
         from app.data.providers import TencentHttpProvider, AkShareProvider
     except ImportError:
+        logger.debug("silent except in _fetch_midday_quotes")
         return {}
     for provider_cls, name in [(TencentHttpProvider, "tencent"), (AkShareProvider, "akshare")]:
         try:
@@ -100,6 +98,7 @@ async def _fetch_midday_quotes(stock_codes: list[str]) -> dict[str, Decimal]:
             if result:
                 return result
         except Exception:
+            logger.debug("silent except in _fetch_midday_quotes")
             continue
     return {}
 
@@ -245,6 +244,7 @@ async def _fetch_realtime_ticks(stock_codes: list[str]) -> tuple[dict[str, Realt
     try:
         ticks = await EastMoneyRealtimeProvider(sorted(set(stock_codes))).fetch_snapshot()
     except DataProviderError as exc:
+        logger.debug("silent except in _fetch_realtime_ticks (exc): %s", exc)
         return {}, str(exc)
     return {tick.ts_code: tick for tick in ticks}, None
 
@@ -581,6 +581,7 @@ async def generate_all_signals_for_date(session, *, trade_date: date | None = No
                 if stats["signals_logged"] % COMMIT_INTERVAL == 0:
                     await session.commit()
             except Exception as exc:
+                logger.warning("silent except in generate_all_signals_for_date (exc)", exc_info=True)
                 stats["errors"].append({"strategy_id": strategy_id, "ts_code": ts_code, "error": str(exc)})
 
     await session.commit()
@@ -778,6 +779,7 @@ async def generate_intraday_position_signals_for_date(
                             }
                         )
         except Exception as exc:
+            logger.warning("silent except in generate_intraday_position_signals_for_date (exc)", exc_info=True)
             stats["errors"].append({"account_id": account_id, "ts_code": ts_code, "error": str(exc)})
 
     await session.commit()

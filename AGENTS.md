@@ -41,7 +41,7 @@
 - **三级数据回退**：AData → Baostock → AkShare，支持增量拉取，通过 `data_update_state` 表追踪
 - **五档信号**：买入 / 加仓 / 减仓 / 卖出 / 等待，通过状态机映射到实际操作
 - **模拟交易**：完整的 6 表闭环（`sim_accounts`、`sim_positions`、`sim_orders`、`sim_trades`、`sim_cash_flow`、`sim_daily_nav`），支持 T+1、涨跌停、手续费
-- **多因子打分**：估值 / 成长 / 质量 / 动量，含 IC/IR 分析
+- **多因子打分**：估值 / 成长 / 质量 / 动量，含 IC/IR 分析（⚠️ 尚未实现：代码中无 `app/factor` 包、无 IC/IR 计算；仅 PostgreSQL 留有 `scoring_rank` / `factor_values` 表）
 - **日 K 线按年分区**存储于 PostgreSQL
 - **交易日历存入数据库**：所有日期逻辑查询数据库，不硬编码假期列表
 
@@ -58,7 +58,7 @@
 | M2 | 自选股、策略 CRUD、Monaco 编辑器 | ✅ 完成 |
 | M3 | 策略与回测：Python 原生异步回测、交易记录 | ✅ 完成 |
 | M4 | 五档信号、完整模拟交易引擎（6 表） | ✅ 完成 |
-| M5 | 多因子打分、IC/IR 分析 | ✅ 完成 |
+| M5 | 多因子打分、IC/IR 分析 | 待处理（实际未实现，见上方设计决策说明） |
 | M6a | HTTP 快照实时行情：东方财富 HTTP、Redis Pub/Sub、WebSocket 订阅、前端展示 | ✅ 完成 |
 | M6b | WebSocket 推流：东方财富 WS 推送、任务/信号 WS 通道、断线重连 | 待处理 |
 | M7 | 打磨：认证、股票池、因子表达式引擎、周/月线、监控、文档 | 待处理 |

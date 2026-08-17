@@ -2,7 +2,6 @@ import React from 'react'
 import { AlertTriangle, Search, Loader2, Plus, X, Menu, Pencil, Trash2, Settings2, Check } from 'lucide-react'
 import { fetchJson, formatNumber } from '../lib/utils'
 import Skeleton from '../components/Skeleton'
-import WatchlistSparkline from '../components/WatchlistSparkline'
 import { useRealtimeTicks } from '../hooks/useRealtimeTicks'
 
 interface WatchlistItem {
@@ -15,6 +14,7 @@ interface WatchlistItem {
   latest_close: string | null
   pre_close: string | null
   latest_trade_date: string | null
+  added_close: string | null
 }
 
 interface WatchlistGroup {
@@ -87,6 +87,13 @@ function volumeValue(value: number | null | undefined) {
   return `${formatNumber(numeric / 10000, 2)}万手`
 }
 
+function sinceAddedPct(currentPrice: string | null | undefined, addedClose: string | null | undefined) {
+  const cur = Number(currentPrice)
+  const add = Number(addedClose)
+  if (!Number.isFinite(cur) || !Number.isFinite(add) || add === 0) return null
+  return ((cur - add) / add) * 100
+}
+
 function amountValue(value: string | null | undefined) {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return '—'
@@ -118,8 +125,8 @@ export default function WatchlistPage() {
   const flatItems = React.useMemo(() => groups.flatMap((g) => g.items), [groups])
   const activeGroup = React.useMemo(() => groups.find((group) => group.group_name === activeGroupName), [activeGroupName, groups])
   const activeItems = activeGroup?.items ?? []
-  const activeTsCodes = React.useMemo(() => activeItems.map((item) => item.ts_code), [activeItems])
-  const realtime = useRealtimeTicks(activeTsCodes)
+  const allTsCodes = React.useMemo(() => flatItems.map((item) => item.ts_code), [flatItems])
+  const realtime = useRealtimeTicks(allTsCodes)
 
   const loadWatchlist = React.useCallback(async () => {
     setLoading(true)
@@ -329,11 +336,11 @@ export default function WatchlistPage() {
               <thead className="bg-tableHead text-xs font-semibold uppercase text-muted">
                 <tr>
                   <th className="px-4 py-3">名称</th>
-                  <th className="px-4 py-3">K线</th>
                   <th className="px-4 py-3">价格</th>
                   <th className="px-4 py-3">涨跌</th>
                   <th className="px-4 py-3">成交</th>
                   <th className="px-4 py-3">加入时间</th>
+                  <th className="px-4 py-3 text-right">加入至今</th>
                   <th className="px-4 py-3">备注</th>
                   <th className="px-4 py-3">操作</th>
                 </tr>
@@ -351,13 +358,6 @@ export default function WatchlistPage() {
                         <div className="font-semibold text-ink">{stock.name}</div>
                         <div className="font-mono text-xs text-muted">{stock.ts_code}</div>
                       </td>
-                      <td className="whitespace-nowrap px-4 py-3">
-                        <WatchlistSparkline
-                          latestClose={stock.latest_close ? Number(stock.latest_close) : null}
-                          preClose={stock.pre_close ? Number(stock.pre_close) : null}
-                          tsCode={stock.ts_code}
-                        />
-                      </td>
                       <td className={`whitespace-nowrap px-4 py-3 text-base font-semibold tabular-nums ${tone}`}>
                         {tick ? priceValue(price) : '暂无'}
                         <div className="mt-0.5 text-[11px] font-normal text-muted">{tick ? '实时' : '实时不可用'}</div>
@@ -371,6 +371,14 @@ export default function WatchlistPage() {
                         <div className="text-xs">{tick ? amountValue(tick.amount) : '—'}</div>
                       </td>
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{new Date(stock.added_at).toLocaleDateString('zh-CN')}</td>
+                      <td className={`whitespace-nowrap px-4 py-3 tabular-nums text-right ${signedTone(sinceAddedPct(price ?? stock.latest_close, stock.added_close)?.toFixed(2) ?? null)}`}>
+                        {stock.added_close ? (
+                          <>
+                            <div>{percentValue(sinceAddedPct(price ?? stock.latest_close, stock.added_close)?.toFixed(2) ?? null)}</div>
+                            <div className="text-xs text-muted">{priceValue(stock.added_close)}</div>
+                          </>
+                        ) : <span className="text-muted">—</span>}
+                      </td>
                       <td className="whitespace-nowrap px-4 py-3 text-muted">{stock.note || '输入备注'}</td>
                       <td className="px-4 py-3">
                         <button onClick={() => void removeStock(stock.id, stock.ts_code)} className="text-sm font-semibold text-red-600 hover:underline">移除</button>

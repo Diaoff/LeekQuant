@@ -10,6 +10,8 @@ import httpx
 
 from app.data.providers import DataProviderError
 from app.realtime.models import RealtimeTick, normalize_ts_code
+import logging
+logger = logging.getLogger(__name__)
 
 
 class RealtimeProvider(Protocol):
@@ -121,6 +123,7 @@ class EastMoneyRealtimeProvider:
                     payload = response.json()
                     break
                 except Exception as exc:
+                    logger.debug("silent except in fetch_snapshot (exc): %s", exc)
                     last_error = exc
         if payload is None:
             raise DataProviderError(f"eastmoney realtime snapshot failed: {last_error}") from last_error

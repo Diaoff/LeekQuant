@@ -55,6 +55,7 @@ def get_loop() -> asyncio.AbstractEventLoop:
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
+        logger.warning("silent except in get_loop", exc_info=True)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         _loop_pid = current_pid
@@ -86,6 +87,7 @@ def _renew_selector_if_stale(loop: asyncio.AbstractEventLoop) -> None:
     try:
         selector.get_map()
     except (OSError, ValueError):
+        logger.debug("silent except in _renew_selector_if_stale")
         pass
     else:
         return  # selector is healthy
@@ -123,6 +125,7 @@ def run_async(coro):
                 try:
                     loop.run_until_complete(asyncio.gather(main_task, return_exceptions=True))
                 except Exception:  # pragma: no cover - best-effort hygiene
+                    logger.debug("silent except in run_async")
                     pass
             raise
         return result

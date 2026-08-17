@@ -12,6 +12,8 @@ from multiprocessing.connection import Connection
 from typing import Any
 
 from app.core.config import get_settings
+import logging
+logger = logging.getLogger(__name__)
 
 SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs,
@@ -21,6 +23,8 @@ SAFE_BUILTINS: dict[str, Any] = {
     "dict": dict,
     "enumerate": enumerate,
     "float": float,
+    "getattr": getattr,
+    "hasattr": hasattr,
     "int": int,
     "len": len,
     "list": list,
@@ -84,6 +88,7 @@ def _runtime_options(timeout_seconds: float | None = None) -> StrategyExecutionO
     try:
         settings = get_settings()
     except Exception:
+        logger.warning("silent except in _runtime_options", exc_info=True)
         fallback_timeout = float(os.getenv("STRATEGY_EXEC_TIMEOUT_SECONDS", "2.0"))
         return StrategyExecutionOptions(
             timeout_seconds=float(timeout_seconds if timeout_seconds is not None else fallback_timeout),
@@ -107,12 +112,14 @@ def _apply_resource_limits(options: StrategyExecutionOptions) -> None:
     try:
         import resource
     except ImportError:  # pragma: no cover - platform dependent.
+        logger.debug("silent except in _apply_resource_limits")
         return
 
     try:
         cpu_seconds = max(int(math.ceil(options.timeout_seconds)) + 1, 1)
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     except Exception:
+        logger.debug("silent except in _apply_resource_limits")
         pass
 
     if not sys.platform.startswith("linux"):
@@ -122,6 +129,7 @@ def _apply_resource_limits(options: StrategyExecutionOptions) -> None:
         memory_bytes = int(options.memory_mb) * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
     except Exception:
+        logger.debug("silent except in _apply_resource_limits")
         pass
 
 
@@ -144,6 +152,7 @@ def _child_main(conn: Connection, source_code: str, ctx: Any, options: StrategyE
                 )
             )
         except Exception:
+            logger.debug("silent except in _child_main")
             pass
     finally:
         conn.close()
@@ -249,6 +258,7 @@ def execute_strategy(
             timed_out=True,
         )
     except EOFError:
+        logger.debug("silent except in execute_strategy")
         return StrategyExecutionResult(
             ok=False,
             error_type="StrategyRuntimeError",

@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.convert import _as_decimal
 from app.data.fetcher import DataProvider, DataProviderError, default_providers, fetch_union, fetch_with_fallback, filter_open_circuits, get_data_proxy_url, stock_basic_providers
 from app.data.models import DailyKline
 from app.data.repository import (
@@ -39,277 +40,48 @@ MAIN_BOARD_PRICE_LIMIT = Decimal("0.10")
 ST_PRICE_LIMIT = Decimal("0.05")
 
 
-def default_kline_window(today: date | None = None) -> tuple[date, date]:
-    end_date = today or datetime.now(tz=UTC).date()
-    return end_date - timedelta(days=365), end_date
 
 
-def _row_value(row: Any, key: str, index: int) -> Any:
-    if isinstance(row, dict):
-        return row.get(key)
-    try:
-        return row[key]
-    except (TypeError, KeyError):
-        try:
-            return row[index]
-        except IndexError:
-            return None
 
 
-def _sample_bucket(symbol: str) -> str:
-    for bucket, prefixes in SAMPLE_STOCK_BUCKETS:
-        if symbol.startswith(prefixes):
-            return bucket
-    return "other"
 
 
-def _balanced_sample_stock_codes(rows: list[Any], limit: int) -> list[str]:
-    limit = max(limit, 0)
-    if limit == 0:
-        return []
-
-    buckets: dict[str, list[tuple[str, str]]] = {bucket: [] for bucket, _ in SAMPLE_STOCK_BUCKETS}
-    buckets["other"] = []
-
-    for row in rows:
-        ts_code = str(_row_value(row, "ts_code", 0))
-        symbol = str(_row_value(row, "symbol", 1) or ts_code.split(".", 1)[0])
-        buckets[_sample_bucket(symbol)].append((ts_code, symbol))
-
-    selected: list[str] = []
-    seen: set[str] = set()
-    bucket_order = [bucket for bucket, _ in SAMPLE_STOCK_BUCKETS] + ["other"]
-    max_bucket_size = max((len(buckets[bucket]) for bucket in bucket_order), default=0)
-    for index in range(max_bucket_size):
-        for bucket in bucket_order:
-            if index >= len(buckets[bucket]):
-                continue
-            ts_code, _symbol = buckets[bucket][index]
-            if ts_code in seen:
-                continue
-            selected.append(ts_code)
-            seen.add(ts_code)
-            if len(selected) >= limit:
-                return selected
-
-    return selected
 
 
-def _as_decimal(value: Any) -> Decimal | None:
-    if value is None:
-        return None
-    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def _daily_kline_quality_issues(records: list[DailyKline], *, is_st: bool = False) -> list[dict[str, Any]]:
-    issues: list[dict[str, Any]] = []
-    limit_pct = ST_PRICE_LIMIT if is_st else MAIN_BOARD_PRICE_LIMIT
-    for record in records:
-        if record.is_suspended:
-            continue
-        if record.adj_factor is None:
-            issues.append(
-                {
-                    "type": "missing_adj_factor",
-                    "ts_code": record.ts_code,
-                    "trade_date": record.trade_date,
-                    "source": record.data_source,
-                    "reason": "adj_factor is missing on non-suspended daily kline",
-                }
-            )
-        close = _as_decimal(record.close)
-        pre_close = _as_decimal(record.pre_close)
-        if pre_close is None or pre_close == Decimal("0") or close is None:
-            continue
-        change_pct = (close - pre_close) / pre_close
-        if abs(change_pct) > limit_pct + PRICE_LIMIT_TOLERANCE:
-            issues.append(
-                {
-                    "type": "abnormal_price_change",
-                    "ts_code": record.ts_code,
-                    "trade_date": record.trade_date,
-                    "source": record.data_source,
-                    "close": record.close,
-                    "pre_close": record.pre_close,
-                    "change_pct": change_pct,
-                    "limit_pct": limit_pct,
-                    "reason": "close/pre_close change exceeds A-share price limit threshold",
-                }
-            )
-    return issues
 
 
-async def _create_kline_quality_alert(
-    session: AsyncSession,
-    *,
-    ts_code: str,
-    source: str,
-    start_date: date,
-    end_date: date,
-    issues: list[dict[str, Any]],
-) -> None:
-    if not issues:
-        return
-    counts: dict[str, int] = {}
-    for issue in issues:
-        issue_type = str(issue["type"])
-        counts[issue_type] = counts.get(issue_type, 0) + 1
-    await create_alert(
-        session,
-        level="warning",
-        category="data_quality",
-        title="Daily kline data quality warnings",
-        message=f"{ts_code} has {len(issues)} data quality warnings during kline sync",
-        payload={
-            "ts_code": ts_code,
-            "source": source,
-            "start_date": start_date,
-            "end_date": end_date,
-            "counts": counts,
-            "issues": issues[:20],
-        },
-    )
 
 
-async def _bulk_load_is_st(session: AsyncSession, ts_codes: list[str]) -> dict[str, bool]:
-    """Load is_st flag for all ts_codes in ONE query instead of N.
-
-    For sync_kline processing 4000+ stocks, this collapses 4000 DB round-trips
-    to 1. Returns ``{ts_code: bool}``; missing stocks default to False.
-    """
-    if not ts_codes:
-        return {}
-    result = await session.execute(
-        text(
-            "SELECT ts_code, COALESCE(is_st, FALSE) AS is_st "
-            "FROM stock_basic "
-            "WHERE ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))"
-        ),
-        {"ts_codes": ts_codes},
-    )
-    rows = result.all()
-    present = {row.ts_code: bool(row.is_st) for row in rows}
-    return {code: present.get(code, False) for code in ts_codes}
 
 
-async def select_sample_stock_codes(session: AsyncSession, limit: int = 20) -> list[str]:
-    result = await session.execute(
-        text(
-            """
-            SELECT ts_code, symbol
-            FROM stock_basic
-            WHERE is_delisted = FALSE
-              AND symbol ~ '^[036][0-9]{5}$'
-              AND """ + SUPPORTED_STOCK_SQL_CONDITION + """
-            ORDER BY symbol
-            """
-        ),
-    )
-    return _balanced_sample_stock_codes(result.all(), limit)
 
 
-async def select_all_stock_codes(session: AsyncSession) -> list[str]:
-    result = await session.execute(
-        text(
-            "SELECT ts_code FROM stock_basic WHERE is_delisted = FALSE AND "
-            + SUPPORTED_STOCK_SQL_CONDITION
-            + " ORDER BY symbol"
-        )
-    )
-    return [row[0] for row in result.all()]
 
 
-async def get_data_status(session: AsyncSession) -> dict[str, Any]:
-    result = await session.execute(
-        text(
-            """
-            SELECT
-                (SELECT COUNT(*) FROM stock_basic) AS stock_basic_count,
-                (SELECT COUNT(*) FROM trade_calendar) AS trade_calendar_count,
-                (SELECT MAX(cal_date) FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE) AS latest_trade_calendar_date,
-                (SELECT COUNT(*) FROM daily_kline) AS daily_kline_count,
-                (SELECT MAX(trade_date) FROM daily_kline) AS latest_kline_trade_date
-            """
-        )
-    )
-    row = result.mappings().one()
+from app.data.sample import (
+    default_kline_window,
+    _row_value,
+    _sample_bucket,
+    _balanced_sample_stock_codes,
+    select_sample_stock_codes,
+    select_all_stock_codes,
+    get_data_status,
+)
 
-    # Recent non-K-line tasks from task_runs (fundamentals, factors, etc.).
-    # K-line sync tasks now live in kline_sync_jobs — exclude legacy batch
-    # tasks here so they don't appear twice. Keep kline_sync_dispatch visible
-    # so the user sees the task was submitted even before the job is created.
-    tasks_result = await session.execute(
-        text(
-            """
-            SELECT id, task_name, task_id, status, started_at, finished_at, duration_ms, payload, result, error_message
-            FROM task_runs
-            WHERE task_name NOT IN (
-                'incremental_kline_batch', 'full_kline_batch',
-                'incremental_kline_update', 'sync_all_kline',
-                'app.tasks.data_tasks.reconcile_kline_batches'
-            )
-            ORDER BY started_at DESC NULLS LAST, id DESC
-            LIMIT 20
-            """
-        )
-    )
-    recent_tasks: list[dict[str, Any]] = [dict(item) for item in tasks_result.mappings().all()]
+from app.data.quality import (
+    _daily_kline_quality_issues,
+    _create_kline_quality_alert,
+    _bulk_load_is_st,
+)
 
-    # Recent K-line sync jobs from kline_sync_jobs (with progress from items).
-    kline_jobs = await list_recent_jobs(session, limit=20)
-    for job in kline_jobs:
-        recent_tasks.append(
-            {
-                "id": job["id"],
-                "task_name": f"kline_sync_{job['job_type']}",
-                "task_id": None,
-                "status": job["status"],
-                "started_at": job.get("started_at"),
-                "finished_at": job.get("completed_at"),
-                "duration_ms": None,
-                "payload": job.get("config"),
-                "result": {
-                    "scope_total": int(job.get("scope_total") or 0),
-                    "scope_done": int(job.get("scope_done") or 0),
-                    "scope_failed": int(job.get("scope_failed") or 0),
-                    "permanent_failure_codes": job.get("permanent_failure_codes") or [],
-                    "item_total": int(job.get("item_total") or 0),
-                    "pending": int(job.get("pending") or 0),
-                    "running": int(job.get("running") or 0),
-                    "done": int(job.get("done") or 0),
-                    "permanently_failed": int(job.get("permanently_failed") or 0),
-                },
-                "error_message": job.get("error"),
-            }
-        )
-
-    # Sort the merged list by started_at DESC (NULLS LAST), then id DESC.
-    recent_tasks.sort(
-        key=lambda t: (t.get("started_at") is not None, t.get("started_at") or datetime.min.replace(tzinfo=UTC)),
-        reverse=True,
-    )
-    recent_tasks = recent_tasks[:20]
-
-    alerts_result = await session.execute(
-        text(
-            """
-            SELECT id, level, category, title, message, created_at, is_resolved
-            FROM alert_events
-            ORDER BY created_at DESC
-            LIMIT 10
-            """
-        )
-    )
-
-    return {
-        "stock_basic_count": row["stock_basic_count"],
-        "trade_calendar_count": row["trade_calendar_count"],
-        "latest_trade_calendar_date": row["latest_trade_calendar_date"],
-        "daily_kline_count": row["daily_kline_count"],
-        "latest_kline_trade_date": row["latest_kline_trade_date"],
-        "recent_tasks": recent_tasks,
-        "recent_alerts": [dict(item) for item in alerts_result.mappings().all()],
-    }
+from app.data.window import (
+    infer_incremental_kline_window,
+    infer_incremental_kline_ranges,
+    split_kline_ranges_by_year,
+    infer_full_kline_ranges,
+)
 
 
 async def sync_stock_basic(
@@ -797,220 +569,9 @@ async def sync_one_stock(
             return {"success": False, "error": message, "source": None, "synced": 0}
 
 
-async def infer_incremental_kline_window(session: AsyncSession) -> tuple[date | None, date | None]:
-    max_kline_result = await session.execute(text("SELECT MAX(trade_date) FROM daily_kline"))
-    last_kline_date = max_kline_result.scalar_one_or_none()
-    if last_kline_date is None:
-        return default_kline_window()
-
-    next_open_result = await session.execute(
-        text(
-            """
-            SELECT MIN(cal_date)
-            FROM trade_calendar
-            WHERE is_open = TRUE AND cal_date > :last_kline_date
-            """
-        ),
-        {"last_kline_date": last_kline_date},
-    )
-    start_date = next_open_result.scalar_one_or_none()
-    latest_open_result = await session.execute(
-        text("SELECT MAX(cal_date) FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE")
-    )
-    end_date = latest_open_result.scalar_one_or_none()
-    if start_date is None or end_date is None or start_date > end_date:
-        return None, None
-    return start_date, end_date
 
 
-async def infer_incremental_kline_ranges(
-    session: AsyncSession,
-    *,
-    ts_codes: list[str] | None = None,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    if ts_codes is not None and not ts_codes:
-        return []
-
-    latest_open_result = await session.execute(text("SELECT MAX(cal_date) FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE"))
-    end_date = latest_open_result.scalar_one_or_none()
-    if end_date is None:
-        return []
-
-    default_start, _default_end = default_kline_window()
-    code_filter = ""
-    limit_clause = ""
-    params: dict[str, Any] = {"end_date": end_date, "default_start": default_start}
-    if ts_codes is not None:
-        code_filter = "AND sb.ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))"
-        params["ts_codes"] = ts_codes
-    if limit is not None:
-        limit_clause = "LIMIT :limit"
-        params["limit"] = max(0, limit)
-
-    # Optimized query: pre-compute the next-open-day lookup with LEAD() window
-    # function (single pass over trade_calendar) instead of correlated subquery
-    # per stock. The CASE handles stocks with no K-line data separately.
-    result = await session.execute(
-        text(
-            f"""
-            WITH next_open AS (
-                SELECT cal_date,
-                       LEAD(cal_date) OVER (ORDER BY cal_date) AS next_cal_date
-                FROM trade_calendar
-                WHERE is_open = TRUE
-            ),
-            latest_kline AS (
-                SELECT ts_code, MAX(trade_date) AS last_trade_date
-                FROM daily_kline
-                GROUP BY ts_code
-            )
-            SELECT
-                sb.ts_code,
-                lk.last_trade_date,
-                CASE
-                    WHEN lk.last_trade_date IS NULL THEN (
-                        SELECT MIN(tc.cal_date)
-                        FROM trade_calendar tc
-                        WHERE tc.is_open = TRUE
-                          AND tc.cal_date >= COALESCE(sb.list_date, :default_start)
-                          AND tc.cal_date <= :end_date
-                    )
-                    ELSE no.next_cal_date
-                END AS start_date,
-                :end_date AS end_date
-            FROM stock_basic sb
-            LEFT JOIN latest_kline lk ON lk.ts_code = sb.ts_code
-            LEFT JOIN next_open no ON no.cal_date = lk.last_trade_date
-            WHERE sb.is_delisted = FALSE
-              AND (sb.delist_date IS NULL OR sb.delist_date > :end_date)
-              AND {supported_stock_sql_condition("sb")}
-              {code_filter}
-            ORDER BY sb.symbol
-            {limit_clause}
-            """
-        ),
-        params,
-    )
-    ranges = []
-    for row in result.mappings().all():
-        start_date = row["start_date"]
-        if start_date is None or start_date > end_date:
-            continue
-        ranges.append(
-            {
-                "ts_code": row["ts_code"],
-                "start_date": start_date,
-                "end_date": end_date,
-                "last_trade_date": row["last_trade_date"],
-            }
-        )
-    return ranges
 
 
-def split_kline_ranges_by_year(ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Split any range spanning multiple years into per-year sub-ranges.
-
-    Replaces the 400-day lookback clamp (which created data gaps for
-    long-suspended stocks). Instead of clamping, we split a multi-year gap
-    into year-bounded chunks so each chunk is small enough to fit in a
-    batch_size=20 group without hitting the soft time limit.
-
-    Example: ts_code=X with start_date=2024-03-15, end_date=2026-07-21
-    becomes 3 ranges:
-      (2024-03-15, 2024-12-31)
-      (2025-01-01, 2025-12-31)
-      (2026-01-01, 2026-07-21)
-    """
-    split: list[dict[str, Any]] = []
-    for r in ranges:
-        start: date = r["start_date"]
-        end: date = r["end_date"]
-        if start.year == end.year:
-            split.append(r)
-            continue
-        # Multi-year: emit one range per calendar year boundary
-        current = start
-        while current.year < end.year:
-            year_end = date(current.year, 12, 31)
-            split.append({**r, "start_date": current, "end_date": year_end})
-            current = date(current.year + 1, 1, 1)
-        split.append({**r, "start_date": current, "end_date": end})
-    return split
 
 
-async def infer_full_kline_ranges(
-    session: AsyncSession,
-    *,
-    ts_codes: list[str] | None = None,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    """Compute per-stock date ranges for a TRUE full-history (全量) K-line sync.
-
-    Unlike the incremental range inference (which only fills gaps and clamps
-    lookback to avoid huge first loads), the full sync starts every stock at its
-    ``list_date`` (or the earliest available open trading day) and runs through
-    the latest open trading day — i.e. the entire listed history. The result is
-    sliced by the caller (``kline_sync_dispatch``) via ``split_kline_ranges_by_year``,
-    exactly like the incremental path, so the job never trips the global Celery
-    time limit.
-    """
-    latest_open_result = await session.execute(
-        text("SELECT MAX(cal_date) FROM trade_calendar WHERE is_open = TRUE AND cal_date <= CURRENT_DATE")
-    )
-    end_date = latest_open_result.scalar_one_or_none()
-    if end_date is None:
-        return []
-
-    params: dict[str, Any] = {"end_date": end_date}
-    code_filter = ""
-    limit_clause = ""
-    if ts_codes is not None:
-        if not ts_codes:
-            return []
-        code_filter = "AND sb.ts_code = ANY(CAST(:ts_codes AS VARCHAR[]))"
-        params["ts_codes"] = ts_codes
-    if limit is not None:
-        limit_clause = "LIMIT :limit"
-        params["limit"] = max(0, limit)
-
-    result = await session.execute(
-        text(
-            f"""
-            SELECT
-                sb.ts_code,
-                CASE
-                    WHEN sb.list_date IS NOT NULL AND sb.list_date <= :end_date
-                        THEN sb.list_date
-                    ELSE (
-                        SELECT MIN(tc.cal_date)
-                        FROM trade_calendar tc
-                        WHERE tc.is_open = TRUE AND tc.cal_date <= :end_date
-                    )
-                END AS start_date,
-                :end_date AS end_date
-            FROM stock_basic sb
-            WHERE sb.is_delisted = FALSE
-              AND (sb.delist_date IS NULL OR sb.delist_date > :end_date)
-              AND {supported_stock_sql_condition("sb")}
-              {code_filter}
-            ORDER BY sb.symbol
-            {limit_clause}
-            """
-        ),
-        params,
-    )
-    ranges = []
-    for row in result.mappings().all():
-        start_date = row["start_date"]
-        if start_date is None or start_date > end_date:
-            continue
-        ranges.append(
-            {
-                "ts_code": row["ts_code"],
-                "start_date": start_date,
-                "end_date": end_date,
-                "last_trade_date": row.get("last_trade_date"),
-            }
-        )
-    return ranges

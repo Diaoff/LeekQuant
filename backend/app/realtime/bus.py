@@ -9,6 +9,8 @@ from redis.exceptions import RedisError
 
 from app.core.config import get_settings
 from app.realtime.models import RealtimeTick, realtime_channel
+import logging
+logger = logging.getLogger(__name__)
 
 
 STREAM_MAXLEN = 1000
@@ -101,6 +103,7 @@ class RedisRealtimeSubscription:
                     try:
                         tick = RealtimeTick.from_payload(json.loads(data))
                     except (TypeError, ValueError, json.JSONDecodeError):
+                        logger.debug("silent except in _replay_history")
                         continue
                     self._last_seen_id = msg_id
                     yield tick
@@ -125,6 +128,7 @@ class RedisRealtimeSubscription:
                 try:
                     yield RealtimeTick.from_payload(json.loads(data))
                 except (TypeError, ValueError, json.JSONDecodeError):
+                    logger.debug("silent except in listen")
                     continue
         except RedisError as exc:
             raise RealtimeUnavailable(f"realtime redis subscription failed: {exc}") from exc

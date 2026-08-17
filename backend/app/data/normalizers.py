@@ -8,6 +8,8 @@ from typing import Any
 import pandas as pd
 
 from app.data.models import DailyKline, StockBasic, StockFundamental, TradeCalendarDay
+import logging
+logger = logging.getLogger(__name__)
 
 
 def parse_date(value: Any) -> date | None:
@@ -25,6 +27,7 @@ def parse_date(value: Any) -> date | None:
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
+            logger.debug("silent except in parse_date")
             continue
     return pd.to_datetime(text).date()
 

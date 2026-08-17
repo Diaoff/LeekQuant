@@ -9,8 +9,16 @@ from these dicts, so the cached and DB paths produce byte-identical engine
 inputs and we avoid any dataclass/slots (``@dataclass(slots=True)``) pickle
 round-trip corruption that previously caused ``IndexError`` in the engine.
 
-Serialization uses pickle (efficient for plain dicts / Decimal / date). Redis
-connection is established lazily per call to avoid holding idle connections.
+The cache key is ``(sorted stock_codes, start_date, end_date)`` only. The
+cached rows are the *raw* daily_kline rows (including ``adj_factor``); price
+adjustment for ``adj_mode`` / ``fill_price_mode`` happens engine-side in
+``_adjust_price``, so the payload is identical across adjust modes and the
+key must NOT include them (doing so would only create redundant entries).
+
+Serialization uses pickle (efficient for plain dicts / Decimal / date).
+A single module-level async Redis client with a connection pool is reused
+across calls; previously a new client was created and closed on every call,
+which defeats pooling.
 """
 from __future__ import annotations
 
@@ -38,6 +46,9 @@ _DEFAULT_TTL_SECONDS = 3600
 # TypeError when a stale v1 entry is hit within its TTL.
 _KEY_PREFIX = "backtest:klines:v2:"
 
+# Scan/delete batch size for cache invalidation.
+_INVALIDATE_BATCH = 200
+
 
 def _build_cache_key(stock_codes: list[str], start_date: date, end_date: date) -> str:
     """Build a deterministic cache key from stock codes and date range.
@@ -64,6 +75,41 @@ def _decode_klines(data: bytes) -> dict[str, list[dict[str, Any]]] | None:
         return None
 
 
+_client = None
+
+
+def _get_redis():
+    """Return a shared async Redis client (lazy, pooled).
+
+    ``from_url`` does not open a connection eagerly, so this is cheap to call
+    repeatedly. The connection pool is reused across get/set/invalidate so we
+    no longer pay the connect/close cost per cache operation.
+    """
+    global _client
+    if _client is None:
+        import redis.asyncio as redis_async
+
+        settings = get_settings()
+        _client = redis_async.from_url(
+            settings.redis_url,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+            decode_responses=False,
+            health_check_interval=30,
+        )
+    return _client
+
+
+async def close_kline_cache() -> None:
+    """Close the shared Redis client (call on app shutdown)."""
+    global _client
+    if _client is not None:
+        try:
+            await _client.aclose()
+        finally:
+            _client = None
+
+
 async def get_cached_klines(
     stock_codes: list[str],
     start_date: date,
@@ -80,16 +126,8 @@ async def get_cached_klines(
     """
     key = _build_cache_key(stock_codes, start_date, end_date)
     try:
-        import redis.asyncio as redis_async
-        settings = get_settings()
-        client = redis_async.from_url(
-            settings.redis_url,
-            socket_timeout=2,
-            socket_connect_timeout=2,
-            decode_responses=False,
-        )
+        client = _get_redis()
         data = await client.get(key)
-        await client.aclose()
         if data is None:
             return None
         decoded = _decode_klines(data)
@@ -116,17 +154,9 @@ async def set_cached_klines(
     """
     key = _build_cache_key(stock_codes, start_date, end_date)
     try:
-        import redis.asyncio as redis_async
-        settings = get_settings()
-        client = redis_async.from_url(
-            settings.redis_url,
-            socket_timeout=2,
-            socket_connect_timeout=2,
-            decode_responses=False,
-        )
+        client = _get_redis()
         encoded = _encode_klines(klines)
         await client.setex(key, ttl_seconds, encoded)
-        await client.aclose()
         logger.debug("Redis kline cache SET: %s (%d bytes)", key, len(encoded))
         return True
     except Exception as exc:
@@ -134,21 +164,29 @@ async def set_cached_klines(
         return False
 
 
-async def invalidate_cache(stock_codes: list[str], start_date: date, end_date: date) -> bool:
-    """Remove a specific kline cache entry (e.g., after data refresh)."""
-    key = _build_cache_key(stock_codes, start_date, end_date)
+async def invalidate_all_kline_cache() -> int:
+    """Invalidate the entire backtest kline cache.
+
+    Called after a K-line data refresh so backtests never read stale rows.
+    Because backtest cache keys are hashed per (stock_codes, date range) and
+    a backtest may request an arbitrary subset, precise per-key invalidation
+    is impractical; wiping the whole key space on refresh is safe because the
+    cache is only read during backtests (infrequent) and repopulates on next
+    run. Returns the number of keys deleted.
+    """
+    deleted = 0
     try:
-        import redis.asyncio as redis_async
-        settings = get_settings()
-        client = redis_async.from_url(
-            settings.redis_url,
-            socket_timeout=2,
-            socket_connect_timeout=2,
-            decode_responses=False,
-        )
-        await client.delete(key)
-        await client.aclose()
-        return True
+        client = _get_redis()
+        cursor = 0
+        while True:
+            cursor, keys = await client.scan(cursor, match=f"{_KEY_PREFIX}*", count=_INVALIDATE_BATCH)
+            if keys:
+                await client.delete(*keys)
+                deleted += len(keys)
+            if cursor == 0:
+                break
+        if deleted:
+            logger.info("Invalidated %d backtest kline cache entries after data refresh", deleted)
     except Exception as exc:
-        logger.debug("Redis kline cache delete failed for %s: %s", key, exc)
-        return False
+        logger.warning("Failed to invalidate backtest kline cache: %s", exc)
+    return deleted

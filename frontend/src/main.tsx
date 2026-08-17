@@ -1,19 +1,31 @@
-import React from 'react'
+import React, { Suspense } from 'react'
 import ReactDOM from 'react-dom/client'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import App from './App'
 import Layout from './components/Layout'
 import { ThemeProvider } from './lib/theme'
-import BacktestPage from './pages/BacktestPage'
-import DashboardPage from './pages/DashboardPage'
-import PreferencesPage from './pages/PreferencesPage'
-import MarketPage from './pages/MarketPage'
-import SignalsPage from './pages/SignalsPage'
-import SimulationPage from './pages/SimulationPage'
-import StatusPage from './pages/StatusPage'
-import StrategyPage from './pages/StrategyPage'
-import WatchlistPage from './pages/WatchlistPage'
 import './styles.css'
+
+// Route-level code splitting: every page is loaded on demand so the initial
+// bundle only ships the shell + dashboard. Heavy pages (BacktestPage,
+// SimulationPage, MarketPage) no longer block first paint.
+const BacktestPage = React.lazy(() => import('./pages/BacktestPage'))
+const DashboardPage = React.lazy(() => import('./pages/DashboardPage'))
+const PreferencesPage = React.lazy(() => import('./pages/PreferencesPage'))
+const MarketPage = React.lazy(() => import('./pages/MarketPage'))
+const SignalsPage = React.lazy(() => import('./pages/SignalsPage'))
+const SimulationPage = React.lazy(() => import('./pages/SimulationPage'))
+const StatusPage = React.lazy(() => import('./pages/StatusPage'))
+const StrategyPage = React.lazy(() => import('./pages/StrategyPage'))
+const WatchlistPage = React.lazy(() => import('./pages/WatchlistPage'))
+
+function PageFallback() {
+  return (
+    <div className="flex h-64 items-center justify-center text-sm text-muted-foreground">
+      加载中…
+    </div>
+  )
+}
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -21,21 +33,23 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       <BrowserRouter>
         <Layout>
           <App>
-            <Routes>
-              <Route path="/dashboard" element={<DashboardPage />} />
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/status" element={<StatusPage />} />
-              <Route path="/preferences" element={<PreferencesPage />} />
-              <Route path="/sources" element={<PreferencesPage />} />
-              <Route path="/market" element={<MarketPage />} />
-              <Route path="/watchlist" element={<WatchlistPage />} />
-              <Route path="/strategy" element={<StrategyPage />} />
-              <Route path="/backtests" element={<BacktestPage />} />
-              <Route path="/backtests/:id" element={<BacktestPage />} />
-              <Route path="/backtests/compare" element={<BacktestPage />} />
-              <Route path="/signals" element={<SignalsPage />} />
-              <Route path="/simulation" element={<SimulationPage />} />
-            </Routes>
+            <Suspense fallback={<PageFallback />}>
+              <Routes>
+                <Route path="/dashboard" element={<DashboardPage />} />
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/status" element={<StatusPage />} />
+                <Route path="/preferences" element={<PreferencesPage />} />
+                <Route path="/sources" element={<PreferencesPage />} />
+                <Route path="/market" element={<MarketPage />} />
+                <Route path="/watchlist" element={<WatchlistPage />} />
+                <Route path="/strategy" element={<StrategyPage />} />
+                <Route path="/backtests" element={<BacktestPage />} />
+                <Route path="/backtests/:id" element={<BacktestPage />} />
+                <Route path="/backtests/compare" element={<BacktestPage />} />
+                <Route path="/signals" element={<SignalsPage />} />
+                <Route path="/simulation" element={<SimulationPage />} />
+              </Routes>
+            </Suspense>
           </App>
         </Layout>
       </BrowserRouter>

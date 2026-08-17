@@ -66,10 +66,12 @@ class EastMoneyWSClient:
             try:
                 raw = raw.decode("utf-8", errors="ignore")
             except Exception:
+                logger.debug("silent except in _parse_message")
                 return []
         try:
             msg = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
+            logger.debug("silent except in _parse_message")
             return []
 
         if not isinstance(msg, dict):

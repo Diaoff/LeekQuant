@@ -42,6 +42,7 @@ from app.data.service import (
     sync_stock_basic,
     sync_trade_calendar,
 )
+from app.backtest.kline_cache import invalidate_all_kline_cache
 from app.data.stock_service import sync_fundamentals
 from app.db.session import async_session_factory
 from app.tasks.beat_lock import with_beat_lock
@@ -102,6 +103,7 @@ def kline_sync_dispatch(
             try:
                 await ping_session.commit()
             except Exception:
+                logger.warning("silent except in run", exc_info=True)
                 await ping_session.rollback()
         if not alive:
             logger.warning(
@@ -147,6 +149,7 @@ def kline_sync_dispatch(
                     meta={"done": 0, "total": 0, "running": 0, "pending": 0},
                 )
             except Exception:
+                logger.debug("silent except in run")
                 pass
             return {
                 "job_id": job_id,
@@ -162,6 +165,7 @@ def kline_sync_dispatch(
                 meta={"done": 0, "total": len(items), "running": 0, "pending": len(items)},
             )
         except Exception:
+            logger.debug("silent except in run")
             pass
 
         for _ in range(settings.kline_sync_worker_count):
@@ -291,11 +295,18 @@ def kline_sync_worker(self, *, job_id: int) -> dict[str, Any]:
                         },
                     )
                 except Exception:
+                    logger.debug("silent except in run")
                     pass
 
         async with async_session_factory() as session:
             completed = await complete_job_if_done(session, job_id=job_id)
-            if not completed:
+            if completed:
+                # Whole K-line sync job finished — backtest cache may now be
+                # stale for the synced pool, so wipe it. Invalidation is
+                # prefix-based (safe: backtest cache is only read during
+                # backtests and repopulates on next run).
+                await invalidate_all_kline_cache()
+            else:
                 progress = await get_job_progress(session, job_id=job_id)
                 # Re-launch is handled by kline_sync_recover_stuck (controller
                 # pattern) which runs every 60s — no self-re-launch here to
@@ -476,6 +487,7 @@ def sync_fundamentals_task(
                     meta={"current": i, "total": total, "current_code": code},
                 )
             except Exception:
+                logger.debug("silent except in progress")
                 pass
 
         return await sync_fundamentals(

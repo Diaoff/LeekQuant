@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dependencies import current_user_id
 from app.db.session import get_session
 from app.sim.service import (
     SignalOrderRequest,
@@ -30,14 +31,6 @@ from app.sim.service import (
 router = APIRouter(prefix="/api/sim", tags=["simulation"])
 
 
-def _extract_user_id(request: Request) -> int:
-    raw = request.headers.get("X-User-ID") or request.query_params.get("user_id")
-    if raw:
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 1
-    return 1
 
 
 class AccountCreateRequest(BaseModel):
@@ -75,7 +68,7 @@ async def get_accounts(
     status_filter: str | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    return await list_accounts_with_realtime_valuation(session, _extract_user_id(req), status_filter)
+    return await list_accounts_with_realtime_valuation(session, current_user_id(req), status_filter)
 
 
 @router.post("/accounts", status_code=status.HTTP_201_CREATED)
@@ -86,7 +79,7 @@ async def create_account_endpoint(
 ) -> dict[str, Any]:
     return await create_account(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         name=request.name,
         initial_cash=request.initial_cash,
         strategy_id=request.strategy_id,
@@ -100,7 +93,7 @@ async def get_account_detail(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    return await get_account_with_realtime_valuation(session, account_id, _extract_user_id(req))
+    return await get_account_with_realtime_valuation(session, account_id, current_user_id(req))
 
 
 @router.patch("/accounts/{account_id}")
@@ -113,7 +106,7 @@ async def patch_account(
     return await update_account(
         session,
         account_id=account_id,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         name=request.name,
         strategy_id=request.strategy_id,
         strategy_id_provided="strategy_id" in request.model_fields_set,
@@ -127,7 +120,7 @@ async def delete_account_endpoint(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, bool]:
-    deleted = await delete_account(session, account_id=account_id, user_id=_extract_user_id(req))
+    deleted = await delete_account(session, account_id=account_id, user_id=current_user_id(req))
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="account not found")
     return {"deleted": True}
@@ -142,7 +135,7 @@ async def get_positions(
 ) -> list[dict[str, Any]]:
     return await list_positions_with_realtime_valuation(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         limit=limit,
     )
@@ -157,7 +150,7 @@ async def get_orders(
 ) -> list[dict[str, Any]]:
     return await list_child_rows(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         table="sim_orders",
         order_by="t.submit_time DESC, t.id DESC",
@@ -175,7 +168,7 @@ async def get_trades(
 ) -> list[dict[str, Any]]:
     return await list_child_rows(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         table="sim_trades",
         order_by="t.trade_time DESC, t.id DESC",
@@ -193,7 +186,7 @@ async def get_cash_flow(
 ) -> list[dict[str, Any]]:
     return await list_child_rows(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         table="sim_cash_flow",
         order_by="t.created_at DESC, t.id DESC",
@@ -210,7 +203,7 @@ async def get_nav(
 ) -> list[dict[str, Any]]:
     return await list_child_rows(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         table="sim_daily_nav",
         order_by="t.nav_date DESC",
@@ -227,7 +220,7 @@ async def create_signal_order(
 ) -> dict[str, Any]:
     return await generate_order_from_signal(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         account_id=account_id,
         request=SignalOrderRequest(
             ts_code=request.ts_code.strip().upper(),
@@ -253,7 +246,7 @@ async def match_order_endpoint(
 ) -> dict[str, Any]:
     return await match_order(
         session,
-        user_id=_extract_user_id(req),
+        user_id=current_user_id(req),
         order_id=order_id,
         trade_date=request.trade_date,
         match_mode=request.match_mode,
@@ -266,4 +259,4 @@ async def cancel_order_endpoint(
     req: Request,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    return await cancel_order(session, user_id=_extract_user_id(req), order_id=order_id)
+    return await cancel_order(session, user_id=current_user_id(req), order_id=order_id)

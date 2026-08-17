@@ -18,6 +18,8 @@ from app.data.repository import (
 )
 from app.data.stock_scope import supported_stock_sql_condition
 from app.db.session import async_session_factory
+import logging
+logger = logging.getLogger(__name__)
 
 LOCAL_USER_ID = 1
 
@@ -79,6 +81,7 @@ def _pinyin_initial(char: str) -> str:
     try:
         encoded = char.encode("gb2312")
     except UnicodeEncodeError:
+        logger.debug("silent except in _pinyin_initial")
         return ""
     if len(encoded) < 2:
         return ""
@@ -380,10 +383,19 @@ async def list_watchlist(
                 w.id, w.group_name, w.ts_code, w.sort_order, w.note, w.added_at,
                 s.name, s.industry, s.market, s.exchange, s.is_st, s.is_delisted,
                 k.trade_date AS latest_trade_date, k.close AS latest_close,
-                k.pre_close AS pre_close
+                k.pre_close AS pre_close,
+                ak.close AS added_close
             FROM watchlist w
             JOIN stock_basic s ON s.ts_code = w.ts_code
             LEFT JOIN latest_kline k ON k.ts_code = w.ts_code
+            LEFT JOIN LATERAL (
+                SELECT close
+                FROM daily_kline
+                WHERE ts_code = w.ts_code
+                  AND trade_date <= w.added_at::date
+                ORDER BY trade_date DESC
+                LIMIT 1
+            ) ak ON TRUE
             WHERE {" AND ".join(clauses)}
             ORDER BY w.group_name, w.sort_order, w.added_at DESC
             """
@@ -793,6 +805,7 @@ async def sync_fundamentals(
             try:
                 progress_callback(completed, len(codes), ts_code)
             except Exception:
+                logger.debug("silent except in report_progress")
                 pass
 
     async def process_code(code: str) -> dict[str, Any]:
@@ -822,10 +835,12 @@ async def sync_fundamentals(
                         await wk_session.commit()
                         return {"ts_code": code, "source": source, "count": count}
                     except Exception as exc:
+                        logger.warning("silent except in process_code (exc)", exc_info=True)
                         message = str(exc)
                         try:
                             await wk_session.rollback()
                         except Exception:
+                            logger.debug("silent except in process_code")
                             pass
                         await wk_session.commit()
                         return {"ts_code": code, "error": message}
@@ -852,6 +867,7 @@ async def sync_fundamentals(
             count = await upsert_stock_fundamentals(session, records)
             return {"ts_code": code, "source": source, "count": count}
         except Exception as exc:
+            logger.warning("silent except in process_code (exc)", exc_info=True)
             message = str(exc)
             assert session is not None
             return {"ts_code": code, "error": message}

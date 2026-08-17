@@ -109,6 +109,7 @@ async def run_dynamic_ws_producer(
         except (NotImplementedError, RuntimeError):
             # Signal handling is best-effort; not supported on all platforms
             # (e.g. Windows, some test environments).
+            logger.debug("silent except in run_dynamic_ws_producer")
             pass
 
     logger.info("Dynamic WS producer started, initial codes: %d", len(codes))
@@ -142,6 +143,7 @@ async def run_dynamic_ws_producer(
                 try:
                     await asyncio.gather(task, return_exceptions=True)
                 except Exception:
+                    logger.debug("silent except in run_dynamic_ws_producer")
                     pass
             # Explicit close in case the inner coroutine didn't get to it
             try:
@@ -164,6 +166,7 @@ async def run_dynamic_ws_producer(
                         await asyncio.wait_for(stop.wait(), timeout=backoff)
                         break  # stop signaled during backoff
                     except asyncio.TimeoutError:
+                        logger.debug("silent except in run_dynamic_ws_producer")
                         pass
                     retry_count += 1
                     continue

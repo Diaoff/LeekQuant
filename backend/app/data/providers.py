@@ -20,6 +20,8 @@ from app.data.normalizers import (
     normalize_ts_code,
     normalize_trade_calendar,
 )
+import logging
+logger = logging.getLogger(__name__)
 
 
 class DataProviderError(RuntimeError):
@@ -332,6 +334,7 @@ class EastMoneyHttpProvider:
                     if price > 0:
                         result[ts_code] = price
                 except Exception:
+                    logger.debug("silent except in fetch_realtime_quote")
                     pass
             if page * page_size >= total:
                 break
@@ -418,6 +421,7 @@ class TencentHttpProvider:
                 if price > 0:
                     result[ts_code] = price
             except Exception:
+                logger.debug("silent except in fetch_realtime_quote")
                 pass
         return result
 
@@ -433,6 +437,7 @@ class TencentHttpProvider:
                 with urlopen(request, timeout=10) as resp:
                     parts.append(resp.read().decode("gbk", errors="ignore"))
             except URLError:
+                logger.debug("silent except in _request_tencent")
                 pass
         return ";".join(parts)
 
@@ -696,12 +701,14 @@ class AkShareProvider:
                 try:
                     delist_frame = getattr(ak, func_name)()
                 except Exception:
+                    logger.debug("silent except in fetch_stock_basic")
                     continue
                 for row in dataframe_records(delist_frame):
                     basic = normalize_stock_basic(row, self.name)
                     if basic.is_delisted or basic.delist_date is not None:
                         result.append(basic)
         except Exception:
+            logger.debug("silent except in fetch_stock_basic")
             pass
 
         return result
@@ -771,10 +778,12 @@ class AkShareProvider:
         try:
             import akshare as ak  # type: ignore[import-not-found]
         except ImportError:
+            logger.debug("silent except in fetch_realtime_quote")
             return {}
         try:
             frame = ak.stock_zh_a_spot_em()
         except Exception:
+            logger.debug("silent except in fetch_realtime_quote")
             return {}
         wanted = {code.split(".", 1)[0]: code for code in ts_codes}
         result: dict[str, Decimal] = {}
@@ -788,6 +797,7 @@ class AkShareProvider:
                 if price > 0:
                     result[ts_code] = price
             except Exception:
+                logger.debug("silent except in fetch_realtime_quote")
                 pass
         return result
 

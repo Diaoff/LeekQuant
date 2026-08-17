@@ -12,6 +12,8 @@ from typing import Any
 from sqlalchemy import text
 
 from app.db.session import async_session_factory
+import logging
+logger = logging.getLogger(__name__)
 
 
 def _jsonable(value: Any) -> Any:
@@ -163,6 +165,7 @@ async def _run_tracked(
             try:
                 await tracker_session.rollback()
             except Exception as rollback_exc:  # pragma: no cover - original failure is more actionable.
+                logger.warning("silent except in _run_tracked (rollback_exc)", exc_info=True)
                 exc.add_note(f"Failed to rollback task session: {rollback_exc}")
             try:
                 await _finish_task_run(
@@ -174,6 +177,7 @@ async def _run_tracked(
                     error_message=str(exc),
                 )
             except Exception as finish_exc:
+                logger.warning("silent except in _run_tracked (finish_exc)", exc_info=True)
                 exc.add_note(f"Failed to record task failure: {finish_exc}")
             raise
         duration_ms = int((perf_counter() - started) * 1000)

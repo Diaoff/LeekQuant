@@ -9,6 +9,8 @@ from dataclasses import dataclass, fields
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
+from app.core.convert import _as_decimal
+
 DEFAULT_COMMISSION_RATE = Decimal("0.00025")
 DEFAULT_MIN_COMMISSION = Decimal("5.0")
 DEFAULT_STAMP_TAX_RATE = Decimal("0.0005")
@@ -33,14 +35,6 @@ class FeeConfig:
 
 
 FEE_CONFIG_FIELDS = tuple(field.name for field in fields(FeeConfig))
-
-
-def _as_decimal(value: Any, default: Decimal) -> Decimal:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
 
 
 def _as_bool(value: Any) -> bool:

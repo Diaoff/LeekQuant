@@ -2,22 +2,22 @@ import { expect, test } from '@playwright/test'
 
 const apiBase = 'http://localhost:8000'
 
-test('watchlist page uses realtime snapshot instead of daily close when websocket tick is absent', async ({ page }) => {
+test('watchlist page shows real-time data from websocket (no snapshot)', async ({ page }) => {
   await page.addInitScript(() => {
     type Listener = (event?: unknown) => void
 
-    class QuietWebSocket {
+    class MockWebSocket {
       static CONNECTING = 0
       static OPEN = 1
       static CLOSING = 2
       static CLOSED = 3
 
-      readyState = QuietWebSocket.CONNECTING
+      readyState = MockWebSocket.CONNECTING
       private listeners: Record<string, Listener[]> = {}
 
       constructor(public url: string) {
         setTimeout(() => {
-          this.readyState = QuietWebSocket.OPEN
+          this.readyState = MockWebSocket.OPEN
           this.emit('open')
         }, 0)
       }
@@ -26,10 +26,28 @@ test('watchlist page uses realtime snapshot instead of daily close when websocke
         this.listeners[type] = [...(this.listeners[type] ?? []), listener]
       }
 
-      send(_data: string) {}
+      send(data: string) {
+        const message = JSON.parse(data) as { action?: string; ts_codes?: string[] }
+        if (message.action !== 'subscribe') return
+        setTimeout(() => {
+          this.emit('message', {
+            data: JSON.stringify({
+              ts_code: '900001.SZ',
+              price: '10.55',
+              change: '0.35',
+              change_pct: '3.43',
+              volume: 1300,
+              amount: '13715.00',
+              bid1: '10.54',
+              ask1: '10.56',
+              ts: '2026-05-24T09:31:00+08:00',
+            }),
+          })
+        }, 20)
+      }
 
       close() {
-        this.readyState = QuietWebSocket.CLOSED
+        this.readyState = MockWebSocket.CLOSED
         this.emit('close')
       }
 
@@ -38,7 +56,7 @@ test('watchlist page uses realtime snapshot instead of daily close when websocke
       }
     }
 
-    Reflect.set(window, 'WebSocket', QuietWebSocket)
+    Reflect.set(window, 'WebSocket', MockWebSocket)
   })
 
   await page.route(`${apiBase}/api/watchlist`, async (route) => {
@@ -65,26 +83,6 @@ test('watchlist page uses realtime snapshot instead of daily close when websocke
   })
   await page.route(`${apiBase}/api/watchlist/groups`, async (route) => {
     await route.fulfill({ json: [{ group_name: '默认', item_count: 1 }] })
-  })
-  await page.route(`${apiBase}/api/realtime/snapshot**`, async (route) => {
-    await route.fulfill({
-      json: {
-        items: [
-          {
-            ts_code: '900001.SZ',
-            price: '10.55',
-            change: '0.35',
-            change_pct: '3.43',
-            volume: 1300,
-            amount: '13715.00',
-            bid1: '10.54',
-            ask1: '10.56',
-            ts: '2026-05-24T09:31:00+08:00',
-          },
-        ],
-        errors: [],
-      },
-    })
   })
 
   await page.goto('/watchlist')
@@ -202,9 +200,6 @@ test('watchlist page applies realtime websocket ticks with A-share colors', asyn
   })
   await page.route(`${apiBase}/api/watchlist/groups`, async (route) => {
     await route.fulfill({ json: [{ group_name: '默认', item_count: 2 }] })
-  })
-  await page.route(`${apiBase}/api/realtime/snapshot**`, async (route) => {
-    await route.fulfill({ json: { items: [], errors: [] } })
   })
 
   await page.goto('/watchlist')

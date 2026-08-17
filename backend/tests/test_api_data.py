@@ -357,7 +357,8 @@ def test_active_worker_names_only_counts_data_consumers(monkeypatch) -> None:
         "general@host": [{"name": "default"}, {"name": "data"}],
         "backtest@host": [{"name": "backtest"}],
     }
-    monkeypatch.setattr(task_api, "_celery_inspector", lambda: inspector)
+    # P8 routes active-queue lookups through cached_active_queues(); patch that.
+    monkeypatch.setattr(task_api, "cached_active_queues", lambda: inspector.active_queues.return_value)
 
     assert task_api._active_celery_worker_names() == ["general@host"]
 

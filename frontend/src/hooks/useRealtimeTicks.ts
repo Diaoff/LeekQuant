@@ -1,5 +1,4 @@
 import React from 'react'
-import { apiBaseUrl, fetchJson } from '../lib/utils'
 import { useWebSocket } from './useWebSocket'
 
 export interface RealtimeTick {
@@ -19,11 +18,6 @@ export interface RealtimeTick {
 }
 
 type RealtimeStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
-
-interface SnapshotResponse {
-  items: RealtimeTick[]
-  errors: string[]
-}
 
 function normalizeCodes(tsCodes: string[]) {
   return Array.from(new Set(tsCodes.map((code) => code.trim().toUpperCase()).filter(Boolean))).sort()
@@ -47,8 +41,6 @@ export function useRealtimeTicks(tsCodes: string[]) {
 
   // On each (re)connect, build the WS URL with ?replay_from=<stream_id> if we
   // have one. Called by WebSocketConnection.ensureOpen() via reconnectPath.
-  // Using useCallback so the reference is stable across renders unless the
-  // underlying stream_id source changes (it doesn't — we read from a ref).
   const buildWsPath = React.useCallback((): string => {
     const streamId = lastTickStreamIdRef.current
     if (!streamId) return '/ws/realtime'
@@ -62,8 +54,6 @@ export function useRealtimeTicks(tsCodes: string[]) {
     onMessage: (payload) => {
       const tick = payload as Partial<RealtimeTick>
       if (!tick.ts_code || tick.price === undefined) return
-      // Track stream_id for future reconnects (forward-compat: backend may
-      // not include it yet, in which case we keep the previous ref).
       if (tick.stream_id) {
         lastTickStreamIdRef.current = tick.stream_id
       }
@@ -72,37 +62,6 @@ export function useRealtimeTicks(tsCodes: string[]) {
     },
     onError: (detail) => setError(detail),
   })
-
-  React.useEffect(() => {
-    if (codes.length === 0) {
-      setStatus('idle')
-      setError(null)
-      return
-    }
-    let cancelled = false
-    fetchJson<SnapshotResponse>(`/api/realtime/snapshot?ts_codes=${encodeURIComponent(codes.join(','))}`)
-      .then((payload) => {
-        if (cancelled) return
-        if (payload.errors.length > 0) {
-          setError(payload.errors[0])
-          return
-        }
-        setError(null)
-        setTicks((current) => {
-          const next = { ...current }
-          for (const tick of payload.items) {
-            next[tick.ts_code] = tick
-          }
-          return next
-        })
-      })
-      .catch((caught) => {
-        if (!cancelled) setError(caught instanceof Error ? caught.message : String(caught))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [codesKey])
 
   return { ticks, status, error }
 }

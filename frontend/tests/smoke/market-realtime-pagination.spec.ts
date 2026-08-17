@@ -2,24 +2,24 @@ import { expect, test } from '@playwright/test'
 
 const apiBase = 'http://localhost:8000'
 
-test('market page uses realtime snapshot and advanced pagination with 20 rows per page', async ({ page }) => {
+test('market page uses realtime websocket tick and advanced pagination with 20 rows per page', async ({ page }) => {
   const stockRequests: string[] = []
 
   await page.addInitScript(() => {
     type Listener = (event?: unknown) => void
 
-    class QuietWebSocket {
+    class MockWebSocket {
       static CONNECTING = 0
       static OPEN = 1
       static CLOSING = 2
       static CLOSED = 3
 
-      readyState = QuietWebSocket.CONNECTING
+      readyState = MockWebSocket.CONNECTING
       private listeners: Record<string, Listener[]> = {}
 
       constructor(public url: string) {
         setTimeout(() => {
-          this.readyState = QuietWebSocket.OPEN
+          this.readyState = MockWebSocket.OPEN
           this.emit('open')
         }, 0)
       }
@@ -28,10 +28,29 @@ test('market page uses realtime snapshot and advanced pagination with 20 rows pe
         this.listeners[type] = [...(this.listeners[type] ?? []), listener]
       }
 
-      send(_data: string) {}
+      send(data: string) {
+        const message = JSON.parse(data) as { action?: string; ts_codes?: string[] }
+        if (message.action !== 'subscribe') return
+        if (!message.ts_codes?.includes('900001.SZ')) return
+        setTimeout(() => {
+          this.emit('message', {
+            data: JSON.stringify({
+              ts_code: '900001.SZ',
+              price: '10.68',
+              change: '-0.02',
+              change_pct: '-0.19',
+              volume: 954133,
+              amount: '1020057083.13',
+              bid1: '10.68',
+              ask1: '10.69',
+              ts: '2026-05-24T09:31:00+08:00',
+            }),
+          })
+        }, 20)
+      }
 
       close() {
-        this.readyState = QuietWebSocket.CLOSED
+        this.readyState = MockWebSocket.CLOSED
         this.emit('close')
       }
 
@@ -40,7 +59,7 @@ test('market page uses realtime snapshot and advanced pagination with 20 rows pe
       }
     }
 
-    Reflect.set(window, 'WebSocket', QuietWebSocket)
+    Reflect.set(window, 'WebSocket', MockWebSocket)
   })
 
   await page.route(`${apiBase}/api/watchlist/groups`, async (route) => {
@@ -77,31 +96,6 @@ test('market page uses realtime snapshot and advanced pagination with 20 rows pe
         page: requestedPage,
         page_size: 20,
         total: 42,
-      },
-    })
-  })
-
-  await page.route(`${apiBase}/api/realtime/snapshot**`, async (route) => {
-    const url = new URL(route.request().url())
-    const codes = (url.searchParams.get('ts_codes') ?? '').split(',')
-    await route.fulfill({
-      json: {
-        items: codes.includes('900001.SZ')
-          ? [
-              {
-                ts_code: '900001.SZ',
-                price: '10.68',
-                change: '-0.02',
-                change_pct: '-0.19',
-                volume: 954133,
-                amount: '1020057083.13',
-                bid1: '10.68',
-                ask1: '10.69',
-                ts: '2026-05-24T09:31:00+08:00',
-              },
-            ]
-          : [],
-        errors: [],
       },
     })
   })

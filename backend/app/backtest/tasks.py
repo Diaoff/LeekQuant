@@ -112,6 +112,7 @@ def _decode_json_dict(value: Any) -> dict[str, Any]:
         try:
             decoded = json.loads(value)
         except json.JSONDecodeError:
+            logger.debug("silent except in _decode_json_dict")
             return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
@@ -176,6 +177,7 @@ def _has_risk_controls(risk_config: dict[str, Any]) -> bool:
             if float(value) > 0:
                 return True
         except (TypeError, ValueError):
+            logger.debug("silent except in _has_risk_controls")
             continue
     return False
 
@@ -337,15 +339,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
     """Execute a backtest by running user strategy code against historical K-line data."""
 
     async def _run() -> dict[str, Any]:
-        # ---- Phase 0: dispose stale engine connections ----
-        # The async engine is created at module import time, before any event loop
-        # is active. When run_async() creates a new event loop (no running loop in
-        # the Celery worker thread), the pooled connections from the import-time
-        # initialization are bound to the wrong loop, causing asyncpg
-        # "connection is closed" on the first query. Disposing forces fresh
-        # connections created in the current loop context.
-        await db_engine.dispose()
-
         # ---- Phase 1: load config + fetch all data (short-lived session) ----
         # IMPORTANT: this session is closed BEFORE the long pure-Python backtest
         # run. Previously the SAME connection (with an open transaction) was held
@@ -392,6 +385,23 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no stocks available for selected target"}
 
+            # Resolve strategy config + trading fee config EARLY, on a fresh
+            # connection before the long K-line load. These only depend on the
+            # backtest record / user, not on K-lines. Fetching them here avoids
+            # running a query on a connection that later idles-in-transaction
+            # during the K-line cache serialization (which Postgres kills via
+            # idle_in_transaction_session_timeout=30s, surfacing as asyncpg
+            # "connection is closed").
+            strategy_config = _merge_backtest_config(
+                bt_row.get("config"),
+                bt_row.get("params_snapshot"),
+            )
+
+            global_fee_cfg = await get_trading_fee_config(session, bt_row["user_id"])
+            fee_cfg = _merge_fee_config(global_fee_cfg, strategy_config.get("fee_config"))
+
+            risk_cfg = strategy_config.get("risk_config", {})
+
             # Prepend a warmup window before start_date so technical indicators
             # (MA20/MACD/BOLL/KDJ/Donchian, lookback=60 bars in the engine) are
             # already primed on the first backtest day. Without it the first ~1
@@ -428,6 +438,12 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 for row in kline_result.mappings().all():
                     row_dict = dict(row)
                     all_klines_raw.setdefault(row_dict["ts_code"], []).append(row_dict)
+                # Close the transaction right after the K-line SELECT so the
+                # connection is NOT idle-in-transaction during the long Redis
+                # serialization below. Postgres' idle_in_transaction_session_timeout
+                # (30s) otherwise kills the connection, surfacing as asyncpg
+                # "connection is closed" on the next query.
+                await session.commit()
                 # Cache the raw row dicts (robust against any dataclass/slots
                 # pickle round-trip corruption). The engine always receives
                 # freshly rebuilt KBar objects via _parse_kline_rows, identical
@@ -457,15 +473,6 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no K-line data"}
 
-            strategy_config = _merge_backtest_config(
-                bt_row.get("config"),
-                bt_row.get("params_snapshot"),
-            )
-
-            global_fee_cfg = await get_trading_fee_config(session, bt_row["user_id"])
-            fee_cfg = _merge_fee_config(global_fee_cfg, strategy_config.get("fee_config"))
-
-            risk_cfg = strategy_config.get("risk_config", {})
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -692,6 +699,7 @@ def _as_date(value: Any) -> "date | None":
             try:
                 return datetime.strptime(value, fmt).date()
             except ValueError:
+                logger.debug("silent except in _as_date")
                 continue
     return None
 

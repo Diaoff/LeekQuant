@@ -68,6 +68,7 @@ def _get_redis() -> redis_mod.Redis | None:
         try:
             _REDIS_CLIENT = redis_mod.from_url(get_settings().redis_url, socket_connect_timeout=1)
         except Exception:
+            logger.debug("silent except in _get_redis")
             return None
     return _REDIS_CLIENT
 
@@ -81,6 +82,7 @@ def _load_order_from_redis() -> list[str] | None:
         if data:
             return json.loads(data)
     except Exception:
+        logger.debug("silent except in _load_order_from_redis")
         pass
     return None
 
@@ -93,6 +95,7 @@ def configure_providers(ordered_names: list[str]) -> None:
         if client is not None:
             client.set(_REDIS_CONFIG_KEY, json.dumps(ordered_names))
     except Exception:
+        logger.debug("silent except in configure_providers")
         pass
 
 
@@ -261,6 +264,7 @@ def fetch_with_fallback(
                     errors.append(f"{provider.name}: no records returned")
                     break
                 except _RETRYABLE as exc:
+                    logger.warning("silent except in fetch_with_fallback (exc)", exc_info=True)
                     msg = f"{provider.name}: {exc}"
                     if attempt < max_retries - 1:
                         # Exponential backoff with full jitter: 2^attempt + [0, 1)
@@ -270,6 +274,7 @@ def fetch_with_fallback(
                     errors.append(msg)
                     break
                 except Exception as exc:
+                    logger.warning("silent except in fetch_with_fallback (exc)", exc_info=True)
                     errors.append(f"{provider.name}: {exc}")
                     break
     raise DataProviderError("; ".join(errors) or "all providers failed")
@@ -304,6 +309,7 @@ def fetch_with_fallback_short(
                     if records:
                         return provider.name, records
                 except Exception:
+                    logger.debug("silent except in fetch_with_fallback_short")
                     break
     return None
 
@@ -349,6 +355,7 @@ def fetch_union(
                     method = getattr(provider, method_name)
                     records = method(*args)
                 except _RETRYABLE as exc:
+                    logger.warning("silent except in fetch_union (exc)", exc_info=True)
                     if attempt < max_retries - 1:
                         backoff = (2 ** attempt) + random.random()
                         time.sleep(min(backoff, 30.0))
@@ -357,6 +364,7 @@ def fetch_union(
                 except Exception:
                     # Non-retryable provider error: skip this provider,
                     # continue with the next one (resilient to one bad source).
+                    logger.debug("silent except in fetch_union")
                     break
                 if not records:
                     break
