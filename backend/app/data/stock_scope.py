@@ -19,15 +19,18 @@ def excluded_stock_sql_condition(alias: str | None = None) -> str:
     prefix = f"{alias}." if alias else ""
     return f"""
 (
-    COALESCE({prefix}market, '') IN ('科创板', '北交所', '京交所')
-    OR COALESCE({prefix}exchange, '') IN ('BJ', 'BSE')
-    OR split_part({prefix}ts_code, '.', 1) LIKE '688%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '689%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '4%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '8%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '920%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '200%'
-    OR split_part({prefix}ts_code, '.', 1) LIKE '900%'
+    (
+        COALESCE({prefix}market, '') IN ('科创板', '北交所', '京交所')
+        OR COALESCE({prefix}exchange, '') IN ('BJ', 'BSE')
+        OR split_part({prefix}ts_code, '.', 1) LIKE '688%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '689%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '4%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '8%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '920%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '200%'
+        OR split_part({prefix}ts_code, '.', 1) LIKE '900%'
+    )
+    AND COALESCE({prefix}market, '') <> '指数'
 )
 """
 

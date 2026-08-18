@@ -50,6 +50,41 @@ async def _fetch_benchmark_klines(session: AsyncSession, benchmark_code: str, st
     return [dict(row) for row in result.mappings().all()]
 
 
+async def _fetch_klines_for_codes(
+    session: AsyncSession,
+    codes: list[str],
+    start_date: date,
+    end_date: date,
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch raw daily_kline rows for arbitrary codes (benchmark / extra series).
+
+    Reuses the exact same column set as the main stock-pool load so the
+    resulting KBar objects are field-compatible. Returns code -> list of row
+    dicts; codes with no data are simply absent from the result.
+    """
+    if not codes:
+        return {}
+    result = await session.execute(
+        text(
+            """
+            SELECT ts_code, trade_date, open, high, low, close, pre_close,
+                   volume, amount, turnover_rate, adj_factor, is_suspended,
+                   is_limit_up, is_limit_down
+            FROM daily_kline
+            WHERE ts_code = ANY(CAST(:codes AS VARCHAR[]))
+              AND trade_date BETWEEN :start_date AND :end_date
+            ORDER BY ts_code, trade_date
+            """
+        ),
+        {"codes": list(codes), "start_date": start_date, "end_date": end_date},
+    )
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in result.mappings().all():
+        rd = dict(row)
+        out.setdefault(rd["ts_code"], []).append(rd)
+    return out
+
+
 def _compute_benchmark_metrics(
     strategy_values: list[float],
     strategy_dates: list[str],
@@ -473,6 +508,27 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 await session.commit()
                 return {"error": "no K-line data"}
 
+            # ---- 注入基准 / 额外序列（指数 / 行业 / 板块）到策略 ctx ----
+            # 这些序列与股票池用同一张 daily_kline 表、同一套加载逻辑，
+            # 故字段完全一致；库中无数据的 code 安静降级（视图为空 / None）。
+            benchmark_code = bt_row.get("benchmark_code")
+            params_snapshot = bt_row.get("params_snapshot") or {}
+            extra_series = params_snapshot.get("extra_series", {}) or {}
+            aux_codes = [c for c in ([benchmark_code] if benchmark_code else []) + list(extra_series.values()) if c]
+            aux_raw = await _fetch_klines_for_codes(session, aux_codes, warmup_start, bt_row["end_date"])
+
+            def _to_kbars(rows: list[dict[str, Any]] | None) -> list[KBar]:
+                return _parse_kline_rows(rows) if rows else []
+
+            benchmark_klines = _to_kbars(aux_raw.get(benchmark_code)) if benchmark_code else None
+            if benchmark_klines is not None and len(benchmark_klines) == 0:
+                benchmark_klines = None
+            extra_klines: dict[str, list[KBar]] = {}
+            for _name, _code in extra_series.items():
+                _kl = _to_kbars(aux_raw.get(_code))
+                if _kl:
+                    extra_klines[_name] = _kl
+
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -482,6 +538,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 initial_cash=Decimal(str(bt_row["initial_cash"])),
                 fee_config=fee_cfg,
                 benchmark_code=bt_row.get("benchmark_code"),
+                extra_series=extra_series,
                 stop_loss_pct=float(risk_cfg.get("stop_loss_pct", 0.0)),
                 take_profit_pct=float(risk_cfg.get("take_profit_pct", 0.0)),
                 trailing_stop_pct=float(risk_cfg.get("trailing_stop_pct", 0.0)),
@@ -490,6 +547,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                slippage_pct=float(risk_cfg.get("slippage_pct", 0.001)),
                 rebalance_mode=str(strategy_config.get("rebalance_mode", "disabled")),
                 max_positions=int(strategy_config.get("max_positions", 0)),
+                max_daily_buys=int(strategy_config.get("max_daily_buys", 0)),
                 rebalance_version=int(strategy_config.get("rebalance_version", 1)),
                 rebalance_frequency=str(strategy_config.get("rebalance_frequency", "weekly")),
                 weighting_method=str(strategy_config.get("weighting_method", "equal")),
@@ -509,7 +567,11 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
         compute_error: str | None = None
         try:
             runner = BacktestRunner(config)
-            results = runner.run(all_klines)
+            results = runner.run(
+                all_klines,
+                benchmark_klines=benchmark_klines,
+                extra_klines=extra_klines,
+            )
         except Exception as exc:
             import traceback as _tb
             compute_error = f"{exc.__class__.__name__}: {exc}\n{_tb.format_exc()}"
@@ -588,6 +650,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     """
                     UPDATE backtest_results SET
                         status = 'success',
+                        strategy_source_snapshot = :strategy_source_snapshot,
                         total_return = :total_return,
                         annual_return = :annual_return,
                         sharpe_ratio = :sharpe_ratio,
@@ -603,6 +666,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                     """
                 ),
                 {
+                    "strategy_source_snapshot": bt_row["source_code"],
                     "total_return": results["total_return"],
                     "annual_return": results["annual_return"],
                     "sharpe_ratio": results["sharpe_ratio"],

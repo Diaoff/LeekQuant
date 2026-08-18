@@ -18,6 +18,7 @@ import numpy as np
 from app.backtest.cost import AShareCostCalculator, CostResult, FeeConfig
 from app.backtest.signals import SignalInput, SignalOutput, apply_cn_rules, map_signal_to_action
 from app.backtest.strategy_runtime import (StrategyExecutionResult, compile_strategy, execute_compiled_signal, execute_compiled_script)
+from app.libs.MyTT import clear_ema_cache, clear_roll_cache
 
 
 @dataclass(slots=True)
@@ -120,6 +121,12 @@ class BacktestConfig:
     fee_config: FeeConfig = field(default_factory=FeeConfig)
     benchmark_code: str | None = None
 
+    # 额外注入策略上下文的序列（指数 / 行业 / 板块等）。
+    # 键为策略内访问名（如 "bench" / "sector"），值为 daily_kline 中的 ts_code。
+    # 这些序列与股票池使用同一张表、同一套加载逻辑，字段完全一致。
+    # 未配置时为空 dict；若某 code 在库中无数据，则对应视图安静降级为空。
+    extra_series: dict[str, str] = field(default_factory=dict)
+
     stop_loss_pct: float = 0.0
     take_profit_pct: float = 0.0
     trailing_stop_pct: float = 0.0
@@ -132,6 +139,12 @@ class BacktestConfig:
     # new buys.  Disabled by default for backward compat.
     rebalance_mode: str = "disabled"  # "disabled" | "ranked"
     max_positions: int = 0  # 0 = unlimited, capped at this when rebalance_mode="ranked"
+
+    # 单日最大买入只数：限制每个交易日实际建仓（买入）的股票数量，避免
+    # 在一天内集中建仓导致过早满仓，使资金分配更平滑、仓位控制更合理。
+    # 0 = 不限制（默认）。统计以成交发生日（fill date）为准，同一交易日
+    # 对同一只股票重复买入只计 1 只。
+    max_daily_buys: int = 0  # 0 = unlimited
 
     # Rebalance v2 settings (weekly, ranked, equal-weight)
     rebalance_version: int = 1
@@ -158,6 +171,89 @@ class _SignalCandidate:
     fill_bar: KBar | None = None  # next day's bar for fill price (None = fallback)
 
 
+@dataclass
+class _StockArrays:
+    """Precomputed per-stock numpy arrays.
+
+    Built once per stock (in ``BacktestRunner.run``) so that each
+    ``BacktestContext`` property access becomes an O(1) array slice instead of
+    a per-bar Python-level rebuild over ~60 bars. This is the core of the
+    Phase 1 backtest speed-up.
+    """
+
+    close: "np.ndarray"
+    open: "np.ndarray"
+    high: "np.ndarray"
+    low: "np.ndarray"
+    volume: "np.ndarray"
+    amount: "np.ndarray"
+    dates: list
+
+    @classmethod
+    def from_klines(cls, klines: list[KBar]) -> "_StockArrays":
+        return cls(
+            close=np.array([float(k.close) for k in klines], dtype=np.float64),
+            open=np.array([float(k.open) for k in klines], dtype=np.float64),
+            high=np.array([float(k.high) for k in klines], dtype=np.float64),
+            low=np.array([float(k.low) for k in klines], dtype=np.float64),
+            volume=np.array([k.volume for k in klines]),
+            amount=np.array([float(k.amount) for k in klines], dtype=np.float64),
+            dates=[k.trade_date for k in klines],
+        )
+
+
+class _SeriesView:
+    """Read-only, trade-date-aligned view over a :class:`_StockArrays`.
+
+    Exposes the prefix of each array **up to and including** a target
+    ``trade_date`` so user strategies can read benchmark / index / extra
+    series without look-ahead bias. Every property returns an O(1) numpy
+    slice over the underlying arrays.
+
+    Used for ``ctx.benchmark`` and ``ctx.extra[name]``.
+    """
+
+    def __init__(self, arrays: "_StockArrays", trade_date: date) -> None:
+        self._a = arrays
+        self._td = trade_date
+        cut = len(arrays.dates) - 1
+        while cut >= 0 and arrays.dates[cut] > trade_date:
+            cut -= 1
+        self._cut = cut
+
+    @property
+    def close(self) -> "np.ndarray":
+        return self._a.close[: self._cut + 1]
+
+    @property
+    def open(self) -> "np.ndarray":
+        return self._a.open[: self._cut + 1]
+
+    @property
+    def high(self) -> "np.ndarray":
+        return self._a.high[: self._cut + 1]
+
+    @property
+    def low(self) -> "np.ndarray":
+        return self._a.low[: self._cut + 1]
+
+    @property
+    def volume(self) -> "np.ndarray":
+        return self._a.volume[: self._cut + 1]
+
+    @property
+    def amount(self) -> "np.ndarray":
+        return self._a.amount[: self._cut + 1]
+
+    @property
+    def dates(self) -> list:
+        return self._a.dates[: self._cut + 1]
+
+    @property
+    def bar_count(self) -> int:
+        return self._cut + 1
+
+
 class BacktestContext:
     """Context object exposed to user strategy code."""
 
@@ -169,50 +265,98 @@ class BacktestContext:
         current_price: Decimal | None = None,
         runner: 'BacktestRunner | None' = None,
         ts_code: str | None = None,
+        benchmark_arrays: "_StockArrays | None" = None,
+        all_klines: "dict[str, list[KBar]] | None" = None,
+        extra_arrays: "dict[str, _StockArrays] | None" = None,
     ):
-        self._klines = klines
+        # Legacy / test path: a full (or window) klines list is supplied and the
+        # whole thing is exposed as the context window.
+        self._arrays = _StockArrays.from_klines(klines)
+        self._lo = 0
+        self._hi = len(klines)
+        self._idx = len(klines)
         self._current_position: float = 0.0
         self.current_price = float(current_price) if current_price is not None else None
         self._runner = runner
         self._ts_code = ts_code
+        self._benchmark_arrays = benchmark_arrays
+        self._all_klines = all_klines
+        self._extra_arrays = extra_arrays or {}
+
+    @classmethod
+    def from_arrays(
+        cls,
+        arrays: "_StockArrays",
+        idx: int,
+        lookback: int,
+        positions: dict[str, Position],
+        total_asset: Decimal,
+        current_price: Decimal | None = None,
+        runner: 'BacktestRunner | None' = None,
+        ts_code: str | None = None,
+        benchmark_arrays: "_StockArrays | None" = None,
+        all_klines: "dict[str, list[KBar]] | None" = None,
+        extra_arrays: "dict[str, _StockArrays] | None" = None,
+    ) -> "BacktestContext":
+        """Hot-path constructor: zero-copy slice window [idx-lookback, idx).
+
+        The per-stock ``arrays`` are built once in ``BacktestRunner.run``; this
+        only records the slice bounds so each property returns an O(1) view,
+        eliminating the per-bar numpy rebuild (Phase 1).
+        """
+        obj = cls.__new__(cls)
+        obj._arrays = arrays
+        obj._lo = max(0, idx - lookback)
+        obj._hi = idx
+        obj._idx = idx
+        obj._current_position = 0.0
+        obj.current_price = float(current_price) if current_price is not None else None
+        obj._runner = runner
+        obj._ts_code = ts_code
+        obj._benchmark_arrays = benchmark_arrays
+        obj._all_klines = all_klines
+        obj._extra_arrays = extra_arrays or {}
+        return obj
 
     @property
     def close(self) -> np.ndarray:
-        return np.array([float(k.close) for k in self._klines])
+        return self._arrays.close[self._lo:self._hi]
 
     @property
     def open(self) -> np.ndarray:
-        return np.array([float(k.open) for k in self._klines])
+        return self._arrays.open[self._lo:self._hi]
 
     @property
     def high(self) -> np.ndarray:
-        return np.array([float(k.high) for k in self._klines])
+        return self._arrays.high[self._lo:self._hi]
 
     @property
     def low(self) -> np.ndarray:
-        return np.array([float(k.low) for k in self._klines])
+        return self._arrays.low[self._lo:self._hi]
 
     @property
     def volume(self) -> np.ndarray:
-        return np.array([k.volume for k in self._klines])
+        return self._arrays.volume[self._lo:self._hi]
 
     @property
     def amount(self) -> np.ndarray:
-        return np.array([float(k.amount) for k in self._klines])
+        return self._arrays.amount[self._lo:self._hi]
 
     @property
     def trade_date(self) -> date:
-        return self._klines[-1].trade_date if self._klines else date.today()
+        if not self._arrays.dates:
+            return date.today()
+        return self._arrays.dates[self._idx - 1]
 
     @property
     def bar_count(self) -> int:
         """Number of bars accumulated so far (len of the current window).
 
         Useful for cooldown/timing logic in user strategies (e.g. "add only
-        once every N bars"). The value equals ``len(self._klines)``, i.e. the
-        window length at the current bar.
+        once every N bars"). The value equals the window length at the current
+        bar (``hi - lo``).
         """
-        return len(self._klines)
+        return self._hi - self._lo
 
     @property
     def current_position(self) -> float:
@@ -224,12 +368,12 @@ class BacktestContext:
 
     @property
     def stock_position_weight(self) -> float:
-        if not self._runner or not self._ts_code or not self._klines:
+        if not self._runner or not self._ts_code or not self._arrays.dates:
             return 0.0
         pos = self._runner.positions.get(self._ts_code)
         if not pos or pos.shares <= 0:
             return 0.0
-        observable_price = self._klines[-1].close
+        observable_price = Decimal(str(self._arrays.close[self._idx - 1]))
         nav = self._runner._calc_total_asset(self._runner._all_klines, self.trade_date)
         if nav <= 0:
             return 0.0
@@ -268,6 +412,38 @@ class BacktestContext:
         if not self._runner:
             return 0.0
         return float(self._runner.cash)
+
+    @property
+    def ts_code(self) -> str | None:
+        """当前股票代码。策略可据此区分标的、读取对应基本面等。"""
+        return self._ts_code
+
+    @property
+    def benchmark(self) -> "_SeriesView | None":
+        """基准 / 指数序列窗口（由 ``config.benchmark_code`` 注入）。
+
+        返回按当前 ``trade_date`` 对齐的只读视图；未配置时为 ``None``。
+        例：``MA(ctx.benchmark.close, 20)[-1]`` 取基准 20 日线。
+        """
+        if self._benchmark_arrays is None:
+            return None
+        return _SeriesView(self._benchmark_arrays, self.trade_date)
+
+    @property
+    def all_klines(self) -> "dict[str, list[KBar]] | None":
+        """全市场已加载 K 线（只读），用于横截面 / 跨标的比较。
+
+        仅含回测股票池（及 ``extra_series``）内的标的，不含未入选股票。
+        """
+        return self._all_klines
+
+    @property
+    def extra(self) -> "dict[str, _SeriesView]":
+        """``extra_series`` 注入的额外序列，键为配置中的访问名。
+
+        例：``ctx.extra.get("sector")`` 取行业指数窗口视图；未配置时为空 dict。
+        """
+        return {name: _SeriesView(arr, self.trade_date) for name, arr in self._extra_arrays.items()}
 
 
 class ScriptContext:
@@ -341,6 +517,10 @@ class BacktestRunner:
         # Rebalance v2 planner (initialized lazily in run())
         self.rebalance_planner: Any = None
         self._stored_rebalance_plan: Any = None
+        # 单日最大买入只数计数：key 为成交日（fill date），value 为该日已买入的
+        # 不同股票集合。仅在 BUY 实际增加持仓份额时计入，避免无成交的占位 BUY
+        # 错误地占用限额。
+        self._daily_bought: dict[date, set[str]] = {}
 
     @staticmethod
     def _infer_candle_path(open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> list[Decimal]:
@@ -397,9 +577,25 @@ class BacktestRunner:
                     return "时间止损"
         return None
 
-    def run(self, all_klines: dict[str, list[KBar]]) -> dict[str, Any]:
-        """Run backtest for all stocks in the pool."""
+    def run(
+        self,
+        all_klines: dict[str, list[KBar]],
+        benchmark_klines: list[KBar] | None = None,
+        extra_klines: dict[str, list[KBar]] | None = None,
+    ) -> dict[str, Any]:
+        """Run backtest for all stocks in the pool.
+
+        ``benchmark_klines`` / ``extra_klines`` (optional) are precomputed
+        series injected into every strategy context so user code can read
+        benchmark / index / sector data via ``ctx.benchmark`` / ``ctx.extra``.
+        """
+        clear_ema_cache()  # Phase 2: 清空逐股 EMA 整段缓存，避免跨回测内存堆积
+        clear_roll_cache()  # Phase 3: 清空逐股 rolling(MA/HHV/LLV/STD/SUM/REF) 整段缓存
         self._all_klines = all_klines
+        self._benchmark_arrays = _StockArrays.from_klines(benchmark_klines) if benchmark_klines else None
+        self._extra_arrays = {
+            name: _StockArrays.from_klines(kl) for name, kl in (extra_klines or {}).items()
+        }
         self._stock_day_index = {code: 0 for code in self.config.stock_pool}
         trading_dates = self._get_trading_dates(all_klines)
         if not trading_dates:
@@ -413,6 +609,15 @@ class BacktestRunner:
             self.rebalance_planner = WeeklyRebalancePlanner(self.config, self)
 
         lookback = 60
+
+        # Phase 1: build per-stock numpy arrays once so the inner loop only
+        # does O(1) slices instead of rebuilding arrays every bar.
+        stock_arrays: dict[str, _StockArrays] = {}
+        for _code in self.config.stock_pool:
+            _kl = all_klines.get(_code)
+            if _kl:
+                stock_arrays[_code] = _StockArrays.from_klines(_kl)
+
         for i, td in enumerate(trading_dates):
             # Next trading day's date — used to look up the fill bar so that
             # orders generated "as of td" (using data through td-1) execute
@@ -473,8 +678,9 @@ class BacktestRunner:
 
                 # Strategy window EXCLUDES td's bar (index idx) to avoid
                 # lookahead bias. Strategy sees data through td-1 only.
-                window = klines[max(0, idx - lookback):idx]
-                if not window:
+                # O(1) slice window via precomputed arrays (Phase 1); skip the
+                # very first bar where the window would be empty.
+                if idx < 1:
                     continue
 
                 # Look up the fill bar (td+1's bar) for this stock using
@@ -552,7 +758,13 @@ class BacktestRunner:
                                 self.rebalance_planner.on_signal(ts_code, reason, td, has_position)
                     continue
 
-                ctx = BacktestContext(window, self.positions, total_asset, runner=self, ts_code=ts_code)
+                ctx = BacktestContext.from_arrays(
+                    stock_arrays[ts_code], idx, lookback,
+                    self.positions, total_asset, runner=self, ts_code=ts_code,
+                    benchmark_arrays=self._benchmark_arrays,
+                    all_klines=self._all_klines,
+                    extra_arrays=self._extra_arrays,
+                )
                 signal_result = self._exec_strategy(ctx, total_asset)
                 if not signal_result.ok:
                     self.strategy_errors.append({
@@ -621,6 +833,17 @@ class BacktestRunner:
 
             # ---- Phase 3: execute all buy candidates ----
             for candidate in sorted(buy_candidates, key=self._candidate_sort_key):
+                ts_code = candidate.ts_code
+                trade_date = self._effective_trade_date(candidate.bar, candidate.fill_bar)
+                if not self._daily_buy_allowed(ts_code, trade_date):
+                    signal_record = self._candidate_signal_record(candidate)
+                    signal_record["action"] = "BUY"
+                    signal_record["match_status"] = "BLOCKED"
+                    signal_record["reason"] = f"达到每日最大买入只数限制 ({self.config.max_daily_buys})"
+                    self.signals.append(signal_record)
+                    continue
+                pos_before = self.positions.get(ts_code)
+                shares_before = pos_before.shares if pos_before else 0
                 match_blocked_reason = self._execute_action(
                     candidate.action,
                     candidate.ts_code,
@@ -634,6 +857,11 @@ class BacktestRunner:
                 if match_blocked_reason:
                     signal_record["match_status"] = "BLOCKED"
                     signal_record["reason"] = match_blocked_reason
+                else:
+                    pos_after = self.positions.get(ts_code)
+                    # 仅在实际增加持仓份额时计入当日买入只数（占位无成交的 BUY 不占用限额）
+                    if pos_after is not None and pos_after.shares > shares_before:
+                        self._record_daily_buy(ts_code, trade_date)
                 self.signals.append(signal_record)
 
             # ---- Phase 4: weekly rebalance check (v2) ----
@@ -1185,6 +1413,36 @@ class BacktestRunner:
             return None
 
         return None
+
+    # ------------------------------------------------------------------
+    # 单日最大买入只数（max_daily_buys）
+    # ------------------------------------------------------------------
+
+    def _effective_trade_date(self, bar: KBar, fill_bar: KBar | None) -> date:
+        """成交发生日：next_open 模式且 fill_bar 可用时为 fill_bar 的交易日，
+        否则为信号当日的交易日。限额按成交日统计，与无未来函数执行模型一致。
+        """
+        if self._fill_price_mode() == "next_open" and fill_bar is not None:
+            return fill_bar.trade_date
+        return bar.trade_date
+
+    def _daily_buy_allowed(self, ts_code: str, trade_date: date) -> bool:
+        """该股票在 trade_date 当日是否仍可下单买入。
+
+        - max_daily_buys <= 0 表示不限制。
+        - 同一交易日已买入过的股票不重复占用限额（只计 1 只）。
+        - 否则当该日已买入股票数达到上限时返回 False。
+        """
+        if self.config.max_daily_buys <= 0:
+            return True
+        bought = self._daily_bought.setdefault(trade_date, set())
+        if ts_code in bought:
+            return True
+        return len(bought) < self.config.max_daily_buys
+
+    def _record_daily_buy(self, ts_code: str, trade_date: date) -> None:
+        """记录 trade_date 当日买入了一只股票（仅在实际增加持仓份额后调用）。"""
+        self._daily_bought.setdefault(trade_date, set()).add(ts_code)
 
     def _fill_price_mode(self) -> str:
         """Read BACKTEST_FILL_PRICE_MODE from settings, defaulting to 'next_open'.

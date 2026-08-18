@@ -456,7 +456,8 @@ async def get_backtest(
                    b.performance, b.trade_records, b.equity_curve,
                    b.status, b.error_message, b.created_at,
                    b.started_at, b.finished_at,
-                   s.name AS strategy_name, s.source_code
+                   s.name AS strategy_name, s.source_code,
+                   b.strategy_source_snapshot
             FROM backtest_results b
             LEFT JOIN strategies s ON s.id = b.strategy_id
             WHERE b.id = :id AND b.user_id = :user_id
@@ -521,6 +522,11 @@ async def get_backtest(
                     klines = await get_klines(session, ts_code, start_date, end_date)
                     kline_data[ts_code] = _serialize_kline_rows(klines)
                 payload["kline_data"] = kline_data
+
+    # 优先返回回测时快照的策略源码；历史记录（该列为 NULL）回退到实时源码，向后兼容。
+    snapshot = payload.get("strategy_source_snapshot")
+    if snapshot:
+        payload["source_code"] = snapshot
 
     return payload
 

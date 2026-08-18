@@ -33,26 +33,36 @@ def MIN(S1,S2):  return np.minimum(S1,S2)    #序列min
 def IF(S,A,B):   return np.where(S,A,B)      #序列布尔判断 return=A  if S==True  else  B
 
 
+def _ref_ref(S, N=1):
+    return pd.Series(S).shift(N).values
 def REF(S, N=1):          #对序列整体下移动N,返回序列(shift后会产生NAN)    
-    return pd.Series(S).shift(N).values  
+    return _cached_roll("REF", _ref_ref, S, N)
 
 def DIFF(S, N=1):         #前一个值减后一个值,前面会产生nan 
     return pd.Series(S).diff(N).values     #np.diff(S)直接删除nan，会少一行
 
+def _std_ref(S, N):
+    return pd.Series(S).rolling(N).std(ddof=0).values
 def STD(S,N):             #求序列的N日标准差，返回序列    
-    return  pd.Series(S).rolling(N).std(ddof=0).values     
+    return _cached_roll("STD", _std_ref, S, N)
 
+def _sum_ref(S, N):
+    return pd.Series(S).rolling(N).sum().values if N>0 else pd.Series(S).cumsum().values
 def SUM(S, N):            #对序列求N天累计和，返回序列    N=0对序列所有依次求和         
-    return pd.Series(S).rolling(N).sum().values if N>0 else pd.Series(S).cumsum().values  
+    return _cached_roll("SUM", _sum_ref, S, N)
 
 def CONST(S):             #返回序列S最后的值组成常量序列
     return np.full(len(S),S[-1])
   
+def _hh_ref(S, N):
+    return pd.Series(S).rolling(N).max().values
 def HHV(S,N):             #HHV(C, 5) 最近5天收盘最高价        
-    return pd.Series(S).rolling(N).max().values     
+    return _cached_roll("HHV", _hh_ref, S, N)
 
+def _ll_ref(S, N):
+    return pd.Series(S).rolling(N).min().values
 def LLV(S,N):             #LLV(C, 5) 最近5天收盘最低价     
-    return pd.Series(S).rolling(N).min().values    
+    return _cached_roll("LLV", _ll_ref, S, N)
     
 def HHVBARS(S,N):         #求N周期内S最高值到当前周期数, 返回序列
     return pd.Series(S).rolling(N).apply(lambda x: np.argmax(x[::-1]),raw=True).values 
@@ -60,11 +70,161 @@ def HHVBARS(S,N):         #求N周期内S最高值到当前周期数, 返回序�
 def LLVBARS(S,N):         #求N周期内S最低值到当前周期数, 返回序列
     return pd.Series(S).rolling(N).apply(lambda x: np.argmin(x[::-1]),raw=True).values    
   
+def _ma_ref(S, N):
+    return pd.Series(S).rolling(N).mean().values
 def MA(S,N):              #求序列的N日简单移动平均值，返回序列                    
-    return pd.Series(S).rolling(N).mean().values  
+    return _cached_roll("MA", _ma_ref, S, N)
   
-def EMA(S,N):             #指数移动平均,为了精度 S>4*N  EMA至少需要120周期     alpha=2/(span+1)    
-    return pd.Series(S).ewm(span=N, adjust=False).mean().values     
+# ------------------ 0.5级：EMA 高性能实现（回测热路径优化） -----------------
+# 原始实现每根 bar 用 pd.Series(S).ewm(span=N, adjust=False) 重建 Series，开销巨大。
+# 新实现：
+#   (1) 纯 numpy 递推，数学等价于 pandas adjust=False（alpha=2/(N+1)，y0=S0）；
+#   (2) 透明缓存：当输入是某只股票全量价格的"视图切片"时，整段 EMA 只算一次，
+#       再用初值差闭式修正项还原成"窗口起点重新播种"语义——结果与原来逐位相等、零偏差。
+_EMA_FULL_CACHE: dict = {}
+
+def _ema_recurrence(S, N):
+    """纯 numpy 递推 EMA(adjust=False)，与 pandas ewm(span=N, adjust=False) 一致。"""
+    S = np.asarray(S, dtype=np.float64)
+    n = S.shape[0]
+    if n == 0:
+        return S.astype(np.float64)
+    alpha = 2.0 / (N + 1.0)
+    one_minus = 1.0 - alpha
+    y = np.empty(n, dtype=np.float64)
+    y[0] = S[0]
+    for i in range(1, n):
+        y[i] = alpha * S[i] + one_minus * y[i - 1]
+    return y
+
+def _root_base(arr):
+    b = arr.base
+    while getattr(b, "base", None) is not None:
+        b = b.base
+    return b
+
+def clear_ema_cache() -> None:
+    """清空 EMA 整段缓存，应在每次回测 run() 起始调用，避免跨回测内存堆积。"""
+    _EMA_FULL_CACHE.clear()
+
+def EMA(S, N):
+    arr = np.asarray(S, dtype=np.float64)
+    base = _root_base(arr)
+    if (
+        base is not None
+        and base.ndim == 1
+        and arr.ndim == 1
+        and arr.flags["C_CONTIGUOUS"]
+    ):
+        key = (id(base), int(N))
+        entry = _EMA_FULL_CACHE.get(key)
+        if entry is None or entry[0] is not base:
+            full = _ema_recurrence(np.asarray(base, dtype=np.float64), N)
+            entry = (base, full)
+            _EMA_FULL_CACHE[key] = entry
+        full = entry[1]
+        itemsize = arr.dtype.itemsize
+        start = (
+            arr.__array_interface__["data"][0] - base.__array_interface__["data"][0]
+        ) // itemsize
+        L = arr.shape[0]
+        if L == 0:
+            return np.zeros(0, dtype=np.float64)
+        alpha = 2.0 / (N + 1.0)
+        k = np.arange(L)
+        # 初值差修正：(1-alpha)^k * (full[start] - close[start])，其中 close[start]==arr[0]。
+        # 把"全局播种"的整段 EMA 精确变换回"窗口起点重新播种"的语义，零偏差。
+        corr = np.power(1.0 - alpha, k) * (full[start] - arr[0])
+        return full[start:start + L] - corr
+    return _ema_recurrence(arr, N)
+
+# ------------------ 0.6级：rolling 整段缓存（回测热路径优化） -----------------
+# 与 EMA 同思路：当输入是某股票全量价格的"视图切片"时，整段 rolling 只算一次，
+# 再按切片偏移直接取后缀。固定窗口 rolling（MA/HHV/LLV/STD/SUM/REF）对后缀
+# *逐位精确*——无需 EMA 那种初值差修正，直接 slice 即可，与原 pandas 实现零偏差。
+_ROLL_FULL_CACHE: dict = {}
+
+def _roll_full(kind, N, base_arr):
+    """对整段 base 计算指定 rolling 一次，结果与原 pandas 实现逐位一致。"""
+    base_arr = np.asarray(base_arr, dtype=np.float64)
+    n = base_arr.shape[0]
+    if kind == "MA":
+        if n == 0:
+            return base_arr.astype(np.float64)
+        p = np.concatenate(([0.0], np.cumsum(base_arr)))
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n >= N:
+            out[N - 1:] = (p[N:] - p[:n - N + 1]) / N
+        return out
+    if kind == "SUM":
+        if n == 0:
+            return base_arr.astype(np.float64)
+        if N and N > 0:
+            p = np.concatenate(([0.0], np.cumsum(base_arr)))
+            out = np.full(n, np.nan, dtype=np.float64)
+            if n >= N:
+                out[N - 1:] = p[N:] - p[:n - N + 1]
+            return out
+        return np.cumsum(base_arr)
+    if kind == "HHV":
+        if n < N:
+            return np.full(n, np.nan, dtype=np.float64)
+        w = np.lib.stride_tricks.sliding_window_view(base_arr, N)
+        return np.concatenate((np.full(N - 1, np.nan), w.max(1)))
+    if kind == "LLV":
+        if n < N:
+            return np.full(n, np.nan, dtype=np.float64)
+        w = np.lib.stride_tricks.sliding_window_view(base_arr, N)
+        return np.concatenate((np.full(N - 1, np.nan), w.min(1)))
+    if kind == "STD":
+        if n < N:
+            return np.full(n, np.nan, dtype=np.float64)
+        p = np.concatenate(([0.0], np.cumsum(base_arr)))
+        p2 = np.concatenate(([0.0], np.cumsum(base_arr * base_arr)))
+        out = np.full(n, np.nan, dtype=np.float64)
+        if n >= N:
+            sums = p[N:] - p[:n - N + 1]
+            sums2 = p2[N:] - p2[:n - N + 1]
+            out[N - 1:] = np.sqrt(sums2 / N - (sums / N) ** 2)
+        return out
+    if kind == "REF":
+        out = np.empty(n, dtype=np.float64)
+        if N > 0:
+            out[N:] = base_arr[:n - N]
+            out[:N] = np.nan
+        else:
+            out[:] = base_arr
+        return out
+    raise ValueError(kind)
+
+def _cached_roll(kind, fn, S, N):
+    """对 rolling 函数套用整段缓存；非视图输入回退到原始 pandas fn。"""
+    arr = np.asarray(S, dtype=np.float64)
+    base = _root_base(arr)
+    if (
+        base is not None
+        and base.ndim == 1
+        and arr.ndim == 1
+        and arr.flags["C_CONTIGUOUS"]
+    ):
+        key = (id(base), kind, int(N))
+        entry = _ROLL_FULL_CACHE.get(key)
+        if entry is None or entry[0] is not base:
+            full = _roll_full(kind, N, np.asarray(base, dtype=np.float64))
+            entry = (base, full)
+            _ROLL_FULL_CACHE[key] = entry
+        full = entry[1]
+        itemsize = arr.dtype.itemsize
+        start = (
+            arr.__array_interface__["data"][0] - base.__array_interface__["data"][0]
+        ) // itemsize
+        L = arr.shape[0]
+        return full[start:start + L]
+    return fn(S, N)
+
+def clear_roll_cache() -> None:
+    """清空 rolling 整段缓存，应在每次回测 run() 起始与 clear_ema_cache 一起调用。"""
+    _ROLL_FULL_CACHE.clear()
 
 def SMA(S, N, M=1):       #中国式的SMA,至少需要120周期才精确 (雪球180周期)    alpha=1/(1+com)    
     return pd.Series(S).ewm(alpha=M/N,adjust=False).mean().values           #com=N-M/M

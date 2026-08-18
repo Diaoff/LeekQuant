@@ -24,6 +24,7 @@ export interface BacktestRunParams {
   rank_buffer_pct: string
   score_max_age_sessions: string
   max_positions: string
+  max_daily_buys: string
   preservedConfig: Record<string, unknown>
 }
 
@@ -67,6 +68,7 @@ const VISIBLE_CONFIG_KEYS = [
   'time_stop_days',
   'rebalance_mode',
   'max_positions',
+  'max_daily_buys',
   'rebalance_version',
   'rebalance_frequency',
   'weighting_method',
@@ -145,6 +147,7 @@ export function createDefaultBacktestRunParams(now = new Date()): BacktestRunPar
     rank_buffer_pct: '0.20',
     score_max_age_sessions: '5',
     max_positions: '0',
+    max_daily_buys: '0',
     preservedConfig: {},
   }
 }
@@ -227,6 +230,7 @@ export function mapHistoricalBacktestRun(result: HistoricalBacktestResult): Back
     rank_buffer_pct: '0.20',
     score_max_age_sessions: '5',
     max_positions: displayNumber(configValue('max_positions')) || '0',
+    max_daily_buys: displayNumber(configValue('max_daily_buys')) || '0',
     preservedConfig: { ...config },
   }
 }
@@ -264,6 +268,10 @@ function buildConfig(params: BacktestRunParams): Record<string, unknown> {
   const maxPositions = finiteNumber(params.max_positions)
   if (params.rebalance_mode !== 'disabled' && maxPositions !== null && maxPositions > 0) {
     config.max_positions = maxPositions
+  }
+  const maxDailyBuys = finiteNumber(params.max_daily_buys)
+  if (maxDailyBuys !== null && maxDailyBuys > 0) {
+    config.max_daily_buys = maxDailyBuys
   }
   return config
 }

@@ -325,7 +325,8 @@ export default function StatusPage() {
         setNotice(`小样本 K 线任务已提交：${result.task_id}`)
       }
       if (action === 'all-kline') {
-        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sync-all-kline', { method: 'POST', body: JSON.stringify({}) })
+        const startDate = `${new Date().getFullYear() - 2}-01-01`
+        const result = await fetchJson<{ task_id: string }>('/api/tasks/data/sync-all-kline', { method: 'POST', body: JSON.stringify({ start_date: startDate }) })
         setNotice(`全量 K 线同步任务已提交：${result.task_id}`)
         setProgressTaskId(result.task_id)
         setProgressTaskKind('all-kline')

@@ -42,6 +42,9 @@ function validate(params: BacktestRunParams, watchlistGroups: WatchlistGroupOpti
   if (!params.max_positions.trim() || !Number.isInteger(Number(params.max_positions)) || Number(params.max_positions) < 0) {
     return '最大持仓数必须是非负整数'
   }
+  if (!params.max_daily_buys.trim() || !Number.isInteger(Number(params.max_daily_buys)) || Number(params.max_daily_buys) < 0) {
+    return '单日最大买入只数必须是非负整数'
+  }
   if (params.rebalance_mode === 'ranked' && params.rebalance_version === 2 && Number(params.max_positions) < 1) {
     return 'v2 调仓时最大持仓数至少为 1'
   }
@@ -223,6 +226,11 @@ export default function BacktestRunModal({ title, submitLabel, initialParams, wa
             <label className="text-sm font-medium text-muted">止盈 %（可选）<input type="number" min="0" step="0.1" value={params.take_profit_pct} onChange={(event) => setParams({ ...params, take_profit_pct: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
             <label className="text-sm font-medium text-muted">移动止损 %（可选）<input type="number" min="0" step="0.1" value={params.trailing_stop_pct} onChange={(event) => setParams({ ...params, trailing_stop_pct: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
             <label className="text-sm font-medium text-muted">最大持仓天数（可选）<input type="number" min="1" step="1" value={params.time_stop_days} onChange={(event) => setParams({ ...params, time_stop_days: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label className="text-sm font-medium text-muted">单日最大买入只数（可选）<input type="number" min="0" step="1" value={params.max_daily_buys} onChange={(event) => setParams({ ...params, max_daily_buys: event.target.value })} placeholder="0=不限" className={`mt-1 ${inputClass}`} /></label>
+            <p className="mt-6 text-xs leading-relaxed text-muted">限制每个交易日实际建仓（买入）的股票数量，避免一天内集中买入导致过早满仓，使资金分配更平滑、仓位控制更合理。0 表示不限制。</p>
           </div>
           {(error || submitError) && <p id={errorId} role="alert" className="text-sm text-red-600">{error ?? submitError}</p>}
         </div>

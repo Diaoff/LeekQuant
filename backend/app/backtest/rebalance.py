@@ -387,6 +387,12 @@ class WeeklyRebalancePlanner:
                 order.blocked_reason = '涨停不可买入'
                 continue
 
+            # 单日最大买入只数限制：调仓买入同样计入当日限额
+            if not self.runner._daily_buy_allowed(order.ts_code, bar.trade_date):
+                order.status = 'blocked'
+                order.blocked_reason = f"达到每日最大买入只数限制 ({self.runner.config.max_daily_buys})"
+                continue
+
             total_asset = self.runner._calc_total_asset(self.runner._all_klines, bar.trade_date)
             if total_asset <= 0:
                 order.status = 'blocked'
@@ -399,6 +405,8 @@ class WeeklyRebalancePlanner:
             target_weight = min(target_weight, 1.0)
 
             action = SignalOutput(action="BUY", target_position=target_weight)
+            pos_before = self.runner.positions.get(order.ts_code)
+            shares_before = pos_before.shares if pos_before else 0
             result = self.runner._execute_action(
                 action, order.ts_code, bar, total_asset,
                 signal={"signal_type": "调仓", "reason": order.reason},
@@ -409,6 +417,9 @@ class WeeklyRebalancePlanner:
                 order.executed_shares = order.planned_shares
                 order.fill_price = bar.open
                 total_turnover += price * order.planned_shares
+                pos_after = self.runner.positions.get(order.ts_code)
+                if pos_after is not None and pos_after.shares > shares_before:
+                    self.runner._record_daily_buy(order.ts_code, bar.trade_date)
             else:
                 order.status = 'blocked'
                 order.blocked_reason = result
