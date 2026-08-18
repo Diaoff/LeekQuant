@@ -43,6 +43,11 @@ generate_signal 内部实现软止损/止盈。近似价与真实成交价（次
 
 关键约束：策略上下文 ctx 仅暴露最近 60 根 K 线（滑窗），因此 trend_ma 必须
 < 60 且留余量，否则长均线在窗口边缘无有效值。
+
+进阶：ctx.benchmark（大盘指数窗口，同样按当前交易日对齐、天然防前视）可用于
+大盘择时闸门——只在市场处于多头时开仓、弱势市道直接观望，这是降低回撤最划算
+的一步。需回测配置 benchmark_code（如 000300.SH）才能生效；未配置则自动降级为
+"不约束"。ctx.extra / ctx.all_klines 也已在引擎层就绪，可按需接入行业/横截面数据。
 """
 
 # ============================ 可调参数 ============================
@@ -51,6 +56,15 @@ PARAMS = {
     "trend_ma": 40,            # 长期均线周期(必须<60)。↑调大=只做强趋势、信号更少更干净；↓调小=信号更多但噪声大
     "fast_ma": 20,             # 中期均线周期(回调参考/多空分界)。默认20
     "min_up_pct": 0.05,        # 价格需比 trend_ma 根前高出至少该比例，才算"已确立上行趋势"。↑更严格
+
+    # ---- 大盘择时闸门（新增：ctx.benchmark）----
+    # 仅在市场处于多头时开仓，弱势市道直接观望。这是控制回撤最划算的一步，
+    # 依赖回测配置里的 benchmark_code（如 000300.SH）。若回测未配置 benchmark，
+    # 闸门自动降级为"不约束"（策略仍可正常运行）。
+    "benchmark_trend_filter": True,    # 是否启用大盘择时闸门。False=忽略大盘、只按个股信号交易
+    "benchmark_ma": 20,                # 大盘均线周期(<60)。价格需在其上方且均线上扬才视为多头
+    "benchmark_min_up_pct": 0.0,       # 大盘需较 benchmark_ma 根前上涨至少该比例，否则视为弱势。↑更严格
+    "benchmark_rs_filter": False,      # 是否额外要求"个股强于大盘"（个股近期涨幅 >= 大盘），专挑领涨股
 
     # ---- 入场：趋势内浅回调 ----
     "pullback_pct": 0.03,      # 价格相对 fast_ma 的最大正向偏离(回调深度阈值)，超过则不视为回调。↓=只在更浅的回调买
@@ -163,6 +177,29 @@ def generate_signal(ctx):
     if ref > 0 and (price - ref) / ref < P["min_up_pct"]:
         return {"signal_type": "观望", "confidence": 0.0}
 
+    # --- 大盘择时闸门（ctx.benchmark）：只在市场多头时开仓 ---
+    # ctx.benchmark 返回按当前 trade_date 对齐的只读窗口（末根=上一交易日，防前视），
+    # 未配置 benchmark_code 时为 None，此时闸门降级放行。
+    if P["benchmark_trend_filter"]:
+        bench = ctx.benchmark
+        bm = P["benchmark_ma"]
+        if bench is not None and bench.bar_count >= bm + 1:
+            b_close = bench.close
+            b_ma = float(MA(b_close, bm)[-1])
+            b_price = float(b_close[-1])
+            b_ref = float(b_close[-bm]) if bench.bar_count > bm else float(b_close[0])
+            # 大盘多头判定：价格在均线上方（趋势向上）且较 bm 根前上涨达标
+            if b_price <= b_ma:
+                return {"signal_type": "观望", "confidence": 0.0, "reason": "大盘空头(价在均线下)"}
+            if b_ref > 0 and (b_price - b_ref) / b_ref < P["benchmark_min_up_pct"]:
+                return {"signal_type": "观望", "confidence": 0.0, "reason": "大盘弱势(涨幅不足)"}
+            # 个股相对大盘强势过滤（可选）：只挑领涨股，回避逆市下跌股
+            if P["benchmark_rs_filter"] and n >= bm and bench.bar_count >= bm:
+                stock_ret = (price - float(close[-bm])) / float(close[-bm]) if float(close[-bm]) > 0 else 0.0
+                bench_ret = (b_price - b_ref) / b_ref if b_ref > 0 else 0.0
+                if stock_ret < bench_ret:
+                    return {"signal_type": "观望", "confidence": 0.0, "reason": "个股弱于大盘"}
+
     # --- 波动率过滤（控制回撤关键）---
     atr = ATR(close, high, low, P["atr_len"])
     atr_pct = float(atr[-1]) / price if price > 0 else 0.0
@@ -234,3 +271,7 @@ def generate_signal(ctx):
 #   slippage_pct            = 0.001  (默认)
 #
 # 若忘记设置，本策略仍靠内部自包含止损/止盈退出，但建议两者保持一致以避免重复触发。
+#
+# ⚠️ 启用大盘择时闸门：回测配置的「基准代码(benchmark_code)」务必设为 000300.SH
+#    （沪深300）；否则 ctx.benchmark 为 None，闸门自动降级为"不约束"。
+#    设置路径：回测配置 → 基准代码。也可换 399006.SZ(创业板指) 等。
