@@ -348,3 +348,142 @@ def test_baostock_run_serializes_login_logout_across_threads(monkeypatch) -> Non
         assert chunk == ["login-start", "login-end", "logout-start", "logout-end"], (
             f"call {i} interleaved: {chunk} (full log: {call_log})"
         )
+
+
+def _install_fake_baostock_quarterly(monkeypatch, profit_rows=None, growth_rows=None):
+    """注入带 query_profit_data / query_growth_data 的 fake baostock，记录调用序列。"""
+    import sys
+
+    call_log: list[str] = []
+
+    class FakeLoginResult:
+        error_code = "0"
+        error_msg = ""
+
+    class FakeResult:
+        def __init__(self, rows):
+            self._rows = list(rows)
+            self._index = 0
+            self.error_code = "0"
+            self.error_msg = ""
+            self.fields = list(rows[0].keys()) if rows else []
+
+        def next(self) -> bool:
+            if self._index < len(self._rows):
+                return True
+            return False
+
+        def get_row_data(self):
+            if self._index >= len(self._rows):
+                return []
+            row = self._rows[self._index]
+            self._index += 1
+            return [str(row.get(f, "")) for f in self.fields]
+
+    class FakeBs:
+        @staticmethod
+        def login():
+            call_log.append("login")
+            return FakeLoginResult()
+
+        @staticmethod
+        def logout():
+            call_log.append("logout")
+
+        @staticmethod
+        def query_profit_data(code=None, year=None, quarter=None):
+            call_log.append(f"profit:{year}Q{quarter}")
+            # 真实 Baostock 每季度只返回当期行；fake 仅 2025Q1 返回
+            if (year, quarter) == (2025, 1):
+                return FakeResult(profit_rows or [])
+            return FakeResult([])
+
+        @staticmethod
+        def query_growth_data(code=None, year=None, quarter=None):
+            call_log.append(f"growth:{year}Q{quarter}")
+            if (year, quarter) == (2025, 1):
+                return FakeResult(growth_rows or [])
+            return FakeResult([])
+
+    baostock_module = ModuleType("baostock")
+    baostock_module.login = FakeBs.login  # type: ignore[attr-defined]
+    baostock_module.logout = FakeBs.logout  # type: ignore[attr-defined]
+    baostock_module.query_profit_data = FakeBs.query_profit_data  # type: ignore[attr-defined]
+    baostock_module.query_growth_data = FakeBs.query_growth_data  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "baostock", baostock_module)
+    return {"call_log": call_log}
+
+
+def test_baostock_fetch_profit_data_maps_roe_and_dates(monkeypatch) -> None:
+    state = _install_fake_baostock_quarterly(
+        monkeypatch,
+        profit_rows=[{
+            "code": "sz.300389",
+            "pubDate": "2025-04-28",
+            "statDate": "2025-03-31",
+            "roeAvg": "12.34",
+            "gpMargin": "30.10",
+            "netProfit": "120000000.00",
+        }],
+    )
+    records = BaostockProvider().fetch_profit_data(
+        ["300389.SZ"], date(2025, 1, 1), date(2025, 12, 31)
+    )
+    assert len(records) == 1
+    r = records[0]
+    assert r.ts_code == "300389.SZ"
+    assert r.report_date == date(2025, 3, 31)
+    assert r.announce_date == date(2025, 4, 28)
+    assert r.roe == Decimal("12.34")
+    assert r.gross_margin == Decimal("30.10")
+    assert r.net_profit == Decimal("120000000.00")
+    assert r.data_source == "baostock_profit"
+    # 逐季度调用：start 2025-01-01 → year 2024..2025，共 8 个季度
+    assert sum(1 for c in state["call_log"] if c.startswith("profit:")) == 8
+    assert state["call_log"][0] == "login"
+    assert state["call_log"][-1] == "logout"
+
+
+def test_baostock_fetch_growth_data_maps_yoy_fields(monkeypatch) -> None:
+    _install_fake_baostock_quarterly(
+        monkeypatch,
+        growth_rows=[{
+            "code": "sz.300389",
+            "pubDate": "2025-04-28",
+            "statDate": "2025-03-31",
+            "YOYNI": "45.6",
+            "YOYPNI": "42.3",
+        }],
+    )
+    records = BaostockProvider().fetch_growth_data(
+        ["300389.SZ"], date(2025, 1, 1), date(2025, 12, 31)
+    )
+    assert len(records) == 1
+    r = records[0]
+    assert r.revenue_growth == Decimal("45.6")
+    assert r.net_profit_growth == Decimal("42.3")
+    assert r.data_source == "baostock_growth"
+
+
+def test_parse_ohlc_adaptive_stock_format() -> None:
+    """个股 qfqday 格式 [日期,开,收,高,低,量]。"""
+    from app.data.providers import _parse_ohlc_adaptive
+    # open=10.0 close=10.5 high=11.0 low=9.5
+    ohlc = _parse_ohlc_adaptive(["2026-08-12", "10.0", "10.5", "11.0", "9.5", "1000"])
+    assert ohlc == (10.0, 10.5, 11.0, 9.5)
+
+
+def test_parse_ohlc_adaptive_index_format() -> None:
+    """指数 day 格式 [日期,开,高,低,收,量]。"""
+    from app.data.providers import _parse_ohlc_adaptive
+    # open=3000 close=3050 high=3100 low=2950
+    ohlc = _parse_ohlc_adaptive(["2026-08-12", "3000", "3100", "2950", "3050", "1000"])
+    assert ohlc == (3000.0, 3050.0, 3100.0, 2950.0)
+
+
+def test_parse_ohlc_adaptive_rejects_invalid() -> None:
+    """全 0 / 负值 / 列序全不合法 → None（停牌日等异常行跳过）。"""
+    from app.data.providers import _parse_ohlc_adaptive
+    assert _parse_ohlc_adaptive(["2026-08-12", "0", "0", "0", "0", "0"]) is None
+    assert _parse_ohlc_adaptive(["2026-08-12", "-1", "2", "3", "4", "5"]) is None
+    assert _parse_ohlc_adaptive(["2026-08-12", "abc", "1", "2", "3", "4"]) is None

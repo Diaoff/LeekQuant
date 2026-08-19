@@ -3,8 +3,63 @@ from decimal import Decimal
 
 import pytest
 
-from app.data.normalizers import normalize_daily_kline, normalize_stock_basic, normalize_trade_calendar
+from app.data.normalizers import (
+    normalize_daily_kline,
+    normalize_stock_basic,
+    normalize_stock_fundamental,
+    normalize_trade_calendar,
+)
 from app.data.validators import DataValidationError, validate_daily_kline
+
+
+def test_normalize_stock_fundamental_maps_baostock_profit_fields() -> None:
+    """Baostock query_profit_data 字段（roeAvg/gpMargin/netProfit/statDate/pubDate）映射。"""
+    record = normalize_stock_fundamental(
+        {
+            "code": "sz.300389",
+            "pubDate": "2025-04-28",
+            "statDate": "2025-03-31",
+            "roeAvg": "12.34",
+            "npMargin": "8.5",
+            "gpMargin": "30.1",
+            "netProfit": "120000000.00",
+            "epsTTM": "0.85",
+        },
+        "baostock_profit",
+    )
+
+    assert record.ts_code == "300389.SZ"
+    assert record.report_date == date(2025, 3, 31)
+    assert record.announce_date == date(2025, 4, 28)
+    assert record.roe == Decimal("12.34")
+    assert record.gross_margin == Decimal("30.1")
+    assert record.net_profit == Decimal("120000000.00")
+    assert record.data_source == "baostock_profit"
+    assert record.income_statement is not None  # baostock_profit 钩子存整行审计
+
+
+def test_normalize_stock_fundamental_maps_baostock_growth_fields() -> None:
+    """Baostock query_growth_data 字段（YOYNI/YOYPNI/statDate/pubDate）映射。"""
+    record = normalize_stock_fundamental(
+        {
+            "code": "sz.300389",
+            "pubDate": "2025-04-28",
+            "statDate": "2025-03-31",
+            "YOYEquity": "5.1",
+            "YOYAsset": "8.2",
+            "YOYNI": "45.6",
+            "YOYEPSBasic": "30.0",
+            "YOYPNI": "42.3",
+        },
+        "baostock_growth",
+    )
+
+    assert record.ts_code == "300389.SZ"
+    assert record.report_date == date(2025, 3, 31)
+    assert record.announce_date == date(2025, 4, 28)
+    assert record.revenue_growth == Decimal("45.6")
+    assert record.net_profit_growth == Decimal("42.3")
+    assert record.data_source == "baostock_growth"
 
 
 @pytest.mark.parametrize("name_field", ["short_name", "code_name", "name", "证券简称"])

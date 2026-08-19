@@ -579,6 +579,7 @@ def test_sync_sample_kline_task_honors_concurrency(monkeypatch) -> None:
         progress_callback=None,
         commit_each=False,
         concurrency=1,
+        from_listing=False,
     ):
         captured["sync"] = {"commit_each": commit_each, "concurrency": concurrency}
         return {"requested_symbols": 1, "inserted_or_updated": 1, "source_counts": {}, "failures": []}
@@ -596,6 +597,45 @@ def test_sync_sample_kline_task_honors_concurrency(monkeypatch) -> None:
     assert result["requested_symbols"] == 1
     assert captured["payload"]["concurrency"] == 3
     assert captured["sync"] == {"commit_each": True, "concurrency": 3}
+
+
+def test_sync_sample_kline_task_from_listing_defaults_start_to_2015(monkeypatch) -> None:
+    from app.tasks import data_tasks
+
+    captured = {}
+
+    class _NullSession:
+        async def close(self):
+            return None
+
+    async def fake_run_tracked(task_name, task_id, payload, fn):
+        captured["payload"] = payload
+        return await fn(_FakeFactory(_NullSession()))
+
+    async def fake_sync_kline(session, ts_codes, start_date, end_date, **kwargs):
+        captured["sync"] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "from_listing": kwargs.get("from_listing"),
+        }
+        return {"requested_symbols": 1, "inserted_or_updated": 1, "source_counts": {}, "failures": []}
+
+    monkeypatch.setattr(data_tasks, "_run_tracked", fake_run_tracked)
+    monkeypatch.setattr(data_tasks, "sync_kline", fake_sync_kline)
+
+    result = data_tasks.sync_sample_kline.run(
+        ts_codes=["000001.SZ"],
+        from_listing=True,
+    )
+
+    assert result["requested_symbols"] == 1
+    assert captured["payload"]["from_listing"] is True
+    assert captured["payload"]["start_date"] == date(2015, 1, 1)
+    assert captured["sync"] == {
+        "start_date": date(2015, 1, 1),
+        "end_date": captured["payload"]["end_date"],
+        "from_listing": True,
+    }
 
 
 def test_run_tracked_claims_pending_task_run(monkeypatch) -> None:

@@ -42,6 +42,9 @@ class FakeResult:
     def all(self):
         return self._rows
 
+    def fetchall(self):
+        return self._rows
+
     def mappings(self):
         return self
 
@@ -245,6 +248,110 @@ async def test_sync_kline_keeps_serial_transaction_when_commit_each_is_false(mon
 
     assert result["requested_symbols"] == 2
     assert session.commits == 1
+
+
+async def test_sync_kline_from_listing_uses_list_date_as_start(monkeypatch) -> None:
+    import app.data.service as service
+
+    class ListDateSession(FakeSession):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "COALESCE(is_st" in sql:
+                return FakeResult([])
+            if "MAX(failure_count)" in sql:
+                return FakeResult([])
+            if "list_date" in sql:
+                return FakeResult([("000001.SZ", date(2010, 6, 1))])
+            return FakeResult([])
+
+    captured = {}
+
+    class CapturingProvider:
+        name = "listing"
+
+        def fetch_daily_kline(self, ts_code, start_date, end_date):
+            captured["start_date"] = start_date
+            captured["end_date"] = end_date
+            return [
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=start_date,
+                    open=10,
+                    high=11,
+                    low=9,
+                    close=10.5,
+                    data_source=self.name,
+                )
+            ]
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+
+    result = await sync_kline(
+        ListDateSession(),
+        ["000001.SZ"],
+        date(2015, 1, 1),
+        date(2026, 5, 30),
+        providers=[CapturingProvider()],
+        from_listing=True,
+    )
+
+    assert captured["start_date"] == date(2010, 6, 1)
+    assert captured["end_date"] == date(2026, 5, 30)
+    assert result["inserted_or_updated"] == 1
+
+
+async def test_sync_kline_from_listing_falls_back_without_list_date(monkeypatch) -> None:
+    import app.data.service as service
+
+    class NoListDateSession(FakeSession):
+        async def execute(self, statement, params=None):
+            sql = str(statement)
+            if "COALESCE(is_st" in sql:
+                return FakeResult([])
+            if "MAX(failure_count)" in sql:
+                return FakeResult([])
+            if "list_date" in sql:
+                return FakeResult([])
+            return FakeResult([])
+
+    captured = {}
+
+    class CapturingProvider:
+        name = "listing"
+
+        def fetch_daily_kline(self, ts_code, start_date, end_date):
+            captured["start_date"] = start_date
+            return [
+                DailyKline(
+                    ts_code=ts_code,
+                    trade_date=start_date,
+                    open=10,
+                    high=11,
+                    low=9,
+                    close=10.5,
+                    data_source=self.name,
+                )
+            ]
+
+    async def fake_upsert_daily_kline(_session, records):
+        return len(records)
+
+    monkeypatch.setattr(service, "upsert_daily_kline", fake_upsert_daily_kline)
+
+    result = await sync_kline(
+        NoListDateSession(),
+        ["000001.SZ"],
+        date(2015, 1, 1),
+        date(2026, 5, 30),
+        providers=[CapturingProvider()],
+        from_listing=True,
+    )
+
+    assert captured["start_date"] == date(2015, 1, 1)
+    assert result["inserted_or_updated"] == 1
 
 
 async def test_sync_kline_writes_quality_alert_for_missing_adj_factor(monkeypatch) -> None:

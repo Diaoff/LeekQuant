@@ -213,6 +213,7 @@ async def sync_kline(
     commit_each: bool = False,
     concurrency: int = 1,
     session_factory: Callable[[], AsyncContextManager[AsyncSession]] | None = None,
+    from_listing: bool = False,
 ) -> dict[str, Any]:
     from app.db.session import async_session_factory as _per_stock_sf
 
@@ -250,6 +251,26 @@ async def sync_kline(
     else:
         filtered_provider_list = await filter_open_circuits(setup_session_cm, provider_list, "daily_kline")
         is_st_by_code = await _bulk_load_is_st(setup_session_cm, codes)
+
+    # from_listing: 每股起点取其上市日（list_date）；list_date 缺失或晚于 end 时
+    # 兜底用 start_date（sync_all_klines.py --start 的默认 2015-01-01）。
+    start_by_code: dict[str, date] = {}
+    if from_listing:
+        list_sql = text("SELECT ts_code, list_date FROM stock_basic WHERE ts_code = ANY(:codes)")
+        if setup_session_cm is not None:
+            rows = (await setup_session_cm.execute(list_sql, {"codes": codes})).fetchall()
+        else:
+            async with per_stock_session_factory() as list_session:
+                rows = (await list_session.execute(list_sql, {"codes": codes})).fetchall()
+        start_by_code = {row[0]: row[1] for row in rows if row[1] is not None}
+
+    def effective_start_for(ts_code: str) -> date:
+        if not from_listing:
+            return start_date
+        listed = start_by_code.get(ts_code)
+        if listed is None or listed > end_date:
+            return start_date
+        return listed
 
     if not filtered_provider_list:
         # All providers' circuits are open — install a sync stub that raises
@@ -318,7 +339,7 @@ async def sync_kline(
                             providers_for_each,
                             "fetch_daily_kline",
                             ts_code,
-                            start_date,
+                            effective_start_for(ts_code),
                             end_date,
                             proxy_url=get_data_proxy_url(),
                         ),
@@ -333,7 +354,7 @@ async def sync_kline(
                         wk_session,
                         ts_code=ts_code,
                         source=source,
-                        start_date=start_date,
+                        start_date=effective_start_for(ts_code),
                         end_date=end_date,
                         issues=quality_issues,
                     )
@@ -355,7 +376,7 @@ async def sync_kline(
                     providers_for_each,
                     "fetch_daily_kline",
                     ts_code,
-                    start_date,
+                    effective_start_for(ts_code),
                     end_date,
                     proxy_url=get_data_proxy_url(),
                 ),
@@ -371,7 +392,7 @@ async def sync_kline(
                 session,
                 ts_code=ts_code,
                 source=source,
-                start_date=start_date,
+                start_date=effective_start_for(ts_code),
                 end_date=end_date,
                 issues=quality_issues,
             )

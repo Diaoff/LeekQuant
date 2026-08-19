@@ -254,6 +254,49 @@ class _SeriesView:
         return self._cut + 1
 
 
+@dataclass(slots=True, frozen=True)
+class _FundamentalsSnapshot:
+    """最近一期已公告财报的只读快照（引擎按决策日防前视截取）。
+
+    属性缺失时为 None；策略侧只需读标量（如 ``ctx.fundamentals.roe``），
+    无需关心日期逻辑——防前视由引擎保证（``announce_date <= 决策日``）。
+    """
+
+    ts_code: str
+    report_date: date | None = None
+    announce_date: date | None = None
+    roe: Decimal | None = None
+    revenue_growth: Decimal | None = None
+    net_profit_growth: Decimal | None = None
+    gross_margin: Decimal | None = None
+    net_profit: Decimal | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "_FundamentalsSnapshot":
+        return cls(
+            ts_code=str(row.get("ts_code") or ""),
+            report_date=row.get("report_date"),
+            announce_date=row.get("announce_date"),
+            roe=row.get("roe"),
+            revenue_growth=row.get("revenue_growth"),
+            net_profit_growth=row.get("net_profit_growth"),
+            gross_margin=row.get("gross_margin"),
+            net_profit=row.get("net_profit"),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ts_code": self.ts_code,
+            "report_date": self.report_date.isoformat() if self.report_date else None,
+            "announce_date": self.announce_date.isoformat() if self.announce_date else None,
+            "roe": float(self.roe) if self.roe is not None else None,
+            "revenue_growth": float(self.revenue_growth) if self.revenue_growth is not None else None,
+            "net_profit_growth": float(self.net_profit_growth) if self.net_profit_growth is not None else None,
+            "gross_margin": float(self.gross_margin) if self.gross_margin is not None else None,
+            "net_profit": float(self.net_profit) if self.net_profit is not None else None,
+        }
+
+
 class BacktestContext:
     """Context object exposed to user strategy code."""
 
@@ -268,6 +311,7 @@ class BacktestContext:
         benchmark_arrays: "_StockArrays | None" = None,
         all_klines: "dict[str, list[KBar]] | None" = None,
         extra_arrays: "dict[str, _StockArrays] | None" = None,
+        fundamental_rows: "dict[str, list[dict[str, Any]]] | None" = None,
     ):
         # Legacy / test path: a full (or window) klines list is supplied and the
         # whole thing is exposed as the context window.
@@ -282,6 +326,7 @@ class BacktestContext:
         self._benchmark_arrays = benchmark_arrays
         self._all_klines = all_klines
         self._extra_arrays = extra_arrays or {}
+        self._fundamental_rows = fundamental_rows or {}
 
     @classmethod
     def from_arrays(
@@ -297,6 +342,7 @@ class BacktestContext:
         benchmark_arrays: "_StockArrays | None" = None,
         all_klines: "dict[str, list[KBar]] | None" = None,
         extra_arrays: "dict[str, _StockArrays] | None" = None,
+        fundamental_rows: "dict[str, list[dict[str, Any]]] | None" = None,
     ) -> "BacktestContext":
         """Hot-path constructor: zero-copy slice window [idx-lookback, idx).
 
@@ -316,6 +362,7 @@ class BacktestContext:
         obj._benchmark_arrays = benchmark_arrays
         obj._all_klines = all_klines
         obj._extra_arrays = extra_arrays or {}
+        obj._fundamental_rows = fundamental_rows or {}
         return obj
 
     @property
@@ -408,6 +455,38 @@ class BacktestContext:
         return pos.shares if pos else 0
 
     @property
+    def entry_price(self) -> float | None:
+        """当前持仓的权威入场价（引擎真实成交价，非近似）。
+
+        无持仓或引擎未记录时返回 ``None``。策略出场逻辑应优先用此值计算
+        止损/止盈距离，而不是在 ctx 上自存入场价——因为 BacktestContext 每天
+        重建，自定义属性无法跨 bar 持久。
+        """
+        if not self._runner or not self._ts_code:
+            return None
+        p = self._runner._entry_prices.get(self._ts_code)
+        return float(p) if p is not None else None
+
+    @property
+    def entry_date(self) -> "date | None":
+        """当前持仓的权威入场日期（引擎记录）。无持仓返回 ``None``。"""
+        if not self._runner or not self._ts_code:
+            return None
+        return self._runner._entry_dates.get(self._ts_code)
+
+    @property
+    def state(self) -> "dict[str, Any]":
+        """跨 bar 持久的策略私有状态（按 ``ts_code`` 隔离）。
+
+        返回一个 dict，对同一只股票在回测全程的各根 bar 间持续存在，可用于
+        记录峰值(移动止盈)、入场 ATR、最近买入日(冷却)等。切勿依赖在 ctx 上
+        直接 set 自定义属性——它们会在下一天丢失。
+        """
+        if not self._runner or not self._ts_code:
+            return {}
+        return self._runner._ctx_state.setdefault(self._ts_code, {})
+
+    @property
     def cash(self) -> float:
         if not self._runner:
             return 0.0
@@ -444,6 +523,36 @@ class BacktestContext:
         例：``ctx.extra.get("sector")`` 取行业指数窗口视图；未配置时为空 dict。
         """
         return {name: _SeriesView(arr, self.trade_date) for name, arr in self._extra_arrays.items()}
+
+    @property
+    def fundamentals(self) -> "_FundamentalsSnapshot | None":
+        """最近一期已公告财报快照（防前视）。
+
+        按 ``announce_date <= 决策日(trade_date)`` 取最近一期；无已公告财报时
+        返回 ``None``。策略可读 ``ctx.fundamentals.roe`` / ``.net_profit_growth``
+        / ``.revenue_growth`` 等标量做"绩优择优"。
+
+        防前视语义：``ctx.trade_date`` 返回的是窗口末根日期（td-1，策略看不到
+        当日 bar），故 ``announce_date == 决策日`` 的财报同样可见——与
+        ``ctx.benchmark`` 的对齐口径完全一致。
+        """
+        if not self._ts_code:
+            return None
+        rows = self._fundamental_rows.get(self._ts_code)
+        if not rows:
+            return None
+        td = self.trade_date
+        # rows 已按 (announce_date, report_date) 升序排序；二分找最后一个 announce_date <= td
+        lo, hi = 0, len(rows)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if rows[mid]["announce_date"] <= td:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo == 0:
+            return None
+        return _FundamentalsSnapshot.from_row(rows[lo - 1])
 
 
 class ScriptContext:
@@ -514,6 +623,9 @@ class BacktestRunner:
         self._all_klines: dict[str, list[KBar]] = {}
         # Per-stock day index for O(1) bar lookup instead of O(n) list comprehension.
         self._stock_day_index: dict[str, int] = {code: 0 for code in config.stock_pool}
+        # 跨 bar 持久的策略私有状态（按 ts_code 隔离），供策略记录 peak/entry_atr/
+        # last_buy 等需要在持仓期间持续累积的数据。BacktestContext.state 暴露它。
+        self._ctx_state: dict[str, dict] = {}
         # Rebalance v2 planner (initialized lazily in run())
         self.rebalance_planner: Any = None
         self._stored_rebalance_plan: Any = None
@@ -582,12 +694,18 @@ class BacktestRunner:
         all_klines: dict[str, list[KBar]],
         benchmark_klines: list[KBar] | None = None,
         extra_klines: dict[str, list[KBar]] | None = None,
+        fundamentals: "dict[str, list[dict[str, Any]]] | None" = None,
     ) -> dict[str, Any]:
         """Run backtest for all stocks in the pool.
 
         ``benchmark_klines`` / ``extra_klines`` (optional) are precomputed
         series injected into every strategy context so user code can read
         benchmark / index / sector data via ``ctx.benchmark`` / ``ctx.extra``.
+
+        ``fundamentals`` (optional) maps ``ts_code`` -> list of financial
+        snapshot rows (each containing ``announce_date``/``report_date`` and
+        fields like ``roe``/``net_profit_growth``); exposed via
+        ``ctx.fundamentals`` as the most recent announced report (no-lookahead).
         """
         clear_ema_cache()  # Phase 2: 清空逐股 EMA 整段缓存，避免跨回测内存堆积
         clear_roll_cache()  # Phase 3: 清空逐股 rolling(MA/HHV/LLV/STD/SUM/REF) 整段缓存
@@ -596,6 +714,13 @@ class BacktestRunner:
         self._extra_arrays = {
             name: _StockArrays.from_klines(kl) for name, kl in (extra_klines or {}).items()
         }
+        # 预处理基本面：剔除无公告日(防前视锚点缺失)的行，按 (announce_date, report_date) 排序
+        self._fundamental_rows: "dict[str, list[dict[str, Any]]]" = {}
+        for _code, _rows in (fundamentals or {}).items():
+            _clean = [r for r in _rows if r.get("announce_date") is not None]
+            if _clean:
+                _clean.sort(key=lambda r: (r["announce_date"], r.get("report_date") or date.min))
+                self._fundamental_rows[_code] = _clean
         self._stock_day_index = {code: 0 for code in self.config.stock_pool}
         trading_dates = self._get_trading_dates(all_klines)
         if not trading_dates:
@@ -764,6 +889,7 @@ class BacktestRunner:
                     benchmark_arrays=self._benchmark_arrays,
                     all_klines=self._all_klines,
                     extra_arrays=self._extra_arrays,
+                    fundamental_rows=self._fundamental_rows,
                 )
                 signal_result = self._exec_strategy(ctx, total_asset)
                 if not signal_result.ok:
@@ -778,9 +904,27 @@ class BacktestRunner:
                 if signal is None:
                     continue
 
+                # 全局出场权威：当回测配置了全局出场(任一>0)时，全局规则为出场唯一权威，
+                # 忽略策略内部"卖出/减仓"信号，避免策略内部出场(校准弱于全局)干扰、劣化结果。
+                # 仅当全局出场全关(自包含模式)时，才交由策略内部出场逻辑。
+                # 历史教训：#198 的 +10% 实际依赖"策略卖出被静默降级 + 内部出场失效"这一 bug，
+                # 修复后策略内部出场开始干扰全局，同源码同配置重跑(#204)塌到 -6.85%。
+                global_exit_active = (
+                    self.config.stop_loss_pct > 0 or self.config.take_profit_pct > 0
+                    or self.config.trailing_stop_pct > 0 or self.config.time_stop_days > 0
+                )
+                if (global_exit_active and self.positions.get(ts_code)
+                        and self.positions[ts_code].shares > 0
+                        and signal.get("signal_type") in ("卖出", "减仓")):
+                    continue
+
+                # 用引擎权威持仓权重作为 current_position，而非信任策略回报——
+                # 策略通常不会返回 current_position，若用默认值 0.0，会让"卖出"信号
+                # 在 map_signal_to_action 里被判为 cur<=0 而静默降级成 HOLD，
+                # 导致持仓永远无法平仓（历史上依赖引擎全局出场兜底，此 bug 被掩盖）。
                 action_info = map_signal_to_action(SignalInput(
                     signal_type=signal.get("signal_type"),
-                    current_position=signal.get("current_position", 0.0),
+                    current_position=ctx.stock_position_weight,
                     target_position=signal.get("target_position"),
                 ))
 

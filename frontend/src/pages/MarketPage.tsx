@@ -448,12 +448,12 @@ export default function MarketPage() {
     try {
       const { task_id } = await fetchJson<{ task_id: string }>('/api/data/sync/kline', {
         method: 'POST',
-        body: JSON.stringify({ ts_codes: [stock.ts_code] }),
+        body: JSON.stringify({ ts_codes: [stock.ts_code], from_listing: true }),
       })
-      setNotice(`${stock.ts_code} K线同步中...`)
+      setNotice(`${stock.ts_code} 同步上市至今K线中...`)
       const abort = new AbortController()
       await pollTask(task_id, abort.signal)
-      setNotice(`${stock.ts_code} K线同步完成`)
+      setNotice(`${stock.ts_code} 上市至今K线同步完成`)
       await refreshActiveTab()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught))
@@ -519,10 +519,10 @@ export default function MarketPage() {
           onClick={() => void syncRowKline(stock)}
           disabled={rowSyncing}
           className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-accent px-2.5 text-xs font-semibold text-accent transition hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-60"
-          title={`同步 ${stock.ts_code} K线`}
+          title={`同步 ${stock.ts_code} 上市到今天的 K 线`}
         >
           <RefreshCw className={`h-3.5 w-3.5 ${rowSyncing ? 'animate-spin' : ''}`} />
-          同步K线
+          {rowSyncing ? '同步中' : '同步上市至今'}
         </button>
       </div>
     )

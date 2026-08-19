@@ -529,6 +529,30 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 if _kl:
                     extra_klines[_name] = _kl
 
+            # ---- 注入基本面（最近一期已公告财报，防前视）----
+            # ts_code -> list[dict]（按 announce_date, report_date 升序，adapter 会再排序+二分）
+            # 只在 announce_date <= 回测截止日内的财报参与（更早的已被区间过滤，天然防前视）。
+            fundamentals: dict[str, list[dict[str, Any]]] = {}
+            if all_klines:
+                _fund_rows = await session.execute(
+                    text("""
+                        SELECT ts_code, report_date, announce_date, roe,
+                               revenue_growth, net_profit_growth, gross_margin, net_profit
+                        FROM stock_fundamentals
+                        WHERE ts_code = ANY(:codes)
+                          AND announce_date IS NOT NULL AND announce_date <= :end_date
+                        ORDER BY ts_code, announce_date, report_date
+                    """),
+                    {"codes": list(all_klines.keys()), "end_date": bt_row["end_date"]},
+                )
+                for _fr in _fund_rows.mappings():
+                    fundamentals.setdefault(_fr["ts_code"], []).append(dict(_fr))
+            if fundamentals:
+                logger.info(
+                    "backtest %s: loaded fundamentals for %d codes (%d rows)",
+                    backtest_id, len(fundamentals), sum(len(v) for v in fundamentals.values()),
+                )
+
             config = BacktestConfig(
                 strategy_id=bt_row["strategy_id"],
                 source_code=bt_row["source_code"],
@@ -571,6 +595,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 all_klines,
                 benchmark_klines=benchmark_klines,
                 extra_klines=extra_klines,
+                fundamentals=fundamentals,
             )
         except Exception as exc:
             import traceback as _tb

@@ -429,16 +429,28 @@ def sync_sample_kline(
     start_date: str | None = None,
     end_date: str | None = None,
     concurrency: int | None = None,
+    from_listing: bool = False,
 ) -> dict[str, Any]:
     default_start, default_end = default_kline_window()
-    start = date.fromisoformat(start_date) if start_date else default_start
-    end = date.fromisoformat(end_date) if end_date else default_end
+    if from_listing:
+        # 从上市日拉到 end；未显式指定起点时兜底 2015-01-01（与 sync_all_klines.py 的 --from-listing 一致）。
+        start = date.fromisoformat(start_date) if start_date else date(2015, 1, 1)
+        end = date.fromisoformat(end_date) if end_date else default_end
+    else:
+        start = date.fromisoformat(start_date) if start_date else default_start
+        end = date.fromisoformat(end_date) if end_date else default_end
     effective_concurrency = _effective_data_sync_concurrency(concurrency)
     return run_async(
         _run_tracked(
             "sync_sample_kline",
             self.request.id,
-            {"ts_codes": ts_codes, "start_date": start, "end_date": end, "concurrency": effective_concurrency},
+            {
+                "ts_codes": ts_codes,
+                "start_date": start,
+                "end_date": end,
+                "concurrency": effective_concurrency,
+                "from_listing": from_listing,
+            },
             with_session(
                 sync_kline,
                 ts_codes,
@@ -446,6 +458,7 @@ def sync_sample_kline(
                 end,
                 commit_each=True,
                 concurrency=effective_concurrency,
+                from_listing=from_listing,
             ),
         )
     )

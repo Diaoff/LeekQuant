@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import signal
 import threading
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from types import FrameType
 from typing import Any, Protocol
@@ -103,10 +103,43 @@ def _date_arg(value: date) -> str:
     return value.strftime("%Y%m%d")
 
 
+def _parse_ohlc_adaptive(item: list) -> tuple[float, float, float, float] | None:
+    """从腾讯 K 线行自适应识别 (open, close, high, low) 列序。
+
+    个股 qfqday 实测为 [日期,开,收,高,低,量]；指数 day 可能为 [日期,开,高,低,收,量]
+    等变体。按 high>=max(o,c) 且 low<=min(o,c) 的 OHLC 合法性遍历候选顺序，返回
+    第一个合法解；全部不合法（停牌日 0/负值、或列序完全不匹配）返回 None。
+    """
+    try:
+        f = [float(x) for x in item[1:5]]
+    except (ValueError, TypeError):
+        return None
+    # 候选列序：(open, close, high, low) 在 item[1:5] 中的位置组合
+    candidates = (
+        (f[0], f[1], f[2], f[3]),  # 开,收,高,低 (个股 qfqday)
+        (f[0], f[3], f[1], f[2]),  # 开,高,低,收 → (o,f[0] c,f[3] h,f[1] l,f[2])
+        (f[0], f[1], f[3], f[2]),  # 开,收,低,高 → (o,f[0] c,f[1] h,f[3] l,f[2])
+        (f[0], f[2], f[1], f[3]),  # 开,高,收,低 → (o,f[0] c,f[2] h,f[1] l,f[3])
+        (f[0], f[3], f[2], f[1]),  # 开,低,收,高
+        (f[0], f[2], f[3], f[1]),  # 开,低,高,收
+    )
+    for o, c, h, l in candidates:
+        if o > 0 and c > 0 and h > 0 and l > 0 and h >= o and h >= c and l <= o and l <= c:
+            return o, c, h, l
+    return None
+
+
 def _http_json(url: str, params: dict[str, Any] | None = None, timeout: int = 15) -> dict[str, Any]:
     query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
     full_url = f"{url}?{query}" if query else url
-    request = Request(full_url, headers={"User-Agent": UA})
+    # 东财 push2/push2his 接口对无 Referer 的请求直接断开连接（RemoteDisconnected）——
+    # 必须带 quote 页 Referer + 浏览器 UA 才能通过风控。
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://quote.eastmoney.com/",
+        "Accept": "*/*",
+    }
+    request = Request(full_url, headers=headers)
     try:
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="ignore")
@@ -348,7 +381,11 @@ class EastMoneyHttpProvider:
 class TencentHttpProvider:
     name = "tencent_http"
     display_name = "Tencent Finance HTTP"
-    capabilities = frozenset({ProviderCapability.FUNDAMENTALS, ProviderCapability.REALTIME_QUOTE})
+    capabilities = frozenset({
+        ProviderCapability.DAILY_KLINE,
+        ProviderCapability.FUNDAMENTALS,
+        ProviderCapability.REALTIME_QUOTE,
+    })
     priority_default = 20
 
     def fetch_stock_basic(self) -> list[StockBasic]:
@@ -358,7 +395,69 @@ class TencentHttpProvider:
         raise _unsupported(self.name, ProviderCapability.TRADE_CALENDAR)
 
     def fetch_daily_kline(self, ts_code: str, start_date: date, end_date: date) -> list[DailyKline]:
-        raise _unsupported(self.name, ProviderCapability.DAILY_KLINE)
+        """腾讯 ifzq fqkline 日 K（前复权）。
+
+        2026-08-19 实测：东财 push2his 对本机 IP 风控断连(RemoteDisconnected)，
+        Baostock/新浪/通达信主站1 均不可达，唯腾讯 qt.gtimg/ifzq.gtimg.cn 可用——
+        故把腾讯补为 K 线回退源。返回 ``qfqday`` 每行 [date, open, close, high, low,
+        volume(手), ...]，前复权价直接使用（adj_factor 留 None）。
+
+        ⚠️ 腾讯接口单次最多返回 640 条（超出时只返回区间内最近 640 根），
+        拉长历史（如 2017 上市至今）必须**按 2 年窗口分段请求**再拼接去重。
+        """
+        symbol = ts_code.split(".", 1)[0]
+        prefix = "sh" if ts_code.upper().endswith("SH") else "sz"
+        key = f"{prefix}{symbol}"
+
+        def _fetch_segment(seg_start: date, seg_end: date) -> list[list]:
+            url = (
+                "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
+                f"?param={key},day,{seg_start.isoformat()},{seg_end.isoformat()},640,qfq"
+            )
+            payload = _http_json(url, timeout=10)
+            data = (payload.get("data") or {}).get(key) or {}
+            return data.get("qfqday") or data.get("day") or []
+
+        seg_start = start_date
+        raw: list[list] = []
+        while seg_start <= end_date:
+            seg_end = min(seg_start + timedelta(days=730), end_date)  # 2年窗口 ≤ ~490 交易日
+            raw.extend(_fetch_segment(seg_start, seg_end))
+            seg_start = seg_end + timedelta(days=1)
+
+        # 去重（分段边界可能重叠；腾讯可能重复返回首末行）
+        seen_dates: set[str] = set()
+        records: list[DailyKline] = []
+        for item in raw:
+            if not item or len(item) < 6:
+                continue
+            d = str(item[0])
+            if d in seen_dates:
+                continue
+            seen_dates.add(d)
+            try:
+                vol = int(float(item[5])) * 100
+            except (ValueError, TypeError):
+                continue
+            # OHLC 列序自适应：个股 qfqday=[日期,开,收,高,低,量]，指数 day 可能
+            # 是 [日期,开,高,低,收,量] 等变体——按"high>=max(o,c) 且 low<=min(o,c)"
+            # 的合法性自动识别正确顺序；全不合法(停牌0/负)则跳过该行。
+            ohlc = _parse_ohlc_adaptive(item)
+            if ohlc is None:
+                continue
+            o, c, h, l = ohlc
+            try:
+                records.append(normalize_daily_kline({
+                    "trade_date": d,
+                    "open": str(o),
+                    "close": str(c),
+                    "high": str(h),
+                    "low": str(l),
+                    "volume": vol,
+                }, self.name, ts_code=ts_code))
+            except (ValueError, TypeError):
+                continue
+        return records
 
     def fetch_stock_fundamentals(
         self, ts_codes: list[str], start_date: date, end_date: date
@@ -528,16 +627,16 @@ class ADataProvider:
             raise DataProviderError("adata is not installed") from exc
 
         symbol = ts_code.split(".", 1)[0]
-        # adj=True: 前复权 (qfq) prices. AData does not expose adj_factor
-        # separately, so adj_factor stays None — backtest uses the qfq prices
-        # directly. Fixes the bug where ex-dividend days produced fake阴线
-        # and triggered spurious sell signals.
+        # adjust_type=1: 前复权 (qfq) prices (adata >= 2.9 API；旧版 adj=True 已废弃，
+        # 会抛 TypeError: get_market() got an unexpected keyword argument 'adj')。
+        # AData 不单独暴露 adj_factor，adj_factor 保持 None —— 回测直接用 qfq 价格，
+        # 修复除权日产生假阴线、误触发卖出信号的问题。
         frame = adata.stock.market.get_market(
             stock_code=symbol,
             k_type=1,
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
-            adj=True,
+            adjust_type=1,
         )
         return [normalize_daily_kline(row, self.name, ts_code=ts_code) for row in dataframe_records(frame)]
 
@@ -672,6 +771,61 @@ class BaostockProvider:
         for row in self._run(query):
             records.append(normalize_stock_fundamental(row, self.name))
         return records
+
+    # ---- 季频财务数据（盈利能力 / 成长能力）----
+    # Baostock 的 query_profit_data / query_growth_data 只能按 (year, quarter) 逐季度
+    # 查询（无 year=0 全量模式），返回财报行含 pubDate(公告日)/statDate(报告期)。
+    # 公告日 pubDate 供回测引擎做防前视（announce_date <= 决策日才可见）。
+    # 新方法不进 METHOD_CAPABILITIES，不参与 fetch_with_fallback 回退链——
+    # 由补数脚本直接调用，避免污染现有估值数据（fetch_stock_fundamentals）的语义。
+    _QUARTER_END = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+
+    def fetch_profit_data(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        """季频盈利能力：ROE(roeAvg)、净利率、毛利(gpMargin)、净利润等。"""
+        return self._fetch_quarterly(ts_codes, start_date, end_date, kind="profit", source="baostock_profit")
+
+    def fetch_growth_data(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        """季频成长能力：营收同比(YOYNI)、净利润同比(YOYPNI)等。"""
+        return self._fetch_quarterly(ts_codes, start_date, end_date, kind="growth", source="baostock_growth")
+
+    def _fetch_quarterly(
+        self,
+        ts_codes: list[str],
+        start_date: date,
+        end_date: date,
+        *,
+        kind: str,
+        source: str,
+    ) -> list[StockFundamental]:
+        # 枚举 (year, quarter)：从 start_date 前一年到 end_date 当年，覆盖区间内全部报告期
+        # （回测起点需"最近一期已公告财报"，故多取一年前置缓冲）。
+        quarters: list[tuple[int, int]] = []
+        for y in range(start_date.year - 1, end_date.year + 1):
+            quarters.extend((y, q) for q in (1, 2, 3, 4))
+        method = "query_profit_data" if kind == "profit" else "query_growth_data"
+
+        def query(bs):
+            out: list[StockFundamental] = []
+            for ts_code in ts_codes:
+                code, suffix = ts_code.split(".", 1)
+                bs_code = f"{suffix.lower()}.{code}"
+                for year, quarter in quarters:
+                    result = getattr(bs, method)(code=bs_code, year=year, quarter=quarter)
+                    if result.error_code != "0":
+                        raise DataProviderError(
+                            f"baostock {kind} failed for {ts_code} {year}Q{quarter}: {result.error_msg}"
+                        )
+                    while result.next():
+                        row = dict(zip(result.fields, result.get_row_data(), strict=False))
+                        row["ts_code"] = ts_code
+                        out.append(normalize_stock_fundamental(row, source, ts_code=ts_code))
+            return out
+
+        return self._run(query)
 
 
 class AkShareProvider:

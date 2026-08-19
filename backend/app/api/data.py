@@ -33,6 +33,7 @@ class KlineSyncRequest(BaseModel):
     ts_codes: list[str] | None = Field(default=None, max_length=30)
     start_date: date | None = None
     end_date: date | None = None
+    from_listing: bool = False
 
 
 @router.get("/status")
@@ -96,6 +97,7 @@ async def sync_kline_endpoint(
         "ts_codes": request.ts_codes,
         "start_date": request.start_date.isoformat() if request.start_date else None,
         "end_date": request.end_date.isoformat() if request.end_date else None,
+        "from_listing": request.from_listing,
     }
     async with async_session_factory() as session:
         await create_pending_task_run(

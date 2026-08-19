@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import random
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -45,6 +46,38 @@ _PROVIDER_ORDER: list[str] = [
     cls.name for cls in sorted(PROVIDER_REGISTRY.values(), key=lambda provider_cls: provider_cls.priority_default)
 ]
 _REDIS_CLIENT: redis_mod.Redis | None = None
+
+# ---- 进程内自适应熔断 ----
+# 背景：filter_open_circuits 已因 data_update_state 表移除而变成 no-op，不可用源
+# （如 Baostock 服务器断连、东财 push2his 对本机 IP 风控）会在每次同步里被完整重试，
+# 每只股票空耗超时后才轮到可用源（腾讯）→ 网页全量同步一两天跑不完。
+# 这里实现轻量进程内熔断：某 provider 连续失败 >= 阈值后，本轮进程内后续调用直接跳过，
+# 单次成功即复位。Celery worker 常驻 → 跨任务生效；脚本每次新进程 → 前几只需试错。
+_BREAKER_THRESHOLD = 3
+_provider_failures: dict[str, int] = {}
+_breaker_lock = threading.Lock()
+
+
+def _breaker_open(name: str) -> bool:
+    with _breaker_lock:
+        return _provider_failures.get(name, 0) >= _BREAKER_THRESHOLD
+
+
+def _breaker_record_failure(name: str) -> None:
+    with _breaker_lock:
+        _provider_failures[name] = _provider_failures.get(name, 0) + 1
+
+
+def _breaker_record_success(name: str) -> None:
+    with _breaker_lock:
+        _provider_failures.pop(name, None)
+
+
+def _breaker_reset() -> None:
+    """测试用：清空熔断状态。"""
+    with _breaker_lock:
+        _provider_failures.clear()
+
 
 async def filter_open_circuits(
     session: AsyncSession,
@@ -248,6 +281,8 @@ def fetch_with_fallback(
     provider_list = [
         provider for provider in providers if capability is None or provider_supports(provider, capability)
     ]
+    # 熔断：跳过已连续失败达阈值的 provider（不可用源不再空耗超时）
+    provider_list = [provider for provider in provider_list if not _breaker_open(provider.name)]
     if not provider_list:
         raise DataProviderError(f"no enabled providers support {capability or method_name}")
 
@@ -260,7 +295,9 @@ def fetch_with_fallback(
                 try:
                     records = _try_once(provider, method_name, args)
                     if records:
+                        _breaker_record_success(provider.name)
                         return provider.name, records
+                    # 无数据返回不视为故障（新股/区间无数据是正常业务），不触发熔断
                     errors.append(f"{provider.name}: no records returned")
                     break
                 except _RETRYABLE as exc:
@@ -271,10 +308,12 @@ def fetch_with_fallback(
                         backoff = (2 ** attempt) + random.random()
                         time.sleep(min(backoff, 30.0))
                         continue
+                    _breaker_record_failure(provider.name)
                     errors.append(msg)
                     break
                 except Exception as exc:
                     logger.warning("silent except in fetch_with_fallback (exc)", exc_info=True)
+                    _breaker_record_failure(provider.name)
                     errors.append(f"{provider.name}: {exc}")
                     break
     raise DataProviderError("; ".join(errors) or "all providers failed")
