@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 import signal
 import threading
+import time
 from datetime import date, timedelta
 from decimal import Decimal
 from types import FrameType
@@ -11,7 +13,9 @@ from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from app.data.models import DailyKline, StockBasic, StockFundamental, TradeCalendarDay
+import pandas as pd
+
+from app.data.models import DailyKline, FundFlowDaily, StockBasic, StockFundamental, TradeCalendarDay
 from app.data.normalizers import (
     dataframe_records,
     normalize_daily_kline,
@@ -34,6 +38,7 @@ class ProviderCapability:
     DAILY_KLINE = "daily_kline"
     FUNDAMENTALS = "fundamentals"
     REALTIME_QUOTE = "realtime_quote"
+    FUND_FLOW = "fund_flow"
 
 
 METHOD_CAPABILITIES = {
@@ -41,6 +46,7 @@ METHOD_CAPABILITIES = {
     "fetch_trade_calendar": ProviderCapability.TRADE_CALENDAR,
     "fetch_daily_kline": ProviderCapability.DAILY_KLINE,
     "fetch_stock_fundamentals": ProviderCapability.FUNDAMENTALS,
+    "fetch_fund_flow": ProviderCapability.FUND_FLOW,
 }
 
 
@@ -59,6 +65,10 @@ class DataProvider(Protocol):
     def fetch_stock_fundamentals(
         self, ts_codes: list[str], start_date: date, end_date: date
     ) -> list[StockFundamental]: ...
+
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]: ...
 
 
 PROVIDER_REGISTRY: dict[str, type[DataProvider]] = {}
@@ -324,6 +334,11 @@ class EastMoneyHttpProvider:
             records.append(normalize_stock_fundamental(row, self.name, ts_code=ts_code, report_date=end_date))
         return records
 
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
     def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
         if not ts_codes:
             return {}
@@ -494,6 +509,11 @@ class TencentHttpProvider:
             records.append(normalize_stock_fundamental(row, self.name, ts_code=ts_code, report_date=end_date))
         return records
 
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
     def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
         if not ts_codes:
             return {}
@@ -601,6 +621,11 @@ class MootdxProvider:
     ) -> list[StockFundamental]:
         raise _unsupported(self.name, ProviderCapability.FUNDAMENTALS)
 
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
 
 class ADataProvider:
     name = "adata"
@@ -644,6 +669,11 @@ class ADataProvider:
         self, ts_codes: list[str], start_date: date, end_date: date
     ) -> list[StockFundamental]:
         raise DataProviderError("adata fundamentals adapter is not available")
+
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
 
 
 class BaostockProvider:
@@ -771,6 +801,12 @@ class BaostockProvider:
         for row in self._run(query):
             records.append(normalize_stock_fundamental(row, self.name))
         return records
+
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
 
     # ---- 季频财务数据（盈利能力 / 成长能力）----
     # Baostock 的 query_profit_data / query_growth_data 只能按 (year, quarter) 逐季度
@@ -926,6 +962,12 @@ class AkShareProvider:
             records.append(normalize_stock_fundamental(data, self.name, ts_code=ts_code, report_date=latest_report_date))
         return records
 
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
+
     def fetch_realtime_quote(self, ts_codes: list[str]) -> dict[str, Decimal]:
         if not ts_codes:
             return {}
@@ -958,3 +1000,122 @@ class AkShareProvider:
 register_provider(ADataProvider)
 register_provider(BaostockProvider)
 register_provider(AkShareProvider)
+
+
+class AkShareFundFlowProvider:
+    """AkShare 主力资金流向 provider。
+
+    数据源：akshare.stock_individual_fund_flow()
+    字段口径：超大单 / 大单 / 中单 / 小单，按成交额分档统计净流入。
+    主力 = 超大单 + 大单合计。
+    """
+
+    name = "akshare_fund_flow"
+    display_name = "AkShare Fund Flow"
+    capabilities = frozenset({ProviderCapability.FUND_FLOW})
+    priority_default = 30
+
+    _FIELD_MAP: dict[str, str] = {
+        "主力净流入-净额": "main_net_amount",
+        "主力净流入-净占比": "main_net_ratio",
+        "超大单净流入-净额": "ultra_net_amount",
+        "超大单净流入-净占比": "ultra_net_ratio",
+        "大单净流入-净额": "large_net_amount",
+        "大单净流入-净占比": "large_net_ratio",
+        "中单净流入-净额": "mid_net_amount",
+        "中单净流入-净占比": "mid_net_ratio",
+        "小单净流入-净额": "small_net_amount",
+        "小单净流入-净占比": "small_net_ratio",
+    }
+
+    def fetch_stock_basic(self) -> list[StockBasic]:
+        raise _unsupported(self.name, ProviderCapability.STOCK_BASIC)
+
+    def fetch_trade_calendar(self, start_date: date, end_date: date) -> list[TradeCalendarDay]:
+        raise _unsupported(self.name, ProviderCapability.TRADE_CALENDAR)
+
+    def fetch_daily_kline(self, ts_code: str, start_date: date, end_date: date) -> list[DailyKline]:
+        raise _unsupported(self.name, ProviderCapability.DAILY_KLINE)
+
+    def fetch_stock_fundamentals(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        raise _unsupported(self.name, ProviderCapability.FUNDAMENTALS)
+
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date, _max_attempts: int = 6
+    ) -> list[FundFlowDaily]:
+        """拉取主力资金流向。
+
+        注意：AkShare 的 ``stock_individual_fund_flow`` 东方财富接口**只返回最近约
+        120 个交易日**（不支持传入起止日期），且在高并发/连续请求下极易限流返回
+        空/报错。因此这里对"瞬时空响应/异常"做内部重试+退避，避免把限流误判为
+        "无数据"而直接丢弃（否则上层 fetch_with_fallback 看到空就结束、不再重试，
+        导致成功率极低）。只有重试耗尽后仍为空才视为"该股确实无数据"跳过。
+        """
+        try:
+            import akshare as ak  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise DataProviderError("akshare is not installed") from exc
+
+        records: list[FundFlowDaily] = []
+        for ts_code in ts_codes:
+            symbol = ts_code.split(".", 1)[0]
+            suffix = ts_code.split(".", 1)[1].lower()
+            df = None
+            last_err: object = None
+            for attempt in range(_max_attempts):
+                # 轻量 pacing + 抖动，降低对东方财富接口的突发压力（首次也稍作避让）
+                time.sleep(0.2 + random.random() * 0.3)
+                try:
+                    df = ak.stock_individual_fund_flow(stock=symbol, market=suffix)
+                    if df is not None and not df.empty:
+                        break
+                    # 空响应：多为限流，退避后重试而非当无数据
+                    last_err = "empty/None response"
+                except Exception as exc:
+                    last_err = exc
+                    logger.debug("fund_flow fetch attempt %d failed for %s: %s", attempt, ts_code, exc)
+                # 指数退避 + 抖动，封顶 15s；AkShare 东方财富接口限流恢复需要时间
+                if attempt < _max_attempts - 1:
+                    time.sleep(min((2 ** attempt) + random.random(), 15.0))
+            if df is None or df.empty:
+                logger.debug("fund_flow: no data for %s after %d attempts (%s)", ts_code, _max_attempts, last_err)
+                continue
+
+            try:
+                date_col = "日期"
+                df[date_col] = pd.to_datetime(df[date_col]).dt.date
+                mask = (df[date_col] >= start_date) & (df[date_col] <= end_date)
+                df = df.loc[mask].copy()
+            except Exception as exc:
+                logger.debug("fund_flow date parse failed for %s: %s", ts_code, exc)
+                continue
+
+            for _, row in df.iterrows():
+                try:
+                    vals: dict[str, Decimal | None] = {}
+                    for src, target in self._FIELD_MAP.items():
+                        if src in row.index:
+                            vals[target] = _to_decimal(row[src])
+                    records.append(FundFlowDaily(
+                        ts_code=ts_code,
+                        trade_date=row[date_col],
+                        **vals,
+                    ))
+                except Exception as exc:
+                    logger.debug("fund_flow row parse failed for %s: %s", ts_code, exc)
+                    continue
+
+        return records
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None or (isinstance(value, float) and value != value):
+        return None
+    try:
+        d = Decimal(str(value))
+        return d if d.is_finite() else None
+    except Exception:
+        return None
+register_provider(AkShareFundFlowProvider)

@@ -44,6 +44,7 @@ from app.data.service import (
 )
 from app.backtest.kline_cache import invalidate_all_kline_cache
 from app.data.stock_service import sync_fundamentals
+from app.data.service_fund_flow import sync_fund_flow
 from app.db.session import async_session_factory
 from app.tasks.beat_lock import with_beat_lock
 from app.tasks.celery_app import celery_app
@@ -516,6 +517,62 @@ def sync_fundamentals_task(
     return run_async(
         _run_tracked(
             "sync_fundamentals",
+            self.request.id,
+            payload,
+            run,
+        )
+    )
+
+
+@celery_app.task(
+    name="app.tasks.data_tasks.sync_fund_flow_task",
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    autoretry_for=(DataProviderError, ConnectionError, TimeoutError),
+)
+@with_beat_lock("app.tasks.data_tasks.sync_fund_flow_task")
+def sync_fund_flow_task(
+    self,
+    ts_codes: list[str] | None = None,
+    target_date: str | None = None,
+    concurrency: int | None = None,
+) -> dict[str, Any]:
+    # 资金流数据源 AkShare 东方财富接口易限流，固定用较低并发（不沿用 kline 的
+    # full_kline_sync_concurrency=8），避免全市场轰炸导致大量瞬态失败。
+    effective_concurrency = _effective_data_sync_concurrency(concurrency if concurrency is not None else 3)
+    run_date = date.fromisoformat(target_date) if target_date else date.today()
+    payload = {"ts_codes": ts_codes, "target_date": run_date.isoformat(), "concurrency": effective_concurrency}
+
+    async def run(session_factory) -> dict[str, Any]:
+        async with session_factory() as session:
+            all_codes = [*ts_codes] if ts_codes is not None else await select_all_stock_codes(session)
+        total = len(all_codes)
+
+        def progress(i: int, _total: int, code: str) -> None:
+            try:
+                self.update_state(
+                    state="PROGRESS",
+                    meta={"current": i, "total": total, "current_code": code},
+                )
+            except Exception:
+                logger.debug("silent except in progress")
+                pass
+
+        return await sync_fund_flow(
+            None,
+            all_codes,
+            run_date,
+            progress_callback=progress,
+            commit_each=True,
+            concurrency=effective_concurrency,
+        )
+
+    return run_async(
+        _run_tracked(
+            "sync_fund_flow",
             self.request.id,
             payload,
             run,

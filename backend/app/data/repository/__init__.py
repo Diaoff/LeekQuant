@@ -25,6 +25,10 @@ from app.data.repository.calendar import (
 from app.data.repository.fundamentals import (
     upsert_stock_fundamentals,
 )
+from app.data.repository.fund_flow import (
+    get_recent_fund_flow,
+    upsert_fund_flow,
+)
 from app.data.repository.kline import (
     get_active_stock_codes,
     get_sync_progress,
@@ -64,6 +68,8 @@ __all__ = [
     "resolve_alert",
     "upsert_trade_calendar",
     "upsert_stock_fundamentals",
+    "get_recent_fund_flow",
+    "upsert_fund_flow",
     "get_active_stock_codes",
     "get_sync_progress",
     "upsert_daily_kline",

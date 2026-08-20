@@ -3,6 +3,8 @@ from decimal import Decimal
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 from app.data import providers
 from app.data.providers import (
     BaostockProvider,
@@ -24,9 +26,12 @@ def test_provider_registry_exposes_plugin_metadata() -> None:
     assert "eastmoney_http" in names
     assert "tencent_http" in names
     assert "mootdx" in names
+    assert "akshare_fund_flow" in names
     eastmoney = next(item for item in metadata if item["name"] == "eastmoney_http")
     assert eastmoney["capabilities"] == ["daily_kline", "fundamentals", "stock_basic"]
     assert next(item for item in metadata if item["name"] == "mootdx")["enabled"] is False
+    fund_flow = next(item for item in metadata if item["name"] == "akshare_fund_flow")
+    assert fund_flow["capabilities"] == ["fund_flow"]
 
 
 def test_provider_supports_declared_capabilities() -> None:
@@ -487,3 +492,114 @@ def test_parse_ohlc_adaptive_rejects_invalid() -> None:
     assert _parse_ohlc_adaptive(["2026-08-12", "0", "0", "0", "0", "0"]) is None
     assert _parse_ohlc_adaptive(["2026-08-12", "-1", "2", "3", "4", "5"]) is None
     assert _parse_ohlc_adaptive(["2026-08-12", "abc", "1", "2", "3", "4"]) is None
+
+
+def test_akshare_fund_flow_provider_registered() -> None:
+    from app.data.providers import AkShareFundFlowProvider, provider_metadata
+    metadata = provider_metadata()
+    ff = next(item for item in metadata if item["name"] == "akshare_fund_flow")
+    assert ff["display_name"] == "AkShare Fund Flow"
+    assert ff["capabilities"] == ["fund_flow"]
+
+
+def test_akshare_fund_flow_provider_unsupported_methods(monkeypatch) -> None:
+    from app.data.providers import AkShareFundFlowProvider, ProviderCapability
+    provider = AkShareFundFlowProvider()
+    from app.data.providers import DataProviderError
+    with pytest.raises(DataProviderError):
+        provider.fetch_stock_basic()
+    with pytest.raises(DataProviderError):
+        provider.fetch_trade_calendar(date(2026, 1, 1), date(2026, 1, 31))
+    with pytest.raises(DataProviderError):
+        provider.fetch_daily_kline("600519.SH", date(2026, 1, 1), date(2026, 1, 31))
+    with pytest.raises(DataProviderError):
+        provider.fetch_stock_fundamentals(["600519.SH"], date(2026, 1, 1), date(2026, 1, 31))
+
+
+def test_akshare_fund_flow_fetch_maps_fields(monkeypatch) -> None:
+    import sys
+    import pandas as pd
+    from app.data.providers import AkShareFundFlowProvider
+
+    fake_df = pd.DataFrame({
+        "日期": ["2026-08-18", "2026-08-19"],
+        "主力净流入-净额": [-941517040, 82581703],
+        "主力净流入-净占比": [-19.39, 5.17],
+        "超大单净流入-净额": [-627993728, 15049079],
+        "超大单净流入-净占比": [-12.93, 0.94],
+        "大单净流入-净额": [-313523312, 67532624],
+        "大单净流入-净占比": [-6.46, 3.95],
+        "中单净流入-净额": [941730816, -53285152],
+        "中单净流入-净占比": [19.40, -3.11],
+        "小单净流入-净额": [-213785, -29296551],
+        "小单净流入-净占比": [-0.00, -1.71],
+    })
+
+    class FakeAk:
+        @staticmethod
+        def stock_individual_fund_flow(stock, market):
+            assert stock == "600519"
+            assert market == "sh"
+            return fake_df
+
+    monkeypatch.setitem(sys.modules, "akshare", FakeAk)
+
+    records = AkShareFundFlowProvider().fetch_fund_flow(
+        ["600519.SH"],
+        date(2026, 8, 1),
+        date(2026, 8, 31),
+    )
+
+    assert len(records) == 2
+    assert records[0].ts_code == "600519.SH"
+    assert records[0].trade_date == date(2026, 8, 18)
+    assert records[0].main_net_amount == Decimal("-941517040")
+    assert records[0].main_net_ratio == Decimal("-19.39")
+    assert records[0].ultra_net_amount == Decimal("-627993728")
+    assert records[0].large_net_amount == Decimal("-313523312")
+    assert records[1].trade_date == date(2026, 8, 19)
+    assert records[1].main_net_amount == Decimal("82581703")
+    assert records[1].data_source == "akshare"
+
+
+def test_akshare_fund_flow_filters_by_date_range(monkeypatch) -> None:
+    import sys
+    import pandas as pd
+    from app.data.providers import AkShareFundFlowProvider
+
+    fake_df = pd.DataFrame({
+        "日期": ["2026-07-01", "2026-08-15", "2026-09-01"],
+        "主力净流入-净额": [100, 200, 300],
+        "主力净流入-净占比": [1.0, 2.0, 3.0],
+        "超大单净流入-净额": [10, 20, 30],
+        "超大单净流入-净占比": [0.1, 0.2, 0.3],
+        "大单净流入-净额": [90, 180, 270],
+        "大单净流入-净占比": [0.9, 1.8, 2.7],
+        "中单净流入-净额": [-50, -100, -150],
+        "中单净流入-净占比": [-0.5, -1.0, -1.5],
+        "小单净流入-净额": [-50, -100, -150],
+        "小单净流入-净占比": [-0.5, -1.0, -1.5],
+    })
+
+    class FakeAk:
+        @staticmethod
+        def stock_individual_fund_flow(stock, market):
+            return fake_df
+
+    monkeypatch.setitem(sys.modules, "akshare", FakeAk)
+
+    records = AkShareFundFlowProvider().fetch_fund_flow(
+        ["600519.SH"],
+        date(2026, 8, 1),
+        date(2026, 8, 31),
+    )
+
+    assert len(records) == 1
+    assert records[0].trade_date == date(2026, 8, 15)
+
+
+def test_provider_supports_fund_flow_capability() -> None:
+    from app.data.providers import AkShareFundFlowProvider, provider_supports
+    provider = AkShareFundFlowProvider()
+    assert provider_supports(provider, ProviderCapability.FUND_FLOW)
+    assert not provider_supports(provider, ProviderCapability.DAILY_KLINE)

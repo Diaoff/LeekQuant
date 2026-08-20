@@ -79,3 +79,20 @@ class StockFundamental:
     balance_sheet: dict[str, Any] | None = None
     cashflow_statement: dict[str, Any] | None = None
     data_source: str = "baostock"
+
+
+@dataclass(slots=True)
+class FundFlowDaily:
+    ts_code: str
+    trade_date: date
+    main_net_amount: Decimal | None = None
+    main_net_ratio: Decimal | None = None
+    ultra_net_amount: Decimal | None = None
+    ultra_net_ratio: Decimal | None = None
+    large_net_amount: Decimal | None = None
+    large_net_ratio: Decimal | None = None
+    mid_net_amount: Decimal | None = None
+    mid_net_ratio: Decimal | None = None
+    small_net_amount: Decimal | None = None
+    small_net_ratio: Decimal | None = None
+    data_source: str = "akshare"

@@ -87,6 +87,10 @@ celery_app.conf.update(
             "task": "app.tasks.data_tasks.sync_fundamentals",
             "schedule": crontab(hour=19, minute=30),
         },
+        "sync-fund-flow-daily": {
+            "task": "app.tasks.data_tasks.sync_fund_flow_task",
+            "schedule": crontab(hour=20, minute=0),
+        },
         "unlock-t1-positions-daily": {
             "task": "app.tasks.trading_tasks.unlock_t1_daily",
             "schedule": crontab(hour=9, minute=25),

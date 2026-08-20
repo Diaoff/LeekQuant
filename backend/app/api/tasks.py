@@ -28,7 +28,7 @@ from app.preferences.service import get_full_kline_sync_concurrency
 from app.tasks.beat_lock import get_beat_lock
 from app.tasks.celery_app import celery_app
 from app.core.celery_health import cached_active_queues
-from app.tasks.data_tasks import kline_sync_dispatch, sync_fundamentals_task, sync_sample_kline
+from app.tasks.data_tasks import kline_sync_dispatch, sync_fundamentals_task, sync_fund_flow_task, sync_sample_kline
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 # this name (the legacy "incremental_kline_update" batch task no longer exists).
 INCREMENTAL_KLINE_TASK_NAME = "kline_sync_dispatch"
 FULL_FUNDAMENTALS_TASK_NAME = "sync_fundamentals"
+FUND_FLOW_TASK_NAME = "sync_fund_flow"
+FUND_FLOW_STALE_AFTER = timedelta(hours=12)
 KLINE_SYNC_DISPATCH_BEAT_LOCK = "app.tasks.data_tasks.kline_sync_dispatch"
 FULL_FUNDAMENTALS_STALE_AFTER = timedelta(hours=24)
 
@@ -65,6 +67,12 @@ class FundamentalsTaskRequest(BaseModel):
     ts_codes: list[str] | None = Field(default=None, max_length=100)
     start_date: date | None = None
     end_date: date | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=8)
+
+
+class FundFlowTaskRequest(BaseModel):
+    ts_codes: list[str] | None = Field(default=None, max_length=5000)
+    target_date: date | None = None
     concurrency: int | None = Field(default=None, ge=1, le=8)
 
 
@@ -400,6 +408,41 @@ async def start_fundamentals_task(
     )
     try:
         sync_fundamentals_task.apply_async(
+            kwargs=payload,
+            task_id=task_id,
+        )
+    except OperationalError as exc:
+        await mark_task_run_queue_failed(session, task_id=task_id, error_message=f"task queue unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"task queue unavailable: {exc}",
+        ) from exc
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.post("/data/fund-flow")
+async def start_fund_flow_task(
+    request: FundFlowTaskRequest = Body(default_factory=FundFlowTaskRequest),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    await _guard_beat_lock_free("app.tasks.data_tasks.sync_fund_flow_task")
+    task_id = uuid4().hex
+    effective_concurrency = request.concurrency
+    if effective_concurrency is None:
+        effective_concurrency = 1
+    payload = {
+        "ts_codes": request.ts_codes,
+        "target_date": request.target_date.isoformat() if request.target_date else None,
+        "concurrency": effective_concurrency,
+    }
+    await create_pending_task_run(
+        session,
+        task_name=FUND_FLOW_TASK_NAME,
+        task_id=task_id,
+        payload=payload,
+    )
+    try:
+        sync_fund_flow_task.apply_async(
             kwargs=payload,
             task_id=task_id,
         )

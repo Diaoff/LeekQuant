@@ -118,6 +118,37 @@ async def sync_kline_endpoint(
     return {"task_id": task_id, "status": "pending"}
 
 
+@router.get("/fund-flow/{ts_code}")
+async def get_fund_flow(
+    ts_code: str,
+    days: int = 30,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.data.repository import get_recent_fund_flow
+    records = await get_recent_fund_flow(session, ts_code, days)
+    return {
+        "ts_code": ts_code,
+        "days": len(records),
+        "records": [
+            {
+                "trade_date": r.trade_date.isoformat(),
+                "main_net_amount": float(r.main_net_amount) if r.main_net_amount else None,
+                "main_net_ratio": float(r.main_net_ratio) if r.main_net_ratio else None,
+                "ultra_net_amount": float(r.ultra_net_amount) if r.ultra_net_amount else None,
+                "ultra_net_ratio": float(r.ultra_net_ratio) if r.ultra_net_ratio else None,
+                "large_net_amount": float(r.large_net_amount) if r.large_net_amount else None,
+                "large_net_ratio": float(r.large_net_ratio) if r.large_net_ratio else None,
+                "mid_net_amount": float(r.mid_net_amount) if r.mid_net_amount else None,
+                "mid_net_ratio": float(r.mid_net_ratio) if r.mid_net_ratio else None,
+                "small_net_amount": float(r.small_net_amount) if r.small_net_amount else None,
+                "small_net_ratio": float(r.small_net_ratio) if r.small_net_ratio else None,
+                "data_source": r.data_source,
+            }
+            for r in records
+        ],
+    }
+
+
 @router.get("/sync/kline/result/{task_id}")
 async def sync_kline_result(task_id: str) -> dict:
     async_result = AsyncResult(task_id, app=celery_app)
