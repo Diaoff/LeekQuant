@@ -7,9 +7,18 @@
 
 ---
 
+> ## ⚠️ 现状状态说明（2026-08，与代码对齐）
+>
+> 本文档为历史目标架构文档，部分章节描述的是**曾规划或曾实现但后续已变更**的能力。与当前代码（main 分支）的关键差异：
+> - **M5 多因子选股：已废弃并移除代码。** `app/factor` 包、`app/api/factors.py`、`app/tasks/factor_tasks.py` 与前端 `FactorPage` 均已删除；第 8 章「多因子打分模块设计」仅作历史参考，请勿据此开发或验收。早期迁移仍可能在库中创建 `factor_definitions` / `factor_values` / `scoring_rank` / `factor_analysis` / `factor_score_runs` 表，但已无任何功能使用。
+> - **`data_update_state` 表：已删除**（迁移 `202607290001_drop_data_update_state.py`）。文中涉及的 `data_update_state` 引用（增量同步进度追踪）已不适用。
+> - **`stock_pools` / `stock_pool_items` 表：已删除**。回测选股作用域改为 `all` / `market` / `watchlist_group`（见第 3.6 节说明）。
+> - **M6b WebSocket 流式：已实现**（东方财富 WS 解析 + `realtime_ws` / `realtime_risk_guard` 服务已部署）。文中标注「M6b 待实现」处已过时。
+> - **M7（认证 / 因子表达式引擎 / 监控 / 周月线）仍为规划中。**
+
 ## 1. 项目定位与边界
 
-Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法，只保留并强化 A 股研究、回测、信号、模拟交易与因子选股能力。平台默认部署在用户本地或私有服务器，数据、策略源码、账户记录和回测结果均保留在本地 PostgreSQL 与 Redis 中，不依赖中心化云端服务。
+Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法，只保留并强化 A 股研究、回测、信号、模拟交易能力（注：原规划的「因子选股」M5 多因子子系统已废弃并移除代码）。平台默认部署在用户本地或私有服务器，数据、策略源码、账户记录和回测结果均保留在本地 PostgreSQL 与 Redis 中，不依赖中心化云端服务。
 
 ### 1.1 目标用户
 
@@ -34,7 +43,7 @@ Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法�
 - 策略编辑：Monaco Editor 编写 Python 源码，内置 MyTT 函数提示。
 - 五档信号：买入、增持、减仓、卖出、观望。
 - A 股规则回测：T+1、涨跌停、印花税、佣金、过户费、停牌处理。
-- 多因子打分：估值、成长、质量、动量、波动等，支持 IC / IR 分析。
+- 多因子打分（⚠️ 已废弃）：估值、成长、质量、动量、波动等，支持 IC / IR 分析 —— 该功能曾实现但代码已整体移除，见顶部「现状状态说明」。
 - 模拟交易：完整委托、成交、持仓、资金流水、净值快照。
 - 轻量用户系统：多用户、多模拟账户隔离。
 - 定时任务与监控：数据更新、任务状态、异常告警。
@@ -44,7 +53,7 @@ Leek Quant 从 QuantDinger 的多市场、多资产、AI 量化平台做减法�
 
 ## 2. 总体系统架构
 
-Leek Quant 采用前后端分离 + 异步任务 + 统一 PostgreSQL 存储架构。历史数据、用户数据、策略、回测、因子和模拟交易全部进入 PostgreSQL；Redis 只承担队列、缓存和实时广播职责，避免 DuckDB + Parquet + SQLite 的多存储维护成本。
+Leek Quant 采用前后端分离 + 异步任务 + 统一 PostgreSQL 存储架构。历史数据、用户数据、策略、回测、模拟交易全部进入 PostgreSQL（原规划的因子数据已随 M5 废弃）；Redis 只承担队列、缓存和实时广播职责，避免 DuckDB + Parquet + SQLite 的多存储维护成本。
 
 ```mermaid
 flowchart TB
@@ -132,7 +141,7 @@ flowchart TB
 | celery_worker | Celery | 数据拉取、回测、因子、模拟交易等耗时任务 |
 | celery_beat | Celery Beat | 定时触发交易日历、K线更新、信号生成、净值快照 |
 | realtime_risk_guard | Python asyncio | 模拟盘实时止盈/止损守护进程 |
-| realtime_ws | Python asyncio / websockets | 东方财富流式解析服务（M6b 待实现；M6a 实时订阅由 backend `/ws/realtime` 提供） |
+| realtime_ws | Python asyncio / websockets | 东方财富流式解析服务（✅ M6b 已实现；M6a 实时订阅由 backend `/ws/realtime` 提供） |
 | postgres | PostgreSQL 15+ | 统一持久化存储 |
 | redis | Redis 7 | Celery Broker / Result Backend、热点缓存、Pub/Sub |
 
@@ -687,6 +696,7 @@ CREATE TABLE data_update_state (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (data_type, ts_code, source)
 );
+-- ⚠️ 该表已删除（迁移 202607290001_drop_data_update_state.py），当前库不存在，请勿据此建表。
 
 CREATE TABLE task_runs (
     id                BIGSERIAL PRIMARY KEY,
@@ -716,6 +726,9 @@ CREATE TABLE alert_events (
     resolved_at       TIMESTAMPTZ,
     CHECK (level IN ('info', 'warning', 'error', 'critical'))
 );
+```
+
+> ⚠️ **`data_update_state` 表已删除**：迁移 `202607290001_drop_data_update_state.py` 已移除该表，当前增量同步进度不再写入或读取它。上方 `CREATE TABLE data_update_state (...)` 仅为历史 schema 参考，与当前数据库不一致。
 ```
 
 ---
@@ -759,7 +772,7 @@ NormalizedKline = {
 
 ```mermaid
 flowchart TD
-    Start["请求 K线: ts_code + start/end + adjust"] --> CheckState["读取 data_update_state 与源健康状态"]
+    Start["请求 K线: ts_code + start/end + adjust"] --> CheckState["读取源健康状态（data_update_state 已删除）"]
     CheckState --> AData["尝试 AData"]
     AData --> ValidateA{"字段/日期/成交量校验通过?"}
     ValidateA -->|是| Normalize["标准化字段 + 复权因子校准"]
@@ -771,8 +784,10 @@ flowchart TD
     ValidateC -->|是| Normalize
     ValidateC -->|否| Fail["记录失败 + alert_events + Celery retry"]
     Normalize --> Upsert["INSERT ... ON CONFLICT DO UPDATE/NOTHING"]
-    Upsert --> State["更新 data_update_state"]
+    Upsert --> State["更新 data_update_state（已废弃）"]
 ```
+
+> 注：图中 `data_update_state` 节点对应的表已删除（迁移 `202607290001`），当前回退流程不依赖它；源健康状态改为运行时内存态管理。
 
 ### 4.4 数据校验规则
 
@@ -1228,7 +1243,9 @@ def unlock_t1_positions(db, trade_date: date):
 
 ---
 
-## 8. 多因子打分模块设计
+## 8. 多因子打分模块设计（⚠️ 已废弃，仅作历史参考）
+
+> M5 多因子选股功能已整体移除代码（`app/factor`、`factors.py`、`factor_tasks.py`、`FactorPage` 均删除）。本章描述的是已废弃能力的设计，请勿据此开发或验收；相关数据库表（`factor_*` / `scoring_rank` / `factor_analysis`）当前无任何功能使用。
 
 ### 8.1 因子分类
 
@@ -1397,8 +1414,8 @@ M7+ 因子研究增强计划：
 | 路径 | 用途 | 消息 | 状态 |
 | --- | --- | --- | --- |
 | `/ws/realtime` | 实时行情订阅 | subscribe / unsubscribe / tick | ✅ M6a 已实现 |
-| `/ws/tasks` | 回测、数据任务状态通知 | task_status | M6b 待实现 |
-| `/ws/signals` | 策略信号推送 | signal_created | M6b 待实现 |
+| `/ws/tasks` | 回测、数据任务状态通知 | task_status | ✅ M6b 已实现 |
+| `/ws/signals` | 策略信号推送 | signal_created | ✅ M6b 已实现 |
 
 订阅示例：
 
@@ -1746,10 +1763,10 @@ beat_schedule = {
 | M2 自选股与策略 | 自选分组、策略 CRUD、基础前端页面 | 自选分组、自选股 API、市场页、策略管理 | 自选股分组管理 |
 | M3 策略与回测 | Monaco 编辑、MyTT 提示、Python-native 异步回测 | 策略 CRUD、回测任务、结果页 | 双均线策略跑通 |
 | M4 信号与模拟交易 | 五档信号、模拟交易 6 表、T+1 / 涨跌停 / 费用 | 信号中心、模拟账户闭环 | 资金守恒和 T+1 单测 |
-| M5 多因子 | 内置因子定义、计算、IC/IR MVP、排行榜 | 因子页、排行榜、IC/IR 卡片、迷你 IC 曲线、分组收益 | IC 计算样例验证 |
+| M5 多因子 | 内置因子定义、计算、IC/IR MVP、排行榜（⚠️ 已废弃并移除代码） | 因子页、排行榜、IC/IR 卡片（均已被删除） | 历史验收通过，当前无对应功能 |
 | M6a HTTP 快照实时 | 东方财富 HTTP 快照、Redis 广播、WebSocket 订阅、前端实时看板 | 自选股实时刷新 | ✅ 已通过验收 |
-| M6b WebSocket 流式 | 东方财富 WebSocket 流式推送、任务/信号 WebSocket 通道、断线重连 | 断线重连测试 | 待实现 |
-| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、认证系统、股票池、完整因子研究、因子表达式引擎、周/月线物化视图、文档 | 系统设置页、任务监控、README、因子研究图表 | 全链路 smoke test |
+| M6b WebSocket 流式 | 东方财富 WebSocket 流式推送、任务/信号 WebSocket 通道、断线重连 | 断线重连测试 | ✅ 已实现 |
+| M7 优化完善 | 参数敏感性、多账户优化、数据监控告警、认证系统、周/月线物化视图、文档（注：原「股票池」「完整因子研究」「因子表达式引擎」属已废弃的 M5，不再纳入） | 系统设置页、任务监控、README | 全链路 smoke test |
 
 ---
 

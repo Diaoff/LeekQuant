@@ -53,13 +53,6 @@
 - 支持限价/市价/收盘价多种撮合模式
 - 资金守恒校验，可审计可重放
 
-### 📈 多因子选股
-- 因子分类：估值、成长、质量、动量、波动、技术
-- IC / IR 分析评估因子有效性
-- 横截面打分排名 + 权重可配置
-- M5 已完成：内置 8 个因子、`factor_definitions.enabled/default_weight` 配置、Top N 排行榜、IC/IR MVP、迷你 IC 曲线、分组收益、Celery/API 任务入口与前端 `/factor` 页面 MVP
-- M7+ 规划：动态因子表达式、IC 分布、多空组合收益、分层累计收益、因子衰减曲线
-
 ### 🔴 实时行情推送
 - 东方财富 WebSocket 自建解析器
 - Redis Pub/Sub 广播 + 前端实时刷新
@@ -92,7 +85,7 @@ docker compose up -d   # 8个服务一键启动
 ### 数据存储
 | 组件 | 说明 |
 |------|------|
-| PostgreSQL 15+ | 统一持久化存储（26张表，按年分区） |
+| PostgreSQL 15+ | 统一持久化存储（约 26 张核心业务表，按年分区） |
 | Redis 7 | Celery Broker / 缓存 / PubSub |
 
 ### 计算引擎
@@ -171,7 +164,6 @@ leek-quant/
 │   │   │   ├── strategies.py    # 策略 CRUD
 │   │   │   ├── backtests.py     # 回测任务
 │   │   │   ├── watchlist.py     # 自选股管理
-│   │   │   ├── factors.py       # 因子定义/值/排行榜/ICIR查询
 │   │   │   ├── signals.py       # 五档信号查询
 │   │   │   ├── sim.py           # 模拟交易 API
 │   │   │   ├── realtime.py      # 实时行情 WS/HTTP
@@ -187,10 +179,6 @@ leek-quant/
 │   │   │   ├── fetcher.py       # 统一数据拉取
 │   │   │   ├── normalizers.py   # 数据标准化
 │   │   │   └── validators.py    # 数据校验
-│   │   ├── factor/              # M5: 多因子计算、表达式、ICIR分析
-│   │   │   ├── service.py       # 因子计算与ICIR
-│   │   │   ├── expression.py    # 动态表达式引擎
-│   │   │   └── definitions.py   # 内置因子定义
 │   │   ├── realtime/            # M6: 实时行情
 │   │   │   ├── eastmoney_ws.py  # 东方财富WS解析
 │   │   │   ├── bus.py           # Redis Pub/Sub
@@ -204,11 +192,10 @@ leek-quant/
 │   │   └── tasks/               # Celery 异步任务
 │   │       ├── celery_app.py    # Celery 应用配置
 │   │       ├── data_tasks.py    # 数据拉取任务
-│   │       ├── factor_tasks.py  # 因子计算/分析任务
 │   │       ├── signal_tasks.py  # 信号生成任务
 │   │       └── trading_tasks.py # 模拟交易任务
 │   ├── alembic/                 # 数据库迁移
-│   │   └── versions/            # 迁移版本(M0-M5)
+│   │   └── versions/            # 数据库迁移（21+ 版本）
 │   ├── tests/                   # 测试套件 (~40个文件)
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -216,13 +203,12 @@ leek-quant/
 │   └── src/
 │       ├── pages/               # 页面组件
 │       │   ├── DashboardPage.tsx # 仪表盘首页
-│       │   ├── MarketPage.tsx   # 股票池页面
+│       │   ├── MarketPage.tsx   # 全市场浏览与筛选
 │       │   ├── WatchlistPage.tsx # 自选股
 │       │   ├── StrategyPage.tsx # 策略编辑器(Monaco)
 │       │   ├── BacktestPage.tsx # 回测结果与对比
 │       │   ├── SimulationPage.tsx # 模拟交易
 │       │   ├── SignalsPage.tsx  # 信号日志
-│       │   ├── FactorPage.tsx   # 因子研究与ICIR
 │       │   ├── StatusPage.tsx   # 数据同步与任务
 │       │   └── PreferencesPage.tsx # 偏好设置
 │       ├── hooks/               # 自定义 Hooks
@@ -234,7 +220,7 @@ leek-quant/
 ├── docs/                         # 设计文档与用户手册
 │   ├── finally-design.md         # 完整技术架构
 │   └── strategy-guide.md         # 策略编写指南
-├── docker-compose.yml            # 服务编排(7个服务)
+├── docker-compose.yml            # 服务编排(9个服务)
 ├── .env.example                  # 环境变量模板
 └── README.md                     # 本文件
 ```
@@ -247,10 +233,10 @@ leek-quant/
 |------|------|-----------|
 | **M0 基础环境** | ✅ 完成 | Docker Compose + PostgreSQL + Redis + FastAPI 骨架 |
 | **M1 数据基座** | ✅ 完成 | 股票列表 + 日K线(年分区) + 交易日历 + 三层回退 |
-| **M2 股票池与自选股** | ✅ 完成 | 动态筛选(ST/退市/行业) + 分组管理 + 基础前端 |
+| **M2 自选股与股票筛选** | ✅ 完成 | 全市场动态筛选(ST/退市/行业) + 自选分组管理 + 基础前端 |
 | **M3 策略与回测** | ✅ **完成** | Monaco编辑器 + MyTT补全 + Python-native异步回测 |
 | **M4 信号与模拟交易** | ✅ 完成 | 五档信号状态机 + 6表闭环 + T+1解锁 + 费用精确计算 |
-| **M5 多因子选股** | ✅ 完成 | 因子四表 + 8个内置因子 + 计算/排行榜/ICIR MVP/API/任务 + 前端因子页 MVP |
+| **M5 多因子选股** | ⚠️ 已废弃 | 曾实现（因子四表 + 8 内置因子 + 计算/排行榜/ICIR MVP + 前端因子页），后续代码已整体移除，不再属于平台功能 |
 | **M6a 实时快照** | ✅ 完成 | 东方财富HTTP快照 + Redis Pub/Sub + WebSocket订阅 + 前端实时刷新 |
 | **M6b WebSocket流式** | ✅ 完成 | 东方财富WS自建解析 + 指数退避重连 + 任务/信号WS推送 + 风险守卫 |
 | **M7 优化完善** | 📋 规划中 | 认证系统 + 周/月K线 + CI/CD + 文档完善 |
@@ -294,10 +280,11 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 ## 🗄️ 数据库设计
 
 ### 架构概览
-- **26张表**统一存储在 PostgreSQL 15+
+- **约 26 张核心业务表**统一存储在 PostgreSQL 15+
 - K线表按**年份分区**（`daily_kline_2020` ~ `daily_kline_2026`）
 - 金融字段使用 `NUMERIC` 类型避免浮点误差
 - 大对象使用 `JSONB` 存储（策略参数、回测曲线等）
+- ⚠️ **已废弃的残留表**：`factor_definitions` / `factor_values` / `scoring_rank` / `factor_analysis` / `factor_score_runs` 由早期迁移创建，但对应的 M5 多因子选股功能代码已整体移除，这些表当前不被任何功能使用；`data_update_state` 与 `stock_pools` / `stock_pool_items` 表已在后续迁移中删除。
 
 ### 核心表清单
 | 表名 | 用途 | 特殊设计 |
@@ -314,10 +301,6 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 | `sim_trades` | 成交记录 | 明细费用分项 |
 | `sim_cash_flow` | 资金流水 | 正负入出账 |
 | `sim_daily_nav` | 每日净值快照 | 累计净值、最大回撤 |
-| `factor_definitions` | 因子定义 | 表达式、方向、权重 |
-| `factor_values` | 因子值 | 原始值、标准化值、百分位 |
-| `scoring_rank` | 打分排名 | 总分、排名、因子分解 |
-| `factor_analysis` | IC/IR分析 | IC均值/标准差/IR |
 
 ---
 
@@ -341,18 +324,12 @@ transfer_fee_rate = 0.00001 # 过户费万0.1
 | 模拟交易 | GET/POST | `/api/sim/accounts` | 模拟账户管理 |
 | 模拟交易 | GET | `/api/sim/accounts/{id}/positions` | 持仓查询 |
 | 模拟交易 | GET | `/api/sim/accounts/{id}/nav` | 净值曲线 |
-| 因子 | GET | `/api/factors` | 因子定义与默认权重 |
-| 因子 | GET | `/api/factors/rank?page_size=N` | 多因子 Top N 排行榜 |
-| 因子 | GET | `/api/factors/values` | 单因子横截面值 |
-| 因子 | GET | `/api/factors/analysis` | 因子 IC/IR 分析结果 |
 | 任务 | GET | `/api/tasks/recent` | 最近任务运行状态 |
 | 任务 | GET | `/api/tasks/{task_id}` | 单个任务状态 |
 | 数据 | GET | `/api/data/status` | 数据更新状态 |
 | 数据 | POST | `/api/data/sync/stock-basic` | 同步股票基础信息 |
 | 数据 | POST | `/api/data/sync/trade-calendar` | 同步交易日历 |
 | 数据 | POST | `/api/tasks/data/incremental-kline` | 触发增量 K 线同步 |
-| 任务 | POST | `/api/tasks/factors/compute` | 触发单日因子计算 |
-| 任务 | POST | `/api/tasks/factors/analyze` | 触发因子 IC/IR 分析 |
 | 实时行情 | GET | `/api/realtime/snapshot` | 东方财富 HTTP 快照 |
 | 实时风控 | GET | `/api/realtime/risk-guard/status` | 实时止盈/止损守护状态 |
 | 系统 | GET | `/api/system/alerts` | 告警列表 |
@@ -378,19 +355,9 @@ pytest backend/tests/test_data_normalizers.py -v   # 数据标准化
 pytest backend/tests/test_m2_stock_management.py -v # 股票池管理
 pytest backend/tests/test_repository.py -v          # 数据仓库
 pytest backend/tests/test_tasks.py -v               # Celery任务
-pytest backend/tests/test_m5_factors.py backend/tests/test_factor_api.py backend/tests/test_factor_tasks.py backend/tests/test_m5_factor_migration.py -v  # M5因子专项
-pytest backend/tests/test_m5_integration.py -v      # M5真实PostgreSQL/Alembic/任务闭环集成
 
 # 运行覆盖率报告
 pytest backend/tests/ --cov=app --cov-report=html
-```
-
-M5 风险消除验证组合：
-
-```bash
-./.venv/bin/python -m pytest backend/tests/test_m5_factors.py backend/tests/test_factor_api.py backend/tests/test_factor_tasks.py backend/tests/test_m5_factor_migration.py
-./.venv/bin/python -m pytest backend/tests/test_m5_integration.py
-cd frontend && npm run typecheck && npm run build && npm run test:smoke
 ```
 
 ### 关键测试覆盖
@@ -401,7 +368,6 @@ cd frontend && npm run typecheck && npm run build && npm run test:smoke
 - ✅ 涨跌停校验逻辑
 - ✅ 模拟交易资金守恒
 - ✅ Python-native回测引擎
-- ✅ M5 因子四表迁移、幂等 seed、单日计算、DB 权重排名、Top N API、IC/IR upsert、Celery任务入口、前端因子页 MVP
 
 ---
 
@@ -488,7 +454,7 @@ copies or substantial portions of the Software.
                       │
 ┌─────────────────────▼───────────────────────────────────────┐
 │              异步任务层 (Celery + Redis)                      │
-│  DataWorker │ BacktestWorker │ FactorWorker │ SimWorker      │
+│  DataWorker │ BacktestWorker │ SimWorker      │
 └──────┬──────────────┬──────────────┬──────────────┬─────────┘
        │              │              │              │
 ┌──────▼──────┐ ┌────▼─────┐ ┌──────▼────┐ ┌──────▼──────┐
@@ -499,7 +465,7 @@ copies or substantial portions of the Software.
        │              │              │              │
 ┌──────▼──────────────▼──────────────▼──────────────▼───────┐
 │                    存储层                                  │
-│  PostgreSQL (26张表, 年分区)  │  Redis (队列/缓存/PubSub)  │
+│  PostgreSQL (≈26张核心表, 年分区)  │  Redis (队列/缓存/PubSub)  │
 └───────────────────────────────────────────────────────────┘
 ```
 

@@ -2,7 +2,7 @@
 
 ## 当前状态
 
-预实现阶段。根目录下没有源代码、清单文件或构建配置。所有设计决策都在 `docs/` 下的设计文档中。骨架将从零开始搭建。
+**已实现的可运行平台**（非预实现阶段）。仓库包含完整后端（`backend/`，FastAPI + Celery + SQLAlchemy 异步）、前端（`frontend/`，React + Vite）与 `docker-compose.yml` 编排。M0–M6b 已落地；**M5 多因子选股曾实现但已废弃并移除代码**；M7 仍为规划中。详见下方「开发里程碑」与 `README.md`。
 
 ## 项目定位
 
@@ -38,7 +38,7 @@ opencode 没有关键词自动触发技能机制，技能加载完全依赖模�
 | 指标库 | MyTT（通达信/同花顺兼容，单文件零依赖） |
 | 历史数据 | AData（Tier 1）→ Baostock（Tier 2）→ AkShare（Tier 3）三级回退 |
 | 实时数据 | 东方财富 WebSocket（自建解析器） |
-| 因子 | 类 Qlib 表达式范式（轻量级，存储在 PostgreSQL 中） |
+| 因子（⚠️ 已废弃） | 原规划类 Qlib 表达式范式，M5 多因子选股代码已移除 |
 
 ## 设计文档
 
@@ -48,11 +48,11 @@ opencode 没有关键词自动触发技能机制，技能加载完全依赖模�
 
 ## 关键设计决策（来自文档）
 
-- **统一 PostgreSQL**：市场数据、因子、模拟交易、系统状态全部存储在 PostgreSQL 中，不另用 DuckDB/Parquet/SQLite
-- **三级数据回退**：AData → Baostock → AkShare，支持增量拉取，通过 `data_update_state` 表追踪
+- **统一 PostgreSQL**：市场数据、模拟交易、系统状态全部存储在 PostgreSQL 中，不另用 DuckDB/Parquet/SQLite（原规划的因子数据已随 M5 废弃）
+- **三级数据回退**：AData → Baostock → AkShare，支持增量拉取（注：`data_update_state` 表已在迁移 `202607290001_drop_data_update_state.py` 中删除，当前增量同步进度不再依赖该表）
 - **五档信号**：买入 / 加仓 / 减仓 / 卖出 / 等待，通过状态机映射到实际操作
 - **模拟交易**：完整的 6 表闭环（`sim_accounts`、`sim_positions`、`sim_orders`、`sim_trades`、`sim_cash_flow`、`sim_daily_nav`），支持 T+1、涨跌停、手续费
-- **多因子打分**：估值 / 成长 / 质量 / 动量，含 IC/IR 分析（⚠️ 尚未实现：代码中无 `app/factor` 包、无 IC/IR 计算；仅 PostgreSQL 留有 `scoring_rank` / `factor_values` 表）
+- **多因子打分（⚠️ 已废弃并移除代码）**：M5 多因子选股曾实现（因子四表 + 8 内置因子 + 计算/排行榜/ICIR MVP + 前端因子页），但后续已整体移除 `app/factor` 包、`factors.py` API、`factor_tasks.py` 任务与 `FactorPage` 前端页。早期迁移仍可能在库中创建 `factor_definitions` / `factor_values` / `scoring_rank` / `factor_analysis` / `factor_score_runs` 表，但已无任何功能使用，请勿依赖。
 - **日 K 线按年分区**存储于 PostgreSQL
 - **交易日历存入数据库**：所有日期逻辑查询数据库，不硬编码假期列表
 
@@ -69,18 +69,19 @@ opencode 没有关键词自动触发技能机制，技能加载完全依赖模�
 | M2 | 自选股、策略 CRUD、Monaco 编辑器 | ✅ 完成 |
 | M3 | 策略与回测：Python 原生异步回测、交易记录 | ✅ 完成 |
 | M4 | 五档信号、完整模拟交易引擎（6 表） | ✅ 完成 |
-| M5 | 多因子打分、IC/IR 分析 | 待处理（实际未实现，见上方设计决策说明） |
+| M5 | 多因子打分、IC/IR 分析 | ⚠️ 已废弃（曾实现，代码已整体移除，见上方设计决策说明） |
 | M6a | HTTP 快照实时行情：东方财富 HTTP、Redis Pub/Sub、WebSocket 订阅、前端展示 | ✅ 完成 |
-| M6b | WebSocket 推流：东方财富 WS 推送、任务/信号 WS 通道、断线重连 | 待处理 |
-| M7 | 打磨：认证、股票池、因子表达式引擎、周/月线、监控、文档 | 待处理 |
+| M6b | WebSocket 推流：东方财富 WS 推送、任务/信号 WS 通道、断线重连 | ✅ 完成（realtime_ws / realtime_risk_guard 服务已部署） |
+| M7 | 打磨：认证、周/月线、监控、文档（注：原「股票池」「因子表达式引擎」属已废弃的 M5，不再纳入） | 待处理 |
 
 ## 构建与工具
 
-尚未配置构建工具。添加工具时，遵循 QuantDinger 的惯例（参见 `third_party/references/QuantDinger/`）：
-- Docker Compose 布局（postgres、redis、backend、frontend 服务）
-- CI 工作流（basic-ci、docker-publish、update-frontend）
-- Python 项目结构（backend_api_python、mcp_server 包）
-- Dockerfile（python:3.12-slim、nginx:1.25-alpine）
+平台已具备完整构建与运行工具链：
+- `docker-compose.yml`：PostgreSQL / Redis / backend / celery_worker / celery_backtest_worker / celery_beat / realtime_risk_guard / realtime_ws / frontend 共 9 个服务
+- `backend/Dockerfile`（python:3.12-slim）、`backend/requirements.txt`、`backend/alembic/` 迁移
+- 前端：`frontend/`（Vite + React + shadcn/ui），`npm run dev/build/typecheck`
+- 本地脚本：`restart.sh`（本机直接起 backend + celery + frontend，不含 Docker）、`stop.sh`
+- 参考实现位于 `third_party/references/QuantDinger/`（Dockerfile、CI 工作流、FastAPI 结构、MCP Server）
 
 ## 参考：QuantDinger 结构
 
