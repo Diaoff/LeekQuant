@@ -29,6 +29,8 @@ RISK_CONFIG_FIELDS = (
     "time_stop_days",
 )
 
+DYNAMIC_TP_SL_KEY = "dynamic_tp_sl"
+
 MARKET_TARGETS = {"主板", "创业板", "科创板", "北交所"}
 MARKET_TARGET_ORDER = ("主板", "创业板", "科创板", "北交所")
 
@@ -181,6 +183,12 @@ def _merge_backtest_config(strategy_config_value: Any, params_snapshot_value: An
             risk_config[key] = value
     if risk_config:
         merged["risk_config"] = risk_config
+
+    # 动态止盈止损配置：优先使用 runtime_config 中的，否则用 strategy_config 中的
+    if DYNAMIC_TP_SL_KEY in runtime_config:
+        merged[DYNAMIC_TP_SL_KEY] = runtime_config[DYNAMIC_TP_SL_KEY]
+    elif DYNAMIC_TP_SL_KEY in strategy_config:
+        merged[DYNAMIC_TP_SL_KEY] = strategy_config[DYNAMIC_TP_SL_KEY]
 
     return merged
 
@@ -582,6 +590,36 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                         "defensive switch enabled but defensive pool is empty — switch disabled for this run"
                     )
 
+            # ---- 动态止盈止损的独立基准 K 线 ----
+            tp_sl_benchmark_code = strategy_config.get("tp_sl_benchmark_code") or ""
+            tp_sl_benchmark_klines: list[KBar] | None = None
+            if tp_sl_benchmark_code and tp_sl_benchmark_code != (benchmark_code or ""):
+                _tp_sl_raw = await _fetch_klines_for_codes(
+                    session, [tp_sl_benchmark_code], warmup_start, bt_row["end_date"]
+                )
+                tp_sl_benchmark_klines = _to_kbars(_tp_sl_raw.get(tp_sl_benchmark_code))
+                if tp_sl_benchmark_klines is not None and len(tp_sl_benchmark_klines) == 0:
+                    tp_sl_benchmark_klines = None
+
+            # ---- 跷跷板择时（bull_bear）模式：解析牛市自选分组 ----
+            bull_pool_codes: list[str] = []
+            if strategy_config.get("strategy_mode") == "bull_bear":
+                bull_pool_group_name = strategy_config.get("bull_pool_group_name", "")
+                if bull_pool_group_name:
+                    _bull_rows = await session.execute(
+                        text("SELECT ts_code FROM watchlist WHERE group_name = :gn AND user_id = :uid"),
+                        {"gn": bull_pool_group_name, "uid": bt_row["user_id"]},
+                    )
+                    bull_pool_codes = [r[0] for r in _bull_rows]
+                    _bull_aux_codes = [c for c in bull_pool_codes if c not in aux_codes]
+                    if _bull_aux_codes:
+                        _bull_raw = await _fetch_klines_for_codes(
+                            session, _bull_aux_codes, warmup_start, bt_row["end_date"]
+                        )
+                        for _code, _rows in _bull_raw.items():
+                            if _code not in all_klines:
+                                all_klines[_code] = _parse_kline_rows(_rows)
+
             # ---- 注入基本面（最近一期已公告财报，防前视）----
             # ts_code -> list[dict]（按 announce_date, report_date 升序，adapter 会再排序+二分）
             # 只在 announce_date <= 回测截止日内的财报参与（更早的已被区间过滤，天然防前视）。
@@ -636,6 +674,13 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 defensive_benchmark_code=defensive_benchmark_code,
                 defensive_rules=defensive_rules,
                 defensive_pick_k=defensive_pick_k,
+                # 动态止盈止损
+                dynamic_tp_sl=dict(strategy_config.get(DYNAMIC_TP_SL_KEY, {})),
+                # 跷跷板择时
+                strategy_mode=str(strategy_config.get("strategy_mode", "signal")),
+                bull_pool_codes=bull_pool_codes,
+                bull_confirm_days=int(strategy_config.get("bull_confirm_days", 3)),
+                bull_smooth_days=int(strategy_config.get("bull_smooth_days", 2)),
             )
 
             benchmark_code = bt_row.get("benchmark_code")
@@ -657,6 +702,7 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 fundamentals=fundamentals,
                 defensive_klines=defensive_klines,
                 defensive_benchmark_klines=defensive_benchmark_klines,
+                tp_sl_benchmark_klines=tp_sl_benchmark_klines,
             )
         except Exception as exc:
             import traceback as _tb

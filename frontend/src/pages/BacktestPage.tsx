@@ -175,6 +175,7 @@ interface DefensiveEpisode {
   holdings: string[]
   return_pct: number
   benchmark_return_pct?: number | null
+  entry_market_state?: string
 }
 
 interface DefensiveStats {
@@ -190,6 +191,35 @@ interface DefensiveStats {
   detail: DefensiveEpisode[]
 }
 
+interface BullBearEpisode {
+  entry_date?: string
+  exit_date?: string
+  holdings?: string[]
+  return_pct?: number
+}
+
+interface BullBearStats {
+  enabled?: boolean
+  bull_days?: number
+  defensive_days?: number
+  cash_days?: number
+  bull_return_pct?: number
+  defensive_return_pct?: number
+  bull_episodes?: BullBearEpisode[]
+  defensive_episodes?: BullBearEpisode[]
+  bull_pool_size?: number
+  defensive_pool_size?: number
+}
+
+interface MarketStateEntry {
+  count: number
+  win_count: number
+  total_pnl: number
+  days: number
+  win_rate: number
+  avg_pnl: number
+}
+
 interface BacktestPerformance {
   sortino_ratio?: number
   calmar_ratio?: number
@@ -202,6 +232,8 @@ interface BacktestPerformance {
   benchmark?: Record<string, unknown>
   monthly_returns?: Record<string, number>
   defensive?: DefensiveStats
+  market_state_stats?: Record<string, MarketStateEntry>
+  bull_bear_stats?: BullBearStats
   pnl_analysis?: PnlAnalysis
   stock_rankings?: StockRanking[]
 }
@@ -209,6 +241,59 @@ interface BacktestPerformance {
 interface EquityPoint {
   date: string
   value: number
+  market_state?: string
+}
+
+const STATE_COLORS: Record<string, string> = {
+  up: 'rgba(239,68,68,0.07)',
+  down: 'rgba(34,197,94,0.07)',
+  neutral: 'transparent',
+}
+
+function computeMarketStateSegments(equityCurve: Array<{ date: string; market_state?: string; total_asset: number }>) {
+  if (!equityCurve || equityCurve.length === 0) return []
+  const segments: Array<{ state: string; startDate: string; endDate: string }> = []
+  let currentState = equityCurve[0].market_state ?? 'neutral'
+  let startDate = equityCurve[0].date
+  for (let i = 1; i < equityCurve.length; i++) {
+    const state = equityCurve[i].market_state ?? 'neutral'
+    if (state !== currentState) {
+      segments.push({ state: currentState, startDate, endDate: equityCurve[i - 1].date })
+      currentState = state
+      startDate = equityCurve[i].date
+    }
+  }
+  segments.push({ state: currentState, startDate, endDate: equityCurve[equityCurve.length - 1].date })
+  return segments
+}
+
+function addMarketStateBackground(
+  chart: ChartApi,
+  equityCurve: Array<{ date: string; market_state?: string; total_asset: number }>,
+  maxValue?: number,
+) {
+  const segments = computeMarketStateSegments(equityCurve)
+  if (segments.length <= 1) return
+  const maxV = maxValue ?? Math.max(...equityCurve.map((d) => d.total_asset))
+  const fillValue = maxV * 2
+  for (const seg of segments) {
+    if (seg.state === 'neutral') continue
+    const color = STATE_COLORS[seg.state]
+    if (!color || color === 'transparent') continue
+    const bg = chart.addSeries(AreaSeries, {
+      lineColor: 'transparent',
+      lineWidth: 0,
+      topColor: color,
+      bottomColor: color,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    })
+    const data = seg.startDate === seg.endDate
+      ? [{ time: seg.startDate, value: fillValue }]
+      : [{ time: seg.startDate, value: fillValue }, { time: seg.endDate, value: fillValue }]
+    bg.setData(data)
+  }
 }
 
 interface TradeRecord {
@@ -1043,6 +1128,7 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
 
     const equityCurve = result.equity_curve
     if (equityCurve && equityCurve.length > 0) {
+      addMarketStateBackground(chart, equityCurve)
       const lineSeries = chart.addSeries(LineSeries, {
         color: '#10b981',
         lineWidth: 2,
@@ -1088,6 +1174,12 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
       handleScale: { mouseWheel: false, pinch: false, axisPressedMouseMove: true, axisDoubleClickReset: false },
     })
     klineChartApiRef.current = chart
+
+    const eqCurve = result.equity_curve
+    if (eqCurve && eqCurve.length > 0) {
+      const klineMax = Math.max(...selectedKlines.map((k) => k.high))
+      addMarketStateBackground(chart, eqCurve, klineMax * 2)
+    }
 
     const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#ef4444',
@@ -1302,20 +1394,26 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
                 <div className="max-h-48 overflow-y-auto rounded border border-line">
                   <table className="w-full text-xs">
                      <thead className="sticky top-0 bg-tableHead">
-                       <tr className="text-left text-muted">
-                         <th className="px-2.5 py-1.5 font-medium">进入</th>
-                         <th className="px-2.5 py-1.5 font-medium">退出</th>
-                         <th className="px-2.5 py-1.5 font-medium">收益</th>
-                         <th className="px-2.5 py-1.5 font-medium">同期基准</th>
-                         <th className="px-2.5 py-1.5 font-medium">持有</th>
-                       </tr>
+<tr className="text-left text-muted">
+                          <th className="px-2.5 py-1.5 font-medium">进入</th>
+                          <th className="px-2.5 py-1.5 font-medium">退出</th>
+                          <th className="px-2.5 py-1.5 font-medium">市场状态</th>
+                          <th className="px-2.5 py-1.5 font-medium">收益</th>
+                          <th className="px-2.5 py-1.5 font-medium">同期基准</th>
+                          <th className="px-2.5 py-1.5 font-medium">持有</th>
+                        </tr>
                      </thead>
                      <tbody>
                        {defensiveEpisodes.map((ep, index) => (
-                         <tr key={`${ep.entry_date}-${index}`} className="border-t border-line">
-                           <td className="px-2.5 py-1.5 tabular-nums">{ep.entry_date}</td>
-                           <td className="px-2.5 py-1.5 tabular-nums">{ep.exit_date ?? '—'}</td>
-                           <td className={`px-2.5 py-1.5 font-mono tabular-nums ${Number(ep.return_pct) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{Number(ep.return_pct).toFixed(2)}%</td>
+<tr key={`${ep.entry_date}-${index}`} className="border-t border-line">
+                            <td className="px-2.5 py-1.5 tabular-nums">{ep.entry_date}</td>
+                            <td className="px-2.5 py-1.5 tabular-nums">{ep.exit_date ?? '—'}</td>
+                            <td className="px-2.5 py-1.5 tabular-nums">
+                              {ep.entry_market_state === 'up' ? <span className="text-red-600 font-medium">牛市</span> :
+                               ep.entry_market_state === 'down' ? <span className="text-emerald-600 font-medium">熊市</span> :
+                               <span className="text-muted">震荡</span>}
+                            </td>
+                            <td className={`px-2.5 py-1.5 font-mono tabular-nums ${Number(ep.return_pct) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{Number(ep.return_pct).toFixed(2)}%</td>
                            <td className={`px-2.5 py-1.5 font-mono tabular-nums ${ep.benchmark_return_pct != null ? (ep.benchmark_return_pct >= 0 ? 'text-red-600' : 'text-emerald-600') : 'text-muted'}`}>
                              {ep.benchmark_return_pct != null ? `${ep.benchmark_return_pct >= 0 ? '+' : ''}${ep.benchmark_return_pct.toFixed(2)}%` : '—'}
                            </td>
@@ -1327,6 +1425,79 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {perf?.market_state_stats && Object.keys(perf.market_state_stats as Record<string, unknown>).length > 0 && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-muted">
+              <Activity className="h-4 w-4" />
+              各市场状态交易统计
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {(['up', 'neutral', 'down'] as const).map((state) => {
+                const st = (perf.market_state_stats as Record<string, MarketStateEntry>)[state]
+                if (!st) return null
+                const labels: Record<string, string> = { up: '牛市', neutral: '震荡市', down: '熊市' }
+                const colors: Record<string, string> = { up: 'text-red-600', neutral: 'text-amber-600', down: 'text-emerald-600' }
+                return (
+                  <div key={state} className="rounded-md border border-line bg-surface p-2.5">
+                    <div className={`text-xs font-semibold ${colors[state]}`}>{labels[state]}</div>
+                    <div className="mt-1.5 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                      <span className="text-muted">交易天数</span><span className="font-mono tabular-nums text-right">{st.days} 天</span>
+                      <span className="text-muted">交易笔数</span><span className="font-mono tabular-nums text-right">{st.count} 笔</span>
+                      <span className="text-muted">胜率</span><span className="font-mono tabular-nums text-right">{(st.win_rate * 100).toFixed(1)}%</span>
+                      <span className="text-muted">总盈亏</span><span className={`font-mono tabular-nums text-right ${st.total_pnl >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{st.total_pnl >= 0 ? '+' : ''}{st.total_pnl.toFixed(0)}</span>
+                      <span className="text-muted">平均盈亏</span><span className={`font-mono tabular-nums text-right ${st.avg_pnl >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{st.avg_pnl >= 0 ? '+' : ''}{st.avg_pnl.toFixed(0)}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {perf?.bull_bear_stats && (perf.bull_bear_stats as BullBearStats).enabled && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-muted">
+              <BarChart3 className="h-4 w-4" />
+              跷跷板择时统计
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="rounded-md border border-line bg-surface p-2.5">
+                <div className="text-xs font-semibold text-red-600">牛市（自选）</div>
+                <div className="mt-1.5 grid grid-cols-1 gap-y-1 text-[11px]">
+                  <span className="text-muted">天数</span><span className="font-mono tabular-nums">{(perf.bull_bear_stats as BullBearStats).bull_days ?? 0} 天</span>
+                  <span className="text-muted">自选股池</span><span className="font-mono tabular-nums">{(perf.bull_bear_stats as BullBearStats).bull_pool_size ?? 0} 只</span>
+                  <span className="text-muted">累计收益</span>
+                  <span className={`font-mono tabular-nums ${((perf.bull_bear_stats as BullBearStats).bull_return_pct ?? 0) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                    {((perf.bull_bear_stats as BullBearStats).bull_return_pct ?? 0).toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+              <div className="rounded-md border border-line bg-surface p-2.5">
+                <div className="text-xs font-semibold text-emerald-600">熊市（避险）</div>
+                <div className="mt-1.5 grid grid-cols-1 gap-y-1 text-[11px]">
+                  <span className="text-muted">天数</span><span className="font-mono tabular-nums">{(perf.bull_bear_stats as BullBearStats).defensive_days ?? 0} 天</span>
+                  <span className="text-muted">避险库</span><span className="font-mono tabular-nums">{(perf.bull_bear_stats as BullBearStats).defensive_pool_size ?? 0} 只</span>
+                  <span className="text-muted">累计收益</span>
+                  <span className={`font-mono tabular-nums ${((perf.bull_bear_stats as BullBearStats).defensive_return_pct ?? 0) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                    {((perf.bull_bear_stats as BullBearStats).defensive_return_pct ?? 0).toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+              <div className="rounded-md border border-line bg-surface p-2.5">
+                <div className="text-xs font-semibold text-amber-600">中性（现金）</div>
+                <div className="mt-1.5 grid grid-cols-1 gap-y-1 text-[11px]">
+                  <span className="text-muted">天数</span><span className="font-mono tabular-nums">{(perf.bull_bear_stats as BullBearStats).cash_days ?? 0} 天</span>
+                  <span className="text-muted">资金</span><span className="text-muted">空仓</span>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       )}

@@ -137,6 +137,11 @@ class BacktestConfig:
     time_stop_days: int = 0
     slippage_pct: float = 0.001
 
+    # 动态止盈止损：按市场状态（up / neutral / down）分别配置不同参数。
+    # 键为 market_state，值为 TP/SL 字段覆盖字典（如 {"stop_loss_pct": 0.05, "take_profit_pct": 0.30}）。
+    # 当前状态有对应覆盖时使用动态值，否则回退到 flat stop_loss_pct / take_profit_pct 等。
+    dynamic_tp_sl: dict[str, dict[str, float]] = field(default_factory=dict)
+
     # Rebalancing: when multiple stocks trigger buy signals on the same day,
     # "ranked" mode sells low-scored existing positions to fund higher-priority
     # new buys.  Disabled by default for backward compat.
@@ -166,6 +171,10 @@ class BacktestConfig:
     # 从避险库等权买入全部标的；defensive_pick_k=0 表示全池等权（前端默认），
     # >0 为内部/进阶择优选前 K 只（前端不暴露）。
     # 转强（up/neutral）则清仓避险、回归策略。
+    # 动态止盈止损的独立基准代码。为空时复用 benchmark_code。
+    # 用于判定市场状态（up/neutral/down），与避险切换的基准解耦。
+    tp_sl_benchmark_code: str | None = None
+
     defensive_switch_enabled: bool = False
     defensive_pool_codes: list[str] = field(default_factory=list)  # 全部启用避险池标的（不限制前几）
     defensive_rules: dict[str, Any] = field(default_factory=dict)  # DefensiveRules 字段子集
@@ -175,6 +184,11 @@ class BacktestConfig:
     # >0 = 内部/进阶择优选前 K 只（按近 N 日抗跌性）。当前前端固定走全池等权。
     defensive_pick_k: int = 0             # 0=全池等权（前端默认）；>0=内部择优选前 K 只
     defensive_pick_ret_window: int = 10   # 抗跌评估窗口：近 N 日区间涨幅，跌幅最小（涨幅最高）者最抗跌
+
+    # ── 跷跷板择时（bull_bear）：牛市买自选/熊市买避险/中性持现金 ──
+    bull_pool_codes: list[str] = field(default_factory=list)  # 牛市池（来自自选分组）
+    bull_confirm_days: int = 3     # 基准状态持续 X 天后才确认切换
+    bull_smooth_days: int = 2      # 分几天逐步买入/卖出
 
 
 @dataclass(slots=True)
@@ -331,6 +345,7 @@ class BacktestContext:
         all_klines: "dict[str, list[KBar]] | None" = None,
         extra_arrays: "dict[str, _StockArrays] | None" = None,
         fundamental_rows: "dict[str, list[dict[str, Any]]] | None" = None,
+        market_state: str = "neutral",
     ):
         # Legacy / test path: a full (or window) klines list is supplied and the
         # whole thing is exposed as the context window.
@@ -346,6 +361,7 @@ class BacktestContext:
         self._all_klines = all_klines
         self._extra_arrays = extra_arrays or {}
         self._fundamental_rows = fundamental_rows or {}
+        self._market_state = market_state
 
     @classmethod
     def from_arrays(
@@ -362,6 +378,7 @@ class BacktestContext:
         all_klines: "dict[str, list[KBar]] | None" = None,
         extra_arrays: "dict[str, _StockArrays] | None" = None,
         fundamental_rows: "dict[str, list[dict[str, Any]]] | None" = None,
+        market_state: str = "neutral",
     ) -> "BacktestContext":
         """Hot-path constructor: zero-copy slice window [idx-lookback, idx).
 
@@ -382,6 +399,7 @@ class BacktestContext:
         obj._all_klines = all_klines
         obj._extra_arrays = extra_arrays or {}
         obj._fundamental_rows = fundamental_rows or {}
+        obj._market_state = market_state
         return obj
 
     @property
@@ -517,6 +535,15 @@ class BacktestContext:
         return self._ts_code
 
     @property
+    def market_state(self) -> str:
+        """当前市场状态（由引擎根据基准行情判定）。
+
+        返回 ``'up' | 'neutral' | 'down'`` 之一，用于策略代码做逻辑分支。
+        依赖回测配置的基准代码（benchmark_code 或 tp_sl_benchmark_code）。
+        """
+        return self._market_state
+
+    @property
     def benchmark(self) -> "_SeriesView | None":
         """基准 / 指数序列窗口（由 ``config.benchmark_code`` 注入）。
 
@@ -577,12 +604,13 @@ class BacktestContext:
 class ScriptContext:
     """Context for on_bar() callback in script strategy mode."""
 
-    def __init__(self, runner: "BacktestRunner", ts_code: str, bar: KBar, total_asset: Decimal):
+    def __init__(self, runner: "BacktestRunner", ts_code: str, bar: KBar, total_asset: Decimal, market_state: str = "neutral"):
         self._runner = runner
         self._ts_code = ts_code
         self._bar = bar
         self._total_asset = total_asset
         self._action_taken = False
+        self.market_state = market_state
 
         self.ts_code = ts_code
         self.date = bar.trade_date
@@ -649,7 +677,11 @@ class BacktestRunner:
         self._open_lots: dict[str, list[_LotEntry]] = {}
         self._closed_lots: list[_ClosedLot] = []
         self._script_pending_action: tuple[str, str, float, KBar, str] | None = None
-        self._compiled_strategy = compile_strategy(config.source_code)
+        self._bull_bear_mode = config.strategy_mode == "bull_bear"
+        if not self._bull_bear_mode:
+            self._compiled_strategy = compile_strategy(config.source_code)
+        else:
+            self._compiled_strategy = None
         self._script_mode = config.strategy_mode == "script"
         self._slippage = Decimal(str(config.slippage_pct))
         self._all_klines: dict[str, list[KBar]] = {}
@@ -665,6 +697,12 @@ class BacktestRunner:
         # 不同股票集合。仅在 BUY 实际增加持仓份额时计入，避免无成交的占位 BUY
         # 错误地占用限额。
         self._daily_bought: dict[date, set[str]] = {}
+        # ── 跷跷板择时（bull_bear）状态 ──
+        self._bull_mode = False
+        self._cash_mode = False
+        self._bull_pool_codes: list[str] = list(config.bull_pool_codes)
+        self._bull_episodes: list[dict[str, Any]] = []
+        self._bull_bear_state: dict[str, Any] = {"state_days": 0, "prev_state": "neutral", "smooth_progress": 0.0}
 
     @staticmethod
     def _infer_candle_path(open_: Decimal, high: Decimal, low: Decimal, close: Decimal) -> list[Decimal]:
@@ -673,12 +711,36 @@ class BacktestRunner:
         else:
             return [open_, high, low, close]
 
+    def _get_effective_tp_sl(self, market_state: str) -> dict[str, float]:
+        """根据市场状态获取生效的止盈止损参数。
+
+        当 `dynamic_tp_sl` 配置了当前状态的覆盖时，用动态值覆盖 flat 字段。
+        未覆盖的字段保持 flat 值不变。
+        """
+        effective: dict[str, float] = {
+            "stop_loss_pct": self.config.stop_loss_pct,
+            "take_profit_pct": self.config.take_profit_pct,
+            "trailing_stop_pct": self.config.trailing_stop_pct,
+            "trailing_activation_pct": self.config.trailing_activation_pct,
+            "time_stop_days": float(self.config.time_stop_days),
+        }
+        overrides = self.config.dynamic_tp_sl.get(market_state)
+        if overrides:
+            for key in ("stop_loss_pct", "take_profit_pct", "trailing_stop_pct",
+                        "trailing_activation_pct"):
+                if key in overrides:
+                    effective[key] = float(overrides[key])
+            if "time_stop_days" in overrides:
+                effective["time_stop_days"] = float(overrides["time_stop_days"])
+        return effective
+
     def _check_exit_conditions(
         self,
         ts_code: str,
         day_high: Decimal,
         day_low: Decimal,
         bar: KBar,
+        market_state: str = "neutral",
     ) -> str | None:
         """Check risk-exit triggers for an open position on signal day `bar`.
 
@@ -689,33 +751,31 @@ class BacktestRunner:
         is still resolved later at the next day's open (next_open mode), so the
         decision date (td) and the fill date (td+1) stay consistent with the
         no-lookahead execution model.
+
+        ``market_state`` 用于动态止盈止损：根据市场状态选择不同的参数。
         """
+        tp_sl = self._get_effective_tp_sl(market_state)
         entry_price = self._entry_prices.get(ts_code)
         if entry_price is None or entry_price <= 0:
             return None
-        if self.config.stop_loss_pct > 0:
-            # Touched the stop when the day's low fell enough below entry.
+        if tp_sl["stop_loss_pct"] > 0:
             loss_pct = float((entry_price - day_low) / entry_price)
-            if loss_pct >= self.config.stop_loss_pct:
+            if loss_pct >= tp_sl["stop_loss_pct"]:
                 return "止损"
-        if self.config.take_profit_pct > 0:
-            # Touched the target when the day's high rose enough above entry.
+        if tp_sl["take_profit_pct"] > 0:
             profit_pct = float((day_high - entry_price) / entry_price)
-            if profit_pct >= self.config.take_profit_pct:
+            if profit_pct >= tp_sl["take_profit_pct"]:
                 return "止盈"
-        if self.config.trailing_stop_pct > 0 and self.config.trailing_activation_pct > 0:
+        if tp_sl["trailing_stop_pct"] > 0 and tp_sl["trailing_activation_pct"] > 0:
             highest = self._highest_since_entry.get(ts_code, entry_price)
-            activated = float((highest - entry_price) / entry_price) >= self.config.trailing_activation_pct
+            activated = float((highest - entry_price) / entry_price) >= tp_sl["trailing_activation_pct"]
             if activated:
-                # Trail fires when price retracts from the peak by the trail %,
-                # using the day's low as the worst intraday point.
                 trail_pct = float((highest - day_low) / highest)
-                if trail_pct >= self.config.trailing_stop_pct:
+                if trail_pct >= tp_sl["trailing_stop_pct"]:
                     return "移动止盈"
-        if self.config.time_stop_days > 0:
+        if tp_sl["time_stop_days"] > 0:
             entry_date = self._entry_dates.get(ts_code)
-            if entry_date is not None and (bar.trade_date - entry_date).days >= self.config.time_stop_days:
-                # Time stop only fires while still underwater (floating loss).
+            if entry_date is not None and (bar.trade_date - entry_date).days >= tp_sl["time_stop_days"]:
                 pnl_pct = float((day_low - entry_price) / entry_price)
                 if pnl_pct <= 0:
                     return "时间止损"
@@ -729,6 +789,7 @@ class BacktestRunner:
         fundamentals: "dict[str, list[dict[str, Any]]] | None" = None,
         defensive_klines: dict[str, list[KBar]] | None = None,
         defensive_benchmark_klines: list[KBar] | None = None,
+        tp_sl_benchmark_klines: list[KBar] | None = None,
     ) -> dict[str, Any]:
         """Run backtest for all stocks in the pool.
 
@@ -740,6 +801,10 @@ class BacktestRunner:
         snapshot rows (each containing ``announce_date``/``report_date`` and
         fields like ``roe``/``net_profit_growth``); exposed via
         ``ctx.fundamentals`` as the most recent announced report (no-lookahead).
+
+        ``tp_sl_benchmark_klines`` (optional) is the benchmark series used
+        for TP/SL market state detection. If not provided, falls back to
+        ``benchmark_klines``.
         """
         clear_ema_cache()  # Phase 2: 清空逐股 EMA 整段缓存，避免跨回测内存堆积
         clear_roll_cache()  # Phase 3: 清空逐股 rolling(MA/HHV/LLV/STD/SUM/REF) 整段缓存
@@ -754,6 +819,10 @@ class BacktestRunner:
             all_klines = merged
             self._all_klines = all_klines
         self._benchmark_arrays = _StockArrays.from_klines(benchmark_klines) if benchmark_klines else None
+        self._tp_sl_benchmark_arrays = (
+            _StockArrays.from_klines(tp_sl_benchmark_klines)
+            if tp_sl_benchmark_klines else self._benchmark_arrays
+        )
         self._defensive_benchmark_arrays = (
             _StockArrays.from_klines(defensive_benchmark_klines)
             if defensive_benchmark_klines else self._benchmark_arrays
@@ -829,16 +898,32 @@ class BacktestRunner:
                 self._stored_rebalance_plan = None
 
             total_asset = self._calc_total_asset(all_klines, td)
+
+            # 市场状态检测（用于动态止盈止损与避险切换）
+            if self._tp_sl_benchmark_arrays is not None:
+                market_state = self._detect_benchmark_state(td, use_tp_sl=True)
+            elif self._benchmark_arrays is not None:
+                market_state = self._detect_benchmark_state(td)
+            else:
+                market_state = "neutral"
+
             self.equity_curve.append({
                 "date": td.isoformat(),
                 "total_asset": float(total_asset),
                 "cash": float(self.cash),
                 "defensive": self._defensive_mode,
+                "market_state": market_state,
+                "bull_mode": self._bull_mode,
             })
 
             # ── 避险切换 overlay：基准走弱→清仓策略、配置避险库；转强→回归 ──
             if self._defensive_switch_active:
                 self._run_defensive_overlay(td, next_td, total_asset)
+
+            # ── 跷跷板择时：牛市买自选/熊市买避险/中性持现金 ──
+            if self._bull_bear_mode:
+                self._run_bull_bear_overlay(td, next_td, total_asset, market_state)
+                continue
 
             candidates: list[_SignalCandidate] = []
             for ts_code in self.config.stock_pool:
@@ -898,7 +983,7 @@ class BacktestRunner:
                     self._highest_since_entry[ts_code] = max(cur_high, bar.high)
                     self._lowest_since_entry[ts_code] = min(cur_low, bar.low)
 
-                exit_reason = self._check_exit_conditions(ts_code, bar.high, bar.low, bar)
+                exit_reason = self._check_exit_conditions(ts_code, bar.high, bar.low, bar, market_state=market_state)
                 if exit_reason:
                     if self.rebalance_planner is not None:
                         self.rebalance_planner.on_exit(ts_code, exit_reason)
@@ -914,7 +999,7 @@ class BacktestRunner:
                     continue
 
                 if self._script_mode:
-                    ctx = ScriptContext(self, ts_code, bar, total_asset)
+                    ctx = ScriptContext(self, ts_code, bar, total_asset, market_state=market_state)
                     try:
                         self._exec_strategy_script(ctx)
                     except Exception as exc:
@@ -966,6 +1051,7 @@ class BacktestRunner:
                     all_klines=self._all_klines,
                     extra_arrays=self._extra_arrays,
                     fundamental_rows=self._fundamental_rows,
+                    market_state=market_state,
                 )
                 signal_result = self._exec_strategy(ctx, total_asset)
                 if not signal_result.ok:
@@ -985,10 +1071,13 @@ class BacktestRunner:
                 # 仅当全局出场全关(自包含模式)时，才交由策略内部出场逻辑。
                 # 历史教训：#198 的 +10% 实际依赖"策略卖出被静默降级 + 内部出场失效"这一 bug，
                 # 修复后策略内部出场开始干扰全局，同源码同配置重跑(#204)塌到 -6.85%。
-                global_exit_active = (
+                # 动态止盈止损（dynamic_tp_sl）也视作全局出场激活。
+                flat_active = (
                     self.config.stop_loss_pct > 0 or self.config.take_profit_pct > 0
                     or self.config.trailing_stop_pct > 0 or self.config.time_stop_days > 0
                 )
+                dyn_active = bool(self.config.dynamic_tp_sl)
+                global_exit_active = flat_active or dyn_active
                 if (global_exit_active and self.positions.get(ts_code)
                         and self.positions[ts_code].shares > 0
                         and signal.get("signal_type") in ("卖出", "减仓")):
@@ -1680,13 +1769,14 @@ class BacktestRunner:
     # 避险切换（跷跷板）overlay 实现
     # ------------------------------------------------------------------
 
-    def _detect_benchmark_state(self, td: date) -> str:
+    def _detect_benchmark_state(self, td: date, use_tp_sl: bool = False) -> str:
         """基于内存基准 K 线（截至 td，与策略可见的 ``ctx.benchmark`` 对齐，防前视）
         判定大盘状态，返回 ``'up' | 'neutral' | 'down'``。
 
-        复用 seesaw 的纯函数 :func:`classify_market_state`，保证与实时判定逻辑一致。
+        当 ``use_tp_sl=True`` 时使用 TP/SL 专用的基准数组（``_tp_sl_benchmark_arrays``），
+        否则使用避险切换的基准数组。复用 seesaw 的纯函数 :func:`classify_market_state`。
         """
-        arrays = self._defensive_benchmark_arrays
+        arrays = self._tp_sl_benchmark_arrays if use_tp_sl else self._defensive_benchmark_arrays
         if arrays is None or not arrays.dates:
             return "neutral"
         # 取截至 td（含）的收盘价序列
@@ -1858,6 +1948,117 @@ class BacktestRunner:
         self._defensive_mode = False
         self._defensive_kept_strategy.clear()
 
+    def _run_bull_bear_overlay(self, td: date, next_td: "date | None", total_asset: Decimal, market_state: str) -> None:
+        """跷跷板择时 overlay：牛市买自选、熊市买避险、中性持现金。
+
+        状态机：
+        ┌──────────┬──────────┬──────────┬──────────┐
+        │ 当前态   │ up       │ down     │ neutral  │
+        ├──────────┼──────────┼──────────┼──────────┤
+        │ 现金     │ → 牛市   │ → 避险   │ 维持     │
+        │ 牛市     │ 维持     │ → 避险   │ → 现金   │
+        │ 避险     │ → 牛市   │ 维持     │ → 现金   │
+        └──────────┴──────────┴──────────┴──────────┘
+
+        ``bull_confirm_days`` 控制切换确认天数，``bull_smooth_days`` 控制分笔平滑。
+        """
+        # 更新状态计数器
+        st = self._bull_bear_state
+        if market_state != st.get("prev_state"):
+            st["state_days"] = 1
+            st["smooth_progress"] = 0.0
+        else:
+            st["state_days"] += 1
+        st["prev_state"] = market_state
+
+        confirm_days = max(1, self.config.bull_confirm_days)
+        smooth_days = max(1, self.config.bull_smooth_days)
+        confirmed = st["state_days"] >= confirm_days
+
+        if not confirmed:
+            return
+
+        is_bull = self._bull_mode
+        is_defensive = self._defensive_mode
+
+        # 计算目标状态
+        if market_state == "up" and not is_bull:
+            self._switch_to_bull(td, next_td, total_asset, smooth_days, st)
+        elif market_state == "down" and not is_defensive:
+            self._switch_to_defensive(td, next_td, total_asset, smooth_days, st)
+        elif market_state == "neutral" and (is_bull or is_defensive):
+            self._switch_to_cash(td, next_td, total_asset)
+
+    def _buy_pool_stocks(self, codes: list[str], td: date, next_td: "date | None",
+                         total_asset: Decimal, reason: str, smooth_days: int,
+                         st: dict[str, Any]) -> None:
+        """等权买入池中股票，支持平滑分笔。"""
+        pool = [c for c in codes if c in self._all_klines and not (self.positions.get(c) and self.positions[c].shares > 0)]
+        if not pool:
+            return
+        progress = st.get("smooth_progress", 0.0)
+        if progress >= 1.0:
+            return
+        step = 1.0 / smooth_days
+        progress = min(1.0, progress + step)
+        st["smooth_progress"] = progress
+        # 每只的目标权重 = 等权
+        target_weight = 1.0 / len(pool)
+        for code in pool:
+            self._execute_defensive_buy(code, td, next_td, target_weight, total_asset, reason)
+
+    def _switch_to_bull(self, td: date, next_td: "date | None", total_asset: Decimal,
+                        smooth_days: int, st: dict[str, Any]) -> None:
+        """切换到牛市模式：清仓全部持仓，买入牛市池。"""
+        self._sell_all_positions(td, next_td, total_asset, "转牛市-买入宽基")
+        self._cash_mode = False
+        self._bull_mode = True
+        self._defensive_mode = False
+        self._buy_pool_stocks(self._bull_pool_codes, td, next_td, total_asset, "转牛市-买入宽基", smooth_days, st)
+        if self._bull_episodes and self._bull_episodes[-1].get("exit_trade_date") is None:
+            self._bull_episodes[-1]["exit_trade_date"] = next_td
+        self._bull_episodes.append({
+            "entry_trade_date": next_td,
+            "exit_trade_date": None,
+            "holdings": list(self._bull_pool_codes),
+        })
+
+    def _switch_to_defensive(self, td: date, next_td: "date | None", total_asset: Decimal,
+                             smooth_days: int, st: dict[str, Any]) -> None:
+        """切换到避险模式：清仓全部持仓，买入避险池。"""
+        self._sell_all_positions(td, next_td, total_asset, "转避险-配置避险库")
+        self._cash_mode = False
+        self._bull_mode = False
+        self._defensive_mode = True
+        pool_codes = [c for c in self._defensive_pool_codes if c in self._all_klines]
+        self._buy_pool_stocks(pool_codes, td, next_td, total_asset, "转避险-配置避险库", smooth_days, st)
+        if self._defensive_episodes and self._defensive_episodes[-1].get("exit_trade_date") is None:
+            self._defensive_episodes[-1]["exit_trade_date"] = next_td
+        self._defensive_episodes.append({
+            "entry_trade_date": next_td,
+            "exit_trade_date": None,
+            "holdings": pool_codes,
+        })
+
+    def _switch_to_cash(self, td: date, next_td: "date | None", total_asset: Decimal) -> None:
+        """切换到现金模式：清仓全部持仓，持有现金。"""
+        self._sell_all_positions(td, next_td, total_asset, "转现金-观望")
+        self._cash_mode = True
+        self._bull_mode = False
+        self._defensive_mode = False
+        if self._bull_episodes and self._bull_episodes[-1].get("exit_trade_date") is None:
+            self._bull_episodes[-1]["exit_trade_date"] = next_td
+        if self._defensive_episodes and self._defensive_episodes[-1].get("exit_trade_date") is None:
+            self._defensive_episodes[-1]["exit_trade_date"] = next_td
+
+    def _sell_all_positions(self, td: date, next_td: "date | None", total_asset: Decimal, reason: str) -> None:
+        """清仓所有持仓。"""
+        for code in list(self.positions.keys()):
+            bar = self._find_bar(code, td)
+            if bar is None:
+                continue
+            self._execute_defensive_sell(code, td, next_td, total_asset, reason)
+
     def _build_defensive_stats(self) -> dict[str, Any]:
         """汇总避险切换统计：分段收益、链式累计、对总收益的贡献、明细。"""
         initial = float(self.config.initial_cash)
@@ -1891,12 +2092,18 @@ class BacktestRunner:
             bm_return_pct: float | None = None
             if bm_entry_close and bm_entry_close > 0 and bm_exit_close is not None and bm_exit_close > 0:
                 bm_return_pct = round((bm_exit_close - bm_entry_close) / bm_entry_close * 100, 4)
+            # 入场时的市场状态
+            entry_state = next(
+                (e.get("market_state", "neutral") for e in self.equity_curve if e["date"] == entry_iso),
+                "neutral",
+            )
             episodes.append({
                 "entry_date": entry_iso,
                 "exit_date": exit_iso,
                 "holdings": ep.get("holdings", []),
                 "return_pct": round(float(ep_return) * 100, 4),
                 "benchmark_return_pct": bm_return_pct,
+                "entry_market_state": entry_state,
             })
         defensive_days = sum(1 for e in self.equity_curve if e.get("defensive"))
         return {
@@ -1915,6 +2122,77 @@ class BacktestRunner:
             "contribution_pct": round(float(contribution) / initial * 100, 4) if initial > 0 else 0.0,
             "final_mode": "defensive" if self._defensive_mode else "normal",
             "detail": episodes,
+        }
+
+    def _build_bull_bear_stats(self) -> dict[str, Any]:
+        """汇总跷跷板择时统计：牛市/避险/现金三段收益。"""
+        if not self._bull_bear_mode:
+            return {"enabled": False}
+        initial = float(self.config.initial_cash)
+        equity_by_date = {e["date"]: e["total_asset"] for e in self.equity_curve}
+        last_date = self.equity_curve[-1]["date"] if self.equity_curve else None
+        bull_episodes: list[dict[str, Any]] = []
+        bull_chained = 1.0
+        def_episodes: list[dict[str, Any]] = []
+        def_chained = 1.0
+        cash_days = 0
+        for e in self.equity_curve:
+            ms = e.get("market_state", "neutral")
+            defensive = e.get("defensive", False)
+            bull = e.get("bull_mode", False)
+            if ms == "neutral" and not defensive and not bull:
+                cash_days += 1
+        for ep in self._bull_episodes:
+            entry = ep.get("entry_trade_date")
+            exit_ = ep.get("exit_trade_date")
+            if entry is None:
+                continue
+            entry_iso = entry.isoformat() if hasattr(entry, "isoformat") else str(entry)
+            exit_iso = exit_.isoformat() if (exit_ is not None and hasattr(exit_, "isoformat")) else last_date
+            ev_in = equity_by_date.get(entry_iso)
+            ev_out = equity_by_date.get(exit_iso) if exit_iso else None
+            if ev_in is None or ev_in <= 0:
+                continue
+            ep_return = (ev_out - ev_in) / ev_in if ev_out is not None else 0.0
+            bull_chained *= (1 + ep_return)
+            bull_episodes.append({
+                "entry_date": entry_iso,
+                "exit_date": exit_iso,
+                "holdings": ep.get("holdings", []),
+                "return_pct": round(float(ep_return) * 100, 4),
+            })
+        for ep in self._defensive_episodes:
+            entry = ep.get("entry_trade_date")
+            exit_ = ep.get("exit_trade_date")
+            if entry is None:
+                continue
+            entry_iso = entry.isoformat() if hasattr(entry, "isoformat") else str(entry)
+            exit_iso = exit_.isoformat() if (exit_ is not None and hasattr(exit_, "isoformat")) else last_date
+            ev_in = equity_by_date.get(entry_iso)
+            ev_out = equity_by_date.get(exit_iso) if exit_iso else None
+            if ev_in is None or ev_in <= 0:
+                continue
+            ep_return = (ev_out - ev_in) / ev_in if ev_out is not None else 0.0
+            def_chained *= (1 + ep_return)
+            def_episodes.append({
+                "entry_date": entry_iso,
+                "exit_date": exit_iso,
+                "holdings": ep.get("holdings", []),
+                "return_pct": round(float(ep_return) * 100, 4),
+            })
+        bull_days = sum(1 for e in self.equity_curve if e.get("bull_mode", False))
+        def_days = sum(1 for e in self.equity_curve if e.get("defensive", False))
+        return {
+            "enabled": True,
+            "bull_days": bull_days,
+            "defensive_days": def_days,
+            "cash_days": cash_days,
+            "bull_return_pct": round(float(bull_chained - 1) * 100, 4),
+            "defensive_return_pct": round(float(def_chained - 1) * 100, 4),
+            "bull_episodes": bull_episodes,
+            "defensive_episodes": def_episodes,
+            "bull_pool_size": len(self._bull_pool_codes),
+            "defensive_pool_size": len(self._defensive_pool_codes),
         }
 
     def _compute_results(self) -> dict[str, Any]:
@@ -1949,6 +2227,12 @@ class BacktestRunner:
                 "trade_records": [],
                 "equity_curve": [],
                 "defensive": self._build_defensive_stats(),
+                "market_state_stats": {
+                    "up": {"count": 0, "win_count": 0, "total_pnl": 0.0, "days": 0, "win_rate": 0.0, "avg_pnl": 0.0},
+                    "neutral": {"count": 0, "win_count": 0, "total_pnl": 0.0, "days": 0, "win_rate": 0.0, "avg_pnl": 0.0},
+                    "down": {"count": 0, "win_count": 0, "total_pnl": 0.0, "days": 0, "win_rate": 0.0, "avg_pnl": 0.0},
+                },
+                "bull_bear_stats": self._build_bull_bear_stats(),
             }
 
         initial = float(self.config.initial_cash)
@@ -2053,9 +2337,37 @@ class BacktestRunner:
 
         defensive_stats = self._build_defensive_stats()
 
+        # ── 各市场状态下的交易统计（用于可视化） ──
+        state_dates: dict[str, int] = {}
+        for e in self.equity_curve:
+            ms = e.get("market_state", "neutral")
+            state_dates[ms] = state_dates.get(ms, 0) + 1
+        state_trades: dict[str, dict[str, Any]] = {}
+        for state in ("up", "neutral", "down"):
+            state_trades[state] = {"count": 0, "win_count": 0, "total_pnl": 0.0, "days": state_dates.get(state, 0)}
+        for lot in self._closed_lots:
+            exit_date_str = lot.exit_date.isoformat()
+            lot_state = "neutral"
+            for e in reversed(self.equity_curve):
+                if e["date"] == exit_date_str:
+                    lot_state = e.get("market_state", "neutral")
+                    break
+            st = state_trades.get(lot_state)
+            if st is not None:
+                st["count"] += 1
+                if lot.pnl > 0:
+                    st["win_count"] += 1
+                st["total_pnl"] += float(lot.pnl)
+        for st in state_trades.values():
+            st["win_rate"] = round(st["win_count"] / st["count"], 4) if st["count"] > 0 else 0.0
+            st["avg_pnl"] = round(st["total_pnl"] / st["count"], 2) if st["count"] > 0 else 0.0
+            st["total_pnl"] = round(st["total_pnl"], 2)
+
         return {
             "total_return": round(total_return, 8),
             "defensive": defensive_stats,
+            "market_state_stats": state_trades,
+            "bull_bear_stats": self._build_bull_bear_stats(),
             "annual_return": round(annual_return, 8),
             "sharpe_ratio": round(sharpe, 8),
             "sortino_ratio": round(sortino, 8),
@@ -2077,6 +2389,8 @@ class BacktestRunner:
             "stock_rankings": pnl_analysis["stock_rankings"],
             "performance": {
                 "defensive": defensive_stats,
+                "market_state_stats": state_trades,
+                "bull_bear_stats": self._build_bull_bear_stats(),
                 "initial_cash": float(initial),
                 "final_asset": final,
                 "total_return_pct": round(total_return * 100, 4),
@@ -2151,6 +2465,7 @@ class BacktestRunner:
                 "take_profit_pct": self.config.take_profit_pct,
                 "trailing_stop_pct": self.config.trailing_stop_pct,
                 "time_stop_days": self.config.time_stop_days,
+                "dynamic_tp_sl": dict(self.config.dynamic_tp_sl) if self.config.dynamic_tp_sl else None,
             },
         }
 

@@ -2,9 +2,11 @@ import React from 'react'
 import { Loader2 } from 'lucide-react'
 import {
   BACKTEST_MARKETS,
+  INDEX_OPTIONS,
   type BacktestMarket,
   type BacktestRunParams,
   type BacktestTargetType,
+  type StrategyMode,
   type WatchlistGroupOption,
   defaultFiltersForTarget,
   normalizeMarketTarget,
@@ -31,12 +33,6 @@ function validate(params: BacktestRunParams, watchlistGroups: WatchlistGroupOpti
   const initialCash = Number(params.initial_cash)
   if (!params.initial_cash.trim() || !Number.isFinite(initialCash) || initialCash <= 0) return '初始资金必须是大于 0 的有限数值'
   if (params.benchmark_code.trim().length > 16) return '基准代码不能超过 16 个字符'
-  for (const [label, value] of [['止损', params.stop_loss_pct], ['止盈', params.take_profit_pct], ['移动止损', params.trailing_stop_pct]] as const) {
-    if (value.trim() && (!Number.isFinite(Number(value)) || Number(value) < 0)) return `${label}比例必须是非负有限数值`
-  }
-  if (params.time_stop_days.trim() && (!Number.isInteger(Number(params.time_stop_days)) || Number(params.time_stop_days) <= 0)) {
-    return '最大持仓天数必须是正整数'
-  }
   if (params.rebalance_mode !== 'disabled' && params.rebalance_mode !== 'ranked') return '请选择有效的调仓模式'
   if (params.rebalance_mode === 'ranked' && params.rebalance_version !== 1 && params.rebalance_version !== 2) return '请选择有效的调仓版本'
   if (!params.max_positions.trim() || !Number.isInteger(Number(params.max_positions)) || Number(params.max_positions) < 0) {
@@ -180,7 +176,10 @@ export default function BacktestRunModal({ title, submitLabel, initialParams, wa
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="text-sm font-medium text-muted">初始资金<input type="number" value={params.initial_cash} onChange={(event) => setParams({ ...params, initial_cash: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
-            <label className="text-sm font-medium text-muted">基准代码（可选）<input type="text" maxLength={16} value={params.benchmark_code} onChange={(event) => setParams({ ...params, benchmark_code: event.target.value })} placeholder="例如 000300.SH" className={`mt-1 ${inputClass}`} /></label>
+            <label className="text-sm font-medium text-muted">基准指数
+  <select value={params.benchmark_code} onChange={(event) => setParams({ ...params, benchmark_code: event.target.value })} className={`mt-1 ${inputClass}`}>
+    {INDEX_OPTIONS.map((opt) => <option key={opt.code} value={opt.code}>{opt.label}{opt.code ? ` (${opt.code})` : ''}</option>)}
+  </select></label>
           </div>
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -222,15 +221,42 @@ export default function BacktestRunModal({ title, submitLabel, initialParams, wa
           )}
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <label className="text-sm font-medium text-muted">止损 %（可选）<input type="number" min="0" step="0.1" value={params.stop_loss_pct} onChange={(event) => setParams({ ...params, stop_loss_pct: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
-            <label className="text-sm font-medium text-muted">止盈 %（可选）<input type="number" min="0" step="0.1" value={params.take_profit_pct} onChange={(event) => setParams({ ...params, take_profit_pct: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
-            <label className="text-sm font-medium text-muted">移动止损 %（可选）<input type="number" min="0" step="0.1" value={params.trailing_stop_pct} onChange={(event) => setParams({ ...params, trailing_stop_pct: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
-            <label className="text-sm font-medium text-muted">最大持仓天数（可选）<input type="number" min="1" step="1" value={params.time_stop_days} onChange={(event) => setParams({ ...params, time_stop_days: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
-          </div>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className="text-sm font-medium text-muted">单日最大买入只数（可选）<input type="number" min="0" step="1" value={params.max_daily_buys} onChange={(event) => setParams({ ...params, max_daily_buys: event.target.value })} placeholder="0=不限" className={`mt-1 ${inputClass}`} /></label>
             <p className="mt-6 text-xs leading-relaxed text-muted">限制每个交易日实际建仓（买入）的股票数量，避免一天内集中买入导致过早满仓，使资金分配更平滑、仓位控制更合理。0 表示不限制。</p>
+          </div>
+
+<div className="rounded-md border border-line bg-surface p-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-ink">
+              <input type="checkbox" checked={params.dynamic_tp_sl_enabled} onChange={(event) => {
+                setParams({ ...params, dynamic_tp_sl_enabled: event.target.checked })
+              }} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+              启用引擎止盈止损（关闭后完全交由策略代码控制）
+            </label>
+            {params.dynamic_tp_sl_enabled && (
+              <div className="mt-3 space-y-3">
+                <label className="text-sm font-medium text-muted">动态止盈止损基准指数（留空复用上方基准）
+  <select value={params.tp_sl_benchmark_code} onChange={(event) => setParams({ ...params, tp_sl_benchmark_code: event.target.value })} className={`mt-1 ${inputClass}`}>
+    <option value="">复用上方基准</option>
+    {INDEX_OPTIONS.filter((opt) => opt.code).map((opt) => <option key={opt.code} value={opt.code}>{opt.label} ({opt.code})</option>)}
+  </select></label>
+                {(['up' as const, 'down' as const, 'neutral' as const]).map((state) => {
+                  const labels: Record<string, string> = { up: '牛市', down: '熊市', neutral: '震荡市' }
+                  return (
+                    <div key={state} className="rounded-md border border-line/50 bg-surface/50 p-2">
+                      <span className="mb-1 block text-xs font-medium text-muted">{labels[state]} 参数</span>
+                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                        <label className="text-xs text-muted">止损 %<input type="number" min="0" step="0.1" value={params[`${state}_stop_loss_pct`] ?? ''} onChange={(e) => setParams({ ...params, [`${state}_stop_loss_pct`]: e.target.value })} className={`mt-0.5 ${inputClass}`} /></label>
+                        <label className="text-xs text-muted">止盈 %<input type="number" min="0" step="0.1" value={params[`${state}_take_profit_pct`] ?? ''} onChange={(e) => setParams({ ...params, [`${state}_take_profit_pct`]: e.target.value })} className={`mt-0.5 ${inputClass}`} /></label>
+                        <label className="text-xs text-muted">移动止损 %<input type="number" min="0" step="0.1" value={params[`${state}_trailing_stop_pct`] ?? ''} onChange={(e) => setParams({ ...params, [`${state}_trailing_stop_pct`]: e.target.value })} className={`mt-0.5 ${inputClass}`} /></label>
+                        <label className="text-xs text-muted">移动止损激活 %<input type="number" min="0" step="0.1" value={params[`${state}_trailing_activation_pct`] ?? ''} onChange={(e) => setParams({ ...params, [`${state}_trailing_activation_pct`]: e.target.value })} className={`mt-0.5 ${inputClass}`} /></label>
+                        <label className="text-xs text-muted">最大持仓天数<input type="number" min="1" step="1" value={params[`${state}_time_stop_days`] ?? ''} onChange={(e) => setParams({ ...params, [`${state}_time_stop_days`]: e.target.value })} className={`mt-0.5 ${inputClass}`} /></label>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            <p className="mt-1 text-xs leading-relaxed text-muted">引擎根据基准行情自动判别市场状态（牛市/熊市/震荡市），并使用对应状态的止盈止损参数。各状态默认值基于经验设定，可单独修改。关闭后所有出场交由策略代码自包含实现，引擎不做干预。</p>
           </div>
 
           <div className="rounded-md border border-line bg-surface p-3">
@@ -238,7 +264,34 @@ export default function BacktestRunModal({ title, submitLabel, initialParams, wa
               <input type="checkbox" checked={params.defensive_enabled} onChange={(event) => setParams({ ...params, defensive_enabled: event.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
               启用避险（基准走弱时切换避险资产）
             </label>
-            <p className="mt-1 text-xs leading-relaxed text-muted">开启后，回测将监测基准（取自上方“基准代码”，默认沪深300）。当基准进入弱势时，清空策略持仓并等权买入整个避险库（避险库标的由人工维护、全部启用，引擎不计算质量分、不限制只数）；转强后回归策略。属于风控动作（减仓/清仓/对冲），不改变策略本身。</p>
+            <p className="mt-1 text-xs leading-relaxed text-muted">开启后，回测将监测基准（取自上方"基准代码"，默认沪深300）。当基准进入弱势时，清空策略持仓并等权买入整个避险库（避险库标的由人工维护、全部启用，引擎不计算质量分、不限制只数）；转强后回归策略。属于风控动作（减仓/清仓/对冲），不改变策略本身。</p>
+          </div>
+
+          <div className="rounded-md border border-line bg-surface p-3">
+            <span className="mb-1 block text-sm font-medium text-ink">策略模式</span>
+            <div className="grid grid-cols-2 gap-2">
+              {([['signal', '信号模式'], ['bull_bear', '跷跷板']] as const).map(([mode, label]) => (
+                <button key={mode} type="button" onClick={() => setParams({ ...params, strategy_mode: mode as StrategyMode })} aria-pressed={params.strategy_mode === mode} className={`min-h-10 rounded-md border px-2 text-sm font-medium ${params.strategy_mode === mode ? 'border-accent bg-accent text-white' : 'border-line bg-surface text-ink hover:bg-rowHover'}`}>{label}</button>
+              ))}
+            </div>
+            {params.strategy_mode === 'signal' && (
+              <p className="mt-1 text-xs leading-relaxed text-muted">默认模式：策略发出买入/卖出信号，引擎执行交易。</p>
+            )}
+            {params.strategy_mode === 'bull_bear' && (
+              <div className="mt-3 space-y-3">
+                <label className="text-sm font-medium text-muted">牛市自选分组
+                  <select disabled={watchlistGroupsLoading} value={params.bull_pool_group_name} onChange={(event) => setParams({ ...params, bull_pool_group_name: event.target.value })} className={`mt-1 ${inputClass}`}>
+                    <option value="">{watchlistGroupsLoading ? '正在加载' : '请选择'}</option>
+                    {watchlistGroups.map((group) => <option key={group.group_name} value={group.group_name}>{group.group_name} ({group.item_count} 只)</option>)}
+                  </select>
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="text-sm font-medium text-muted">确认天数<input type="number" min="1" step="1" value={params.bull_confirm_days} onChange={(event) => setParams({ ...params, bull_confirm_days: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
+                  <label className="text-sm font-medium text-muted">平滑天数<input type="number" min="1" step="1" value={params.bull_smooth_days} onChange={(event) => setParams({ ...params, bull_smooth_days: event.target.value })} className={`mt-1 ${inputClass}`} /></label>
+                </div>
+                <p className="text-xs leading-relaxed text-muted">牛市买自选：基准转牛时买入自选分组标的，转熊时切换避险库，中性时持现金。确认天数：需连续N日确认才触发切换。</p>
+              </div>
+            )}
           </div>
           {(error || submitError) && <p id={errorId} role="alert" className="text-sm text-red-600">{error ?? submitError}</p>}
         </div>
