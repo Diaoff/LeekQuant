@@ -18,6 +18,7 @@ const SimulationPage = React.lazy(() => import('./pages/SimulationPage'))
 const StatusPage = React.lazy(() => import('./pages/StatusPage'))
 const StrategyPage = React.lazy(() => import('./pages/StrategyPage'))
 const WatchlistPage = React.lazy(() => import('./pages/WatchlistPage'))
+const SeesawPage = React.lazy(() => import('./pages/SeesawPage'))
 
 function PageFallback() {
   return (
@@ -48,6 +49,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
                 <Route path="/backtests/compare" element={<BacktestPage />} />
                 <Route path="/signals" element={<SignalsPage />} />
                 <Route path="/simulation" element={<SimulationPage />} />
+                <Route path="/seesaw" element={<SeesawPage />} />
               </Routes>
             </Suspense>
           </App>

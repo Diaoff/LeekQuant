@@ -16,6 +16,7 @@ from app.api.metrics import router as metrics_router
 from app.api.preferences import router as preferences_router
 from app.api.realtime import router as realtime_router
 from app.api.signals import router as signals_router
+from app.api.seesaw import router as seesaw_router
 from app.api.sim import router as sim_router
 from app.api.sources import router as sources_router
 from app.api.stocks import router as stocks_router
@@ -112,6 +113,7 @@ app.include_router(preferences_router)
 app.include_router(realtime_router)
 app.include_router(system_router)
 app.include_router(metrics_router)
+app.include_router(seesaw_router)
 
 
 @app.get("/health", tags=["health"])

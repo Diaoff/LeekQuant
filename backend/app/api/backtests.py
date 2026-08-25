@@ -648,13 +648,14 @@ async def get_backtest_klines(
     backtest_id: int,
     req: Request,
     ts_code: str = Query(..., min_length=1),
+    benchmark_code: str | None = Query(default=None),
     session: AsyncSession = Depends(get_session),
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     user_id = current_user_id(req)
     result = await session.execute(
         text(
             """
-            SELECT start_date, end_date
+            SELECT start_date, end_date, benchmark_code
             FROM backtest_results
             WHERE id = :id AND user_id = :user_id
             """
@@ -666,7 +667,18 @@ async def get_backtest_klines(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="backtest not found")
 
     klines = await get_klines(session, ts_code, row["start_date"], row["end_date"])
-    return _serialize_kline_rows(klines)
+    response: dict[str, Any] = {"stock_klines": _serialize_kline_rows(klines)}
+
+    bm_code = benchmark_code or row["benchmark_code"]
+    if bm_code:
+        bm_klines = await get_klines(session, bm_code, row["start_date"], row["end_date"])
+        response["benchmark_klines"] = [
+            {"date": str(r["trade_date"]), "close": float(r["close"])}
+            for r in bm_klines
+            if r["close"] is not None
+        ]
+
+    return response
 
 
 @router.delete("/{backtest_id}")

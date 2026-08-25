@@ -9,6 +9,7 @@ import {
   BarChart3,
   RadioTower,
   WalletCards,
+  ShieldCheck,
   Settings,
   ChevronLeft,
   ChevronRight,
@@ -17,7 +18,7 @@ import {
 } from 'lucide-react'
 import { useTheme } from '../lib/theme'
 
-type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest' | 'signals' | 'simulation' | 'preferences'
+type ViewKey = 'dashboard' | 'status' | 'market' | 'watchlist' | 'strategy' | 'backtest' | 'signals' | 'simulation' | 'seesaw' | 'preferences'
 
 const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: string }> = [
   { key: 'dashboard', label: '仪表盘', icon: <LayoutDashboard className="h-5 w-5" />, to: '/' },
@@ -28,6 +29,7 @@ const navItems: Array<{ key: ViewKey; label: string; icon: React.ReactNode; to: 
   { key: 'backtest', label: '回测', icon: <BarChart3 className="h-5 w-5" />, to: '/backtests' },
   { key: 'signals', label: '信号中心', icon: <RadioTower className="h-5 w-5" />, to: '/signals' },
   { key: 'simulation', label: '模拟交易', icon: <WalletCards className="h-5 w-5" />, to: '/simulation' },
+  { key: 'seesaw', label: '避险库', icon: <ShieldCheck className="h-5 w-5" />, to: '/seesaw' },
   { key: 'preferences', label: '偏好设置', icon: <Settings className="h-5 w-5" />, to: '/preferences' },
 ]
 
@@ -69,6 +71,7 @@ export default function Layout({ children }: LayoutProps) {
     if (path.startsWith('/backtests')) return 'backtest'
     if (path === '/signals') return 'signals'
     if (path === '/simulation') return 'simulation'
+    if (path === '/seesaw') return 'seesaw'
     if (path === '/preferences' || path === '/sources') return 'preferences'
     return 'dashboard'
   }, [location.pathname])

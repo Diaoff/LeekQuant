@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.backtest.tasks",
         "app.tasks.trading_tasks",
         "app.tasks.signal_tasks",
+        "app.tasks.seesaw_tasks",
     ],
 )
 celery_app.conf.update(
@@ -106,6 +107,10 @@ celery_app.conf.update(
         "cleanup-stale-task-runs-hourly": {
             "task": "app.tasks.data_tasks.cleanup_stale_task_runs",
             "schedule": crontab(minute=15),  # hourly at :15
+        },
+        "check-market-state-daily": {
+            "task": "app.tasks.seesaw_tasks.check_market_state",
+            "schedule": crontab(hour=16, minute=5),
         },
         "kline-sync-recover-stuck": {
             "task": "app.tasks.data_tasks.kline_sync_recover_stuck",

@@ -17,8 +17,8 @@ engine = create_async_engine(
     pool_timeout=30,
     connect_args={
         "server_settings": {
-            "statement_timeout": "60000",
-            "idle_in_transaction_session_timeout": "30000",
+            "statement_timeout": "600000",
+            "idle_in_transaction_session_timeout": "0",
         },
     },
 )

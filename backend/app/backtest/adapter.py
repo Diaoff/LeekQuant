@@ -7,6 +7,7 @@ Supports stop-loss, take-profit, trailing stop, and time-based stop.
 """
 from __future__ import annotations
 
+import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import date
@@ -19,6 +20,8 @@ from app.backtest.cost import AShareCostCalculator, CostResult, FeeConfig
 from app.backtest.signals import SignalInput, SignalOutput, apply_cn_rules, map_signal_to_action
 from app.backtest.strategy_runtime import (StrategyExecutionResult, compile_strategy, execute_compiled_signal, execute_compiled_script)
 from app.libs.MyTT import clear_ema_cache, clear_roll_cache
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -156,6 +159,22 @@ class BacktestConfig:
     execution_timeframe: str = "1D"
     signal_timeframe: str = "1D"
     strategy_mode: str = "signal"
+
+    # ── 避险切换（跷跷板）：基准走弱时把资金动态配置到避险库 ──
+    # 由回测提交参数 params_snapshot.defensive_switch 控制，默认关闭，
+    # 不影响既有回测。开启时引擎在时序中监测基准状态，down 则清仓策略、
+    # 从避险库等权买入全部标的；defensive_pick_k=0 表示全池等权（前端默认），
+    # >0 为内部/进阶择优选前 K 只（前端不暴露）。
+    # 转强（up/neutral）则清仓避险、回归策略。
+    defensive_switch_enabled: bool = False
+    defensive_pool_codes: list[str] = field(default_factory=list)  # 全部启用避险池标的（不限制前几）
+    defensive_rules: dict[str, Any] = field(default_factory=dict)  # DefensiveRules 字段子集
+    defensive_benchmark_code: str | None = None
+    # ── 避险 V3：一键清仓全部持仓 + 池内等权买入（不计算质量分/自动排名）──
+    # defensive_pick_k：0（默认，前端不暴露）= 全池等权买入；
+    # >0 = 内部/进阶择优选前 K 只（按近 N 日抗跌性）。当前前端固定走全池等权。
+    defensive_pick_k: int = 0             # 0=全池等权（前端默认）；>0=内部择优选前 K 只
+    defensive_pick_ret_window: int = 10   # 抗跌评估窗口：近 N 日区间涨幅，跌幅最小（涨幅最高）者最抗跌
 
 
 @dataclass(slots=True)
@@ -613,6 +632,19 @@ class BacktestRunner:
         self._entry_dates: dict[str, date] = {}
         self._entry_prices: dict[str, Decimal] = {}
         self._highest_since_entry: dict[str, Decimal] = {}
+        # 避险切换（跷跷板）状态——在 __init__ 预置默认值，
+        # 保证直接调用 _compute_results()（如单测）也不会因属性缺失而报错。
+        self._defensive_mode = False
+        self._defensive_pool_codes: list[str] = []
+        self._defensive_rules: dict[str, Any] = dict(config.defensive_rules or {})
+        self._defensive_episodes: list[dict[str, Any]] = []
+        self._defensive_switch_active = False
+        self._defensive_benchmark_arrays = None
+        # V3: 择优选股参数
+        self._defensive_pick_k = max(0, int(config.defensive_pick_k or 0))
+        self._defensive_pick_ret_window = max(2, int(config.defensive_pick_ret_window or 10))
+        # 记录进入避险时被"保留"的强势持仓代码（用于退出时延后清仓）
+        self._defensive_kept_strategy = set()
         self._lowest_since_entry: dict[str, Decimal] = {}
         self._open_lots: dict[str, list[_LotEntry]] = {}
         self._closed_lots: list[_ClosedLot] = []
@@ -695,6 +727,8 @@ class BacktestRunner:
         benchmark_klines: list[KBar] | None = None,
         extra_klines: dict[str, list[KBar]] | None = None,
         fundamentals: "dict[str, list[dict[str, Any]]] | None" = None,
+        defensive_klines: dict[str, list[KBar]] | None = None,
+        defensive_benchmark_klines: list[KBar] | None = None,
     ) -> dict[str, Any]:
         """Run backtest for all stocks in the pool.
 
@@ -709,11 +743,45 @@ class BacktestRunner:
         """
         clear_ema_cache()  # Phase 2: 清空逐股 EMA 整段缓存，避免跨回测内存堆积
         clear_roll_cache()  # Phase 3: 清空逐股 rolling(MA/HHV/LLV/STD/SUM/REF) 整段缓存
+        # 股票池（策略）K 线，单独保留用于交易日历推导，避免避险库日期污染时序
+        self._stock_all_klines = all_klines
         self._all_klines = all_klines
+        # 避险库 K 线并入统一行情宇宙：估值(_calc_total_asset)与成交(_find_bar)
+        # 即可覆盖避险股，无需改动既有执行/估值路径。
+        if defensive_klines:
+            merged = dict(all_klines)
+            merged.update(defensive_klines)
+            all_klines = merged
+            self._all_klines = all_klines
         self._benchmark_arrays = _StockArrays.from_klines(benchmark_klines) if benchmark_klines else None
+        self._defensive_benchmark_arrays = (
+            _StockArrays.from_klines(defensive_benchmark_klines)
+            if defensive_benchmark_klines else self._benchmark_arrays
+        )
         self._extra_arrays = {
             name: _StockArrays.from_klines(kl) for name, kl in (extra_klines or {}).items()
         }
+
+        # ── 避险切换（跷跷板）状态初始化 ──
+        self._defensive_mode = False
+        self._defensive_pool_codes = list(self.config.defensive_pool_codes)
+        self._defensive_rules = dict(self.config.defensive_rules or {})
+        self._defensive_episodes: list[dict[str, Any]] = []
+        self._defensive_switch_active = (
+            self.config.defensive_switch_enabled
+            and bool(self._defensive_benchmark_arrays)
+            and bool(self._defensive_pool_codes)
+        )
+        # V3: 择优选股参数（run() 阶段再次落位，供直接单测构造 BacktestRunner 使用）
+        self._defensive_pick_k = max(0, int(self.config.defensive_pick_k or 0))
+        self._defensive_pick_ret_window = max(2, int(self.config.defensive_pick_ret_window or 10))
+        self._defensive_kept_strategy: set[str] = set()
+        if self.config.defensive_switch_enabled and not self._defensive_switch_active:
+            logger.warning(
+                "defensive switch enabled but inactive (benchmark=%s, pool_size=%d) — "
+                "need both a benchmark series and a non-empty defensive pool",
+                self.config.defensive_benchmark_code, len(self._defensive_pool_codes),
+            )
         # 预处理基本面：剔除无公告日(防前视锚点缺失)的行，按 (announce_date, report_date) 排序
         self._fundamental_rows: "dict[str, list[dict[str, Any]]]" = {}
         for _code, _rows in (fundamentals or {}).items():
@@ -722,7 +790,7 @@ class BacktestRunner:
                 _clean.sort(key=lambda r: (r["announce_date"], r.get("report_date") or date.min))
                 self._fundamental_rows[_code] = _clean
         self._stock_day_index = {code: 0 for code in self.config.stock_pool}
-        trading_dates = self._get_trading_dates(all_klines)
+        trading_dates = self._get_trading_dates(self._stock_all_klines)
         if not trading_dates:
             raise ValueError("no trading dates found in the specified range")
 
@@ -751,7 +819,7 @@ class BacktestRunner:
             next_td = trading_dates[i + 1] if i + 1 < len(trading_dates) else None
 
             # Execute stored rebalance plan at the open of the fill date
-            if self._stored_rebalance_plan is not None and self.rebalance_planner is not None:
+            if self._stored_rebalance_plan is not None and self.rebalance_planner is not None and not self._defensive_mode:
                 fill_bar_map: dict[str, KBar] = {}
                 for ts_code in set(self.config.stock_pool):
                     bar = self._find_bar(ts_code, td)
@@ -765,10 +833,18 @@ class BacktestRunner:
                 "date": td.isoformat(),
                 "total_asset": float(total_asset),
                 "cash": float(self.cash),
+                "defensive": self._defensive_mode,
             })
+
+            # ── 避险切换 overlay：基准走弱→清仓策略、配置避险库；转强→回归 ──
+            if self._defensive_switch_active:
+                self._run_defensive_overlay(td, next_td, total_asset)
 
             candidates: list[_SignalCandidate] = []
             for ts_code in self.config.stock_pool:
+                if self._defensive_mode:
+                    # 避险模式下跳过策略选股，仅持有避险库（切换由 overlay 直接执行）
+                    continue
                 klines = all_klines.get(ts_code, [])
                 if not klines:
                     continue
@@ -1009,7 +1085,7 @@ class BacktestRunner:
                 self.signals.append(signal_record)
 
             # ---- Phase 4: weekly rebalance check (v2) ----
-            if self.rebalance_planner is not None and self.rebalance_planner.should_run_weekly(td, trading_dates):
+            if self.rebalance_planner is not None and not self._defensive_mode and self.rebalance_planner.should_run_weekly(td, trading_dates):
                 plan = self.rebalance_planner.plan(td, all_klines, total_asset, trading_dates)
                 if plan is not None:
                     plan.fill_date = next_td
@@ -1600,6 +1676,247 @@ class BacktestRunner:
         except Exception:
             return "next_open"
 
+    # ------------------------------------------------------------------
+    # 避险切换（跷跷板）overlay 实现
+    # ------------------------------------------------------------------
+
+    def _detect_benchmark_state(self, td: date) -> str:
+        """基于内存基准 K 线（截至 td，与策略可见的 ``ctx.benchmark`` 对齐，防前视）
+        判定大盘状态，返回 ``'up' | 'neutral' | 'down'``。
+
+        复用 seesaw 的纯函数 :func:`classify_market_state`，保证与实时判定逻辑一致。
+        """
+        arrays = self._defensive_benchmark_arrays
+        if arrays is None or not arrays.dates:
+            return "neutral"
+        # 取截至 td（含）的收盘价序列
+        idx = None
+        for i, d in enumerate(arrays.dates):
+            if d <= td:
+                idx = i
+            else:
+                break
+        if idx is None:
+            return "neutral"
+        closes = arrays.close[: idx + 1]
+        try:
+            from app.data.seesaw import DefensiveRules, classify_market_state
+        except Exception:
+            return "neutral"
+        rules = DefensiveRules()
+        for k, v in self._defensive_rules.items():
+            if k in DefensiveRules.__dataclass_fields__:
+                if k in ("drop_threshold", "high_drop_pct", "vol_expand_thresh"):
+                    try:
+                        v = Decimal(str(v))
+                    except Exception:
+                        continue
+                try:
+                    setattr(rules, k, v)
+                except Exception:
+                    continue
+        if len(closes) < rules.ma_long + 1:
+            return "neutral"
+        state, _detail = classify_market_state(closes, rules)
+        return state
+
+    def _stock_ret_n(self, code: str, td: date, period: int = 10) -> float | None:
+        """返回 code 截至 td 的 period 日区间涨幅；数据不足返回 None。"""
+        kl = self._all_klines.get(code, [])
+        closes = [float(k.close) for k in kl if k.trade_date <= td and k.close is not None]
+        if len(closes) < period + 1:
+            return None
+        ref = closes[-period - 1]
+        if ref <= 0:
+            return None
+        return closes[-1] / ref - 1.0
+
+    def _defensive_pick_best(self, pool_codes: list[str], td: date, top_k: int) -> list[str]:
+        """从避险池候选里择优：按近 N 日相对强度（抗跌性）排序，取涨幅最高（最抗跌）的前 top_k 只。
+
+        大盘弱时跌幅最小者 = 最抗跌，作为避险标的的理想候选。数据不足的标的垫底（
+        新上市/停牌），不会入选除非候选不足。
+        """
+        if top_k <= 0 or top_k >= len(pool_codes):
+            return pool_codes
+        window = self._defensive_pick_ret_window
+        scored = []
+        for c in pool_codes:
+            r = self._stock_ret_n(c, td, window)
+            scored.append((r if r is not None else -99.0, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [c for _r, c in scored[:top_k]]
+
+    def _execute_defensive_sell(self, code: str, td: date, next_td: "date | None",
+                                total_asset: Decimal, reason: str) -> None:
+        """避险路径下的清仓（不改 ctx.state，仅交易与信号记录）。"""
+        bar = self._find_bar(code, td)
+        if bar is None:
+            return
+        fill = self._find_bar(code, next_td) if next_td is not None else None
+        self._execute_action(
+            SignalOutput(action="SELL_ALL", target_position=0.0),
+            code, bar, total_asset,
+            signal={"signal_type": "避险切换", "reason": reason},
+            exit_reason="避险切换",
+            fill_bar=fill,
+        )
+        self.signals.append({
+            "ts_code": code,
+            "trade_date": td.isoformat(),
+            "signal_type": "避险切换",
+            "action": "SELL_ALL",
+            "target_position": 0.0,
+            "exit_reason": "避险切换",
+            "reason": reason,
+        })
+
+    def _execute_defensive_buy(self, code: str, td: date, next_td: "date | None",
+                               weight: float, total_asset: Decimal, reason: str) -> None:
+        bar = self._find_bar(code, td)
+        if bar is None:
+            return
+        fill = self._find_bar(code, next_td) if next_td is not None else None
+        self._execute_action(
+            SignalOutput(action="BUY", target_position=float(weight)),
+            code, bar, total_asset,
+            signal={"signal_type": "避险买入", "reason": reason, "target_position": float(weight)},
+            fill_bar=fill,
+        )
+        self.signals.append({
+            "ts_code": code,
+            "trade_date": td.isoformat(),
+            "signal_type": "避险买入",
+            "action": "BUY",
+            "target_position": float(weight),
+            "exit_reason": "",
+            "reason": reason,
+        })
+
+    def _run_defensive_overlay(self, td: date, next_td: "date | None", total_asset: Decimal) -> None:
+        """避险切换 overlay（V3）：
+
+        - 非避险态 + 大盘 down     → 进入避险：
+            * 一键清仓全部策略持仓（不保留、无逐股判断）
+            * 从避险池等权买入全部标的（defensive_pick_k<=0）；>0 时择优选前 K 只
+        - 避险态 + 大盘 down       → 维持（持有避险股，等待转强）
+        - 避险态 + 大盘 非down     → 一键清仓避险股并退出避险态（记录分段）
+        - 非避险态 + 大盘 非down   → 正常策略（无动作）
+
+        执行直接调用 :meth:`_execute_action`（不走候选管道），不受
+        ``max_daily_buys``/再平衡规划器干扰；成交均在 ``next_td`` 开盘发生，
+        与既有 next_open 模型一致，无未来函数。
+        """
+        state = self._detect_benchmark_state(td)
+        is_down = state == "down"
+
+        # 避险池候选 = 全部启用标的（不限制前几）
+        pool_codes = [c for c in self._defensive_pool_codes if c in self._all_klines]
+
+        if not self._defensive_mode:
+            if not is_down:
+                return  # 正常策略，无动作
+            # ── 进入避险：一键清仓全部策略持仓 ──
+            for code in list(self.positions.keys()):
+                bar = self._find_bar(code, td)
+                if bar is None:
+                    continue
+                self._execute_defensive_sell(code, td, next_td, total_asset, "基准走弱(避险)")
+            # 等权买入全部避险池标的（defensive_pick_k<=0）；>0 时择优选前 K 只
+            chosen: list[str] = []
+            if pool_codes:
+                chosen = self._defensive_pick_best(pool_codes, td, self._defensive_pick_k)
+                chosen = [c for c in chosen if not (self.positions.get(c) and self.positions[c].shares > 0)]
+                if chosen:
+                    weight = 1.0 / len(chosen)
+                    for code in chosen:
+                        self._execute_defensive_buy(code, td, next_td, weight, total_asset, "基准走弱-配置避险库")
+            # 记录实际买入的避险标的（按池内优先级排序，剔除未被选入者）
+            _chosen_set = set(chosen)
+            holdings = [c for c in pool_codes if c in _chosen_set]
+            self._defensive_episodes.append({
+                "entry_trade_date": next_td,
+                "exit_trade_date": None,
+                "holdings": holdings,
+            })
+            self._defensive_mode = True
+            return
+
+        # ── 避险态 ──
+        if is_down:
+            return  # 维持避险：持有避险股，等待大盘转强
+
+        # ── 避险态 → 退出（大盘转非down）：一键清仓避险股并回归策略 ──
+        for code in list(self.positions.keys()):
+            if code in self._defensive_pool_codes:
+                bar = self._find_bar(code, td)
+                if bar is None:
+                    continue
+                self._execute_defensive_sell(code, td, next_td, total_asset, "基准转强(回归策略)")
+        if self._defensive_episodes and self._defensive_episodes[-1].get("exit_trade_date") is None:
+            self._defensive_episodes[-1]["exit_trade_date"] = next_td
+        self._defensive_mode = False
+        self._defensive_kept_strategy.clear()
+
+    def _build_defensive_stats(self) -> dict[str, Any]:
+        """汇总避险切换统计：分段收益、链式累计、对总收益的贡献、明细。"""
+        initial = float(self.config.initial_cash)
+        equity_by_date = {e["date"]: e["total_asset"] for e in self.equity_curve}
+        last_date = self.equity_curve[-1]["date"] if self.equity_curve else None
+        episodes: list[dict[str, Any]] = []
+        chained = 1.0
+        contribution = 0.0
+        # 构建基准收盘价按日期的快速查找表
+        bm_close_by_date: dict[str, float] = {}
+        if self._defensive_benchmark_arrays is not None:
+            for d, c in zip(self._defensive_benchmark_arrays.dates, self._defensive_benchmark_arrays.close):
+                bm_close_by_date[str(d)] = float(c)
+        for ep in self._defensive_episodes:
+            entry = ep.get("entry_trade_date")
+            exit_ = ep.get("exit_trade_date")
+            if entry is None:
+                continue
+            entry_iso = entry.isoformat() if hasattr(entry, "isoformat") else str(entry)
+            exit_iso = exit_.isoformat() if (exit_ is not None and hasattr(exit_, "isoformat")) else last_date
+            ev_in = equity_by_date.get(entry_iso)
+            ev_out = equity_by_date.get(exit_iso) if exit_iso else None
+            if ev_in is None or ev_in <= 0:
+                continue
+            ep_return = (ev_out - ev_in) / ev_in if ev_out is not None else 0.0
+            chained *= (1 + ep_return)
+            contribution += (ev_out - ev_in) if ev_out is not None else 0.0
+            # 同期基准涨跌幅
+            bm_entry_close = bm_close_by_date.get(entry_iso)
+            bm_exit_close = bm_close_by_date.get(str(exit_iso)) if exit_iso else None
+            bm_return_pct: float | None = None
+            if bm_entry_close and bm_entry_close > 0 and bm_exit_close is not None and bm_exit_close > 0:
+                bm_return_pct = round((bm_exit_close - bm_entry_close) / bm_entry_close * 100, 4)
+            episodes.append({
+                "entry_date": entry_iso,
+                "exit_date": exit_iso,
+                "holdings": ep.get("holdings", []),
+                "return_pct": round(float(ep_return) * 100, 4),
+                "benchmark_return_pct": bm_return_pct,
+            })
+        defensive_days = sum(1 for e in self.equity_curve if e.get("defensive"))
+        return {
+            "enabled": self.config.defensive_switch_enabled,
+            "active": self._defensive_switch_active,
+            "benchmark_code": self.config.defensive_benchmark_code or self.config.benchmark_code,
+            # 实际买入只数：pick_k==0 表示全池等权；否则取 min(pick_k, 池长)
+            "pool_size": (
+                len(self._defensive_pool_codes)
+                if self._defensive_pick_k == 0
+                else min(self._defensive_pick_k, len(self._defensive_pool_codes))
+            ),
+            "periods": len(episodes),
+            "days": defensive_days,
+            "return_pct": round(float(chained - 1) * 100, 4),
+            "contribution_pct": round(float(contribution) / initial * 100, 4) if initial > 0 else 0.0,
+            "final_mode": "defensive" if self._defensive_mode else "normal",
+            "detail": episodes,
+        }
+
     def _compute_results(self) -> dict[str, Any]:
         if not self.equity_curve:
             pnl_analysis = self._build_pnl_analysis()
@@ -1631,6 +1948,7 @@ class BacktestRunner:
                 },
                 "trade_records": [],
                 "equity_curve": [],
+                "defensive": self._build_defensive_stats(),
             }
 
         initial = float(self.config.initial_cash)
@@ -1733,8 +2051,11 @@ class BacktestRunner:
             if month_start_val > 0 and values:
                 monthly_returns[current_month] = (values[-1] - month_start_val) / month_start_val
 
+        defensive_stats = self._build_defensive_stats()
+
         return {
             "total_return": round(total_return, 8),
+            "defensive": defensive_stats,
             "annual_return": round(annual_return, 8),
             "sharpe_ratio": round(sharpe, 8),
             "sortino_ratio": round(sortino, 8),
@@ -1755,6 +2076,7 @@ class BacktestRunner:
             "closed_lots": pnl_analysis["closed_lots"],
             "stock_rankings": pnl_analysis["stock_rankings"],
             "performance": {
+                "defensive": defensive_stats,
                 "initial_cash": float(initial),
                 "final_asset": final,
                 "total_return_pct": round(total_return * 100, 4),

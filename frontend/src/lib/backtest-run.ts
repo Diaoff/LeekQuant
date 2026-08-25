@@ -25,6 +25,7 @@ export interface BacktestRunParams {
   score_max_age_sessions: string
   max_positions: string
   max_daily_buys: string
+  defensive_enabled: boolean
   preservedConfig: Record<string, unknown>
 }
 
@@ -148,6 +149,7 @@ export function createDefaultBacktestRunParams(now = new Date()): BacktestRunPar
     score_max_age_sessions: '5',
     max_positions: '0',
     max_daily_buys: '0',
+    defensive_enabled: false,
     preservedConfig: {},
   }
 }
@@ -231,6 +233,7 @@ export function mapHistoricalBacktestRun(result: HistoricalBacktestResult): Back
     score_max_age_sessions: '5',
     max_positions: displayNumber(configValue('max_positions')) || '0',
     max_daily_buys: displayNumber(configValue('max_daily_buys')) || '0',
+    defensive_enabled: Boolean(record(config.defensive_switch).enabled),
     preservedConfig: { ...config },
   }
 }
@@ -272,6 +275,21 @@ function buildConfig(params: BacktestRunParams): Record<string, unknown> {
   const maxDailyBuys = finiteNumber(params.max_daily_buys)
   if (maxDailyBuys !== null && maxDailyBuys > 0) {
     config.max_daily_buys = maxDailyBuys
+  }
+  // 避险切换（跷跷板）：启用时把 defensive_switch 写入 params_snapshot，
+  // 后端据此在回测时序中监测基准、切换避险资产。
+  // 避险库由人工维护、全部启用、等权买入（不计算质量分、不限制只数）；
+  // benchmark_code：避险判定所用基准（缺省回落到上方“基准代码”）。
+  if (params.defensive_enabled) {
+    config.defensive_switch = {
+      enabled: true,
+      benchmark_code: params.benchmark_code?.trim() || undefined,
+    }
+  } else {
+    // 关键：取消勾选必须显式移除 defensive_switch。
+    // config 来自 {...params.preservedConfig}（上一次运行/历史回测的完整 config），
+    // 若不删除，旧 {enabled:true} 会原样带到后端，导致“取消避险仍自动启用”。
+    delete config.defensive_switch
   }
   return config
 }

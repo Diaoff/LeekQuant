@@ -74,8 +74,10 @@ async function deleteBacktest(id: number) {
   }
 }
 
-async function fetchBacktestKlines(backtestId: number, tsCode: string) {
-  return fetchJson<KlineBar[]>(`/api/backtests/${backtestId}/klines?ts_code=${encodeURIComponent(tsCode)}`)
+async function fetchBacktestKlines(backtestId: number, tsCode: string, benchmarkCode?: string | null) {
+  const params = new URLSearchParams({ ts_code: tsCode })
+  if (benchmarkCode) params.set('benchmark_code', benchmarkCode)
+  return fetchJson<{ stock_klines: KlineBar[]; benchmark_klines?: Array<{ date: string; close: number }> }>(`/api/backtests/${backtestId}/klines?${params.toString()}`)
 }
 
 interface KlineBar {
@@ -167,6 +169,27 @@ interface PnlAnalysis {
   stock_rankings: StockRanking[]
 }
 
+interface DefensiveEpisode {
+  entry_date: string
+  exit_date: string | null
+  holdings: string[]
+  return_pct: number
+  benchmark_return_pct?: number | null
+}
+
+interface DefensiveStats {
+  enabled: boolean
+  active: boolean
+  benchmark_code?: string | null
+  pool_size?: number
+  periods: number
+  days: number
+  return_pct: number
+  contribution_pct: number
+  final_mode?: string
+  detail: DefensiveEpisode[]
+}
+
 interface BacktestPerformance {
   sortino_ratio?: number
   calmar_ratio?: number
@@ -178,6 +201,7 @@ interface BacktestPerformance {
   risk_config?: Record<string, number>
   benchmark?: Record<string, unknown>
   monthly_returns?: Record<string, number>
+  defensive?: DefensiveStats
   pnl_analysis?: PnlAnalysis
   stock_rankings?: StockRanking[]
 }
@@ -947,6 +971,7 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
   const [klineCache, setKlineCache] = React.useState<Record<string, KlineBar[]>>(() => result.kline_data ?? {})
   const [klineLoadingTsCode, setKlineLoadingTsCode] = React.useState<string | null>(null)
   const [klineError, setKlineError] = React.useState<string | null>(null)
+  const [benchmarkKlines, setBenchmarkKlines] = React.useState<Array<{ date: string; close: number }> | null>(null)
   const chartRef = React.useRef<HTMLDivElement>(null)
   const klineChartRef = React.useRef<HTMLDivElement>(null)
   const equityChartRef = React.useRef<ChartApi | null>(null)
@@ -962,6 +987,7 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
     setKlineCache(result.kline_data ?? {})
     setKlineLoadingTsCode(null)
     setKlineError(null)
+    setBenchmarkKlines(null)
   }, [result.id, result.kline_data])
 
   React.useEffect(() => {
@@ -978,10 +1004,13 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
     let cancelled = false
     setKlineLoadingTsCode(selectedTsCode)
     setKlineError(null)
-    fetchBacktestKlines(result.id, selectedTsCode)
-      .then((klines) => {
+    fetchBacktestKlines(result.id, selectedTsCode, result.benchmark_code)
+      .then((data) => {
         if (cancelled) return
-        setKlineCache((cache) => ({ ...cache, [selectedTsCode]: klines }))
+        setKlineCache((cache) => ({ ...cache, [selectedTsCode]: data.stock_klines }))
+        if (data.benchmark_klines && data.benchmark_klines.length > 0) {
+          setBenchmarkKlines(data.benchmark_klines)
+        }
       })
       .catch((caught) => {
         if (cancelled) return
@@ -994,7 +1023,7 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
     return () => {
       cancelled = true
     }
-  }, [klineCache, result.id, selectedTsCode])
+  }, [klineCache, result.id, result.benchmark_code, selectedTsCode])
 
   React.useEffect(() => {
     if (!chartRef.current) return
@@ -1089,6 +1118,17 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
         }
       })
     createSeriesMarkers(candleSeries, markers)
+
+    if (benchmarkKlines && benchmarkKlines.length > 0 && result.benchmark_code) {
+      const bmSeries = chart.addSeries(LineSeries, {
+        color: '#60a5fa',
+        lineWidth: 1,
+        crosshairMarkerRadius: 3,
+      }, 1)
+      bmSeries.setData(benchmarkKlines.map(d => ({ time: d.date, value: d.close })))
+      chart.panes()[1]?.setHeight(80)
+    }
+
     chart.timeScale().fitContent()
 
     const handleResize = () => {
@@ -1100,7 +1140,7 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
       klineChartApiRef.current = null
       chart.remove()
     }
-  }, [selectedKlines, selectedTsCode, trades])
+  }, [selectedKlines, selectedTsCode, trades, benchmarkKlines, result.benchmark_code])
 
   const riskCfg = result.performance?.risk_config
   const riskLabel = !riskCfg
@@ -1144,6 +1184,11 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
       }
     }
   }
+
+  const defensive = perf?.defensive
+  const defensiveEpisodes = defensive?.detail ?? []
+  const defensiveRet = Number(defensive?.return_pct ?? 0)
+  const defensiveContrib = Number(defensive?.contribution_pct ?? 0)
 
   return (
     <section className="rounded-lg border border-line bg-panel shadow-sm">
@@ -1214,6 +1259,74 @@ function BacktestDetail({ result, onBack, onRerun }: { result: BacktestResult; o
               <div><div className="text-muted">跟踪误差</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).tracking_error ?? 0) * 100, 2)}%</div></div>
               <div><div className="text-muted">信息比率</div><div className="mt-1 font-mono text-sm text-ink">{formatNumber(Number((perf.benchmark as Record<string, unknown>).information_ratio ?? 0), 2)}</div></div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {defensive && defensive.enabled && (
+        <div className="px-4 pb-2">
+          <div className="rounded-lg border border-line p-3">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-muted">
+                <ShieldAlert className="h-4 w-4 text-amber-600" />
+                避险收益
+                <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${defensive.active ? 'bg-amber-100 text-amber-700' : 'bg-tableHead text-muted'}`}>
+                  {defensive.active ? '已触发' : '未触发'}
+                </span>
+              </div>
+              <span className="text-[10px] text-muted">
+                基准 {defensive.benchmark_code ?? '—'} · 避险库 {defensive.pool_size ?? '—'} 只 · 最终模式 {defensive.final_mode ?? '—'}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-3 text-center text-xs md:grid-cols-4">
+              <div>
+                <div className="text-muted">避险收益</div>
+                <div className={`mt-1 font-mono text-sm ${defensiveRet >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{defensiveRet.toFixed(2)}%</div>
+              </div>
+              <div>
+                <div className="text-muted">对总收益贡献</div>
+                <div className={`mt-1 font-mono text-sm ${defensiveContrib >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{defensiveContrib.toFixed(2)}%</div>
+              </div>
+              <div>
+                <div className="text-muted">避险天数</div>
+                <div className="mt-1 font-mono text-sm text-ink">{defensive.days} 天</div>
+              </div>
+              <div>
+                <div className="text-muted">避险段数</div>
+                <div className="mt-1 font-mono text-sm text-ink">{defensive.periods} 段</div>
+              </div>
+            </div>
+            {defensiveEpisodes.length > 0 && (
+              <div className="mt-3">
+                <div className="mb-1.5 text-xs font-semibold text-muted">避险明细（进入 → 退出 · 持有标的）</div>
+                <div className="max-h-48 overflow-y-auto rounded border border-line">
+                  <table className="w-full text-xs">
+                     <thead className="sticky top-0 bg-tableHead">
+                       <tr className="text-left text-muted">
+                         <th className="px-2.5 py-1.5 font-medium">进入</th>
+                         <th className="px-2.5 py-1.5 font-medium">退出</th>
+                         <th className="px-2.5 py-1.5 font-medium">收益</th>
+                         <th className="px-2.5 py-1.5 font-medium">同期基准</th>
+                         <th className="px-2.5 py-1.5 font-medium">持有</th>
+                       </tr>
+                     </thead>
+                     <tbody>
+                       {defensiveEpisodes.map((ep, index) => (
+                         <tr key={`${ep.entry_date}-${index}`} className="border-t border-line">
+                           <td className="px-2.5 py-1.5 tabular-nums">{ep.entry_date}</td>
+                           <td className="px-2.5 py-1.5 tabular-nums">{ep.exit_date ?? '—'}</td>
+                           <td className={`px-2.5 py-1.5 font-mono tabular-nums ${Number(ep.return_pct) >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{Number(ep.return_pct).toFixed(2)}%</td>
+                           <td className={`px-2.5 py-1.5 font-mono tabular-nums ${ep.benchmark_return_pct != null ? (ep.benchmark_return_pct >= 0 ? 'text-red-600' : 'text-emerald-600') : 'text-muted'}`}>
+                             {ep.benchmark_return_pct != null ? `${ep.benchmark_return_pct >= 0 ? '+' : ''}${ep.benchmark_return_pct.toFixed(2)}%` : '—'}
+                           </td>
+                           <td className="px-2.5 py-1.5 text-muted" title={(ep.holdings ?? []).join(', ')}>{(ep.holdings ?? []).length} 只</td>
+                         </tr>
+                       ))}
+                     </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

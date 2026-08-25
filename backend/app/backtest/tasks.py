@@ -529,6 +529,59 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 if _kl:
                     extra_klines[_name] = _kl
 
+            # ---- 避险切换（跷跷板）数据加载 ----
+            # 前端把避险开关写在 params_snapshot.config.defensive_switch（buildConfig 返回的
+            # 是 config 子对象，会作为 params_snapshot.config 存入）；同时兼容历史顶层写法。
+            # 启用时按「库内人工优先级 sort_order」读取避险库（不计算质量分），并加载其 K 线
+            # 与（可选）独立防御基准。任何缺失都安静降级，不阻断主回测。
+            _runtime_cfg = _decode_json_dict(params_snapshot.get("config"))
+            defensive_cfg = _runtime_cfg.get("defensive_switch")
+            if not isinstance(defensive_cfg, dict):
+                defensive_cfg = _decode_json_dict(params_snapshot.get("defensive_switch"))
+            defensive_enabled = (
+                bool(defensive_cfg.get("enabled"))
+                if isinstance(defensive_cfg, dict) else bool(defensive_cfg)
+            )
+            defensive_pool_codes: list[str] = []
+            defensive_klines: dict[str, list[KBar]] = {}
+            defensive_benchmark_klines: list[KBar] | None = None
+            defensive_benchmark_code: str | None = None
+            defensive_rules: dict[str, Any] = {}
+            defensive_pick_k: int = 0  # 0 = 全池等权买入（避险库手动维护、不计算，前端不暴露择优）
+            if defensive_enabled:
+                if isinstance(defensive_cfg, dict):
+                    defensive_benchmark_code = defensive_cfg.get("benchmark_code") or benchmark_code
+                    defensive_rules = defensive_cfg.get("rules", {}) or {}
+                else:
+                    defensive_benchmark_code = benchmark_code
+                try:
+                    from app.data.seesaw import rank_defensive_pool
+                    # 不限制前几：取全部启用避险池标的
+                    ranked = await rank_defensive_pool(session, limit=200)
+                except Exception as _e:
+                    logger.warning("rank_defensive_pool failed: %s", _e)
+                    ranked = []
+                if ranked:
+                    defensive_pool_codes = ranked
+                    _def_aux_codes = [c for c in [defensive_benchmark_code] if c and c not in aux_codes]
+                    _def_raw = await _fetch_klines_for_codes(
+                        session, list(defensive_pool_codes) + _def_aux_codes, warmup_start, bt_row["end_date"]
+                    )
+                    defensive_klines = {
+                        code: _to_kbars(_def_raw.get(code))
+                        for code in defensive_pool_codes
+                        if _def_raw.get(code)
+                    }
+                    defensive_benchmark_klines = (
+                        _to_kbars(_def_raw.get(defensive_benchmark_code))
+                        if (defensive_benchmark_code and _def_raw.get(defensive_benchmark_code))
+                        else benchmark_klines
+                    )
+                else:
+                    logger.warning(
+                        "defensive switch enabled but defensive pool is empty — switch disabled for this run"
+                    )
+
             # ---- 注入基本面（最近一期已公告财报，防前视）----
             # ts_code -> list[dict]（按 announce_date, report_date 升序，adapter 会再排序+二分）
             # 只在 announce_date <= 回测截止日内的财报参与（更早的已被区间过滤，天然防前视）。
@@ -577,6 +630,12 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 weighting_method=str(strategy_config.get("weighting_method", "equal")),
                 rank_buffer_pct=float(strategy_config.get("rank_buffer_pct", 0.2)),
                 score_max_age_sessions=int(strategy_config.get("score_max_age_sessions", 5)),
+                # 避险切换（跷跷板）
+                defensive_switch_enabled=defensive_enabled,
+                defensive_pool_codes=defensive_pool_codes,
+                defensive_benchmark_code=defensive_benchmark_code,
+                defensive_rules=defensive_rules,
+                defensive_pick_k=defensive_pick_k,
             )
 
             benchmark_code = bt_row.get("benchmark_code")
@@ -596,6 +655,8 @@ def run_backtest_task(self, backtest_id: int) -> dict[str, Any]:
                 benchmark_klines=benchmark_klines,
                 extra_klines=extra_klines,
                 fundamentals=fundamentals,
+                defensive_klines=defensive_klines,
+                defensive_benchmark_klines=defensive_benchmark_klines,
             )
         except Exception as exc:
             import traceback as _tb

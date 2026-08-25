@@ -232,6 +232,14 @@ export default function BacktestRunModal({ title, submitLabel, initialParams, wa
             <label className="text-sm font-medium text-muted">单日最大买入只数（可选）<input type="number" min="0" step="1" value={params.max_daily_buys} onChange={(event) => setParams({ ...params, max_daily_buys: event.target.value })} placeholder="0=不限" className={`mt-1 ${inputClass}`} /></label>
             <p className="mt-6 text-xs leading-relaxed text-muted">限制每个交易日实际建仓（买入）的股票数量，避免一天内集中买入导致过早满仓，使资金分配更平滑、仓位控制更合理。0 表示不限制。</p>
           </div>
+
+          <div className="rounded-md border border-line bg-surface p-3">
+            <label className="flex items-center gap-2 text-sm font-medium text-ink">
+              <input type="checkbox" checked={params.defensive_enabled} onChange={(event) => setParams({ ...params, defensive_enabled: event.target.checked })} className="h-4 w-4 rounded border-line text-accent focus:ring-accent" />
+              启用避险（基准走弱时切换避险资产）
+            </label>
+            <p className="mt-1 text-xs leading-relaxed text-muted">开启后，回测将监测基准（取自上方“基准代码”，默认沪深300）。当基准进入弱势时，清空策略持仓并等权买入整个避险库（避险库标的由人工维护、全部启用，引擎不计算质量分、不限制只数）；转强后回归策略。属于风控动作（减仓/清仓/对冲），不改变策略本身。</p>
+          </div>
           {(error || submitError) && <p id={errorId} role="alert" className="text-sm text-red-600">{error ?? submitError}</p>}
         </div>
         <div className="flex gap-3 border-t border-line px-5 py-4">

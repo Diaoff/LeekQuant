@@ -368,6 +368,53 @@ function RiskConfigSection({
   )
 }
 
+function SeesawSection({
+  account,
+  patchAccount,
+  saving,
+}: {
+  account: Account
+  patchAccount: (id: number, body: Record<string, unknown>, notice?: string) => Promise<void>
+  saving: boolean
+}) {
+  const seesawEnabled = Boolean((account.config as Record<string, unknown> | null)?.['seesaw_enabled'])
+  const seesawMode = String((account.config as Record<string, unknown> | null)?.['seesaw_mode'] ?? 'normal')
+  const inDefensive = seesawMode === 'defensive'
+
+  const toggle = () => {
+    void patchAccount(
+      account.id,
+      { config: { seesaw_enabled: !seesawEnabled } },
+      seesawEnabled ? '已关闭跷跷板自动切换' : '已启用跷跷板自动切换',
+    )
+  }
+
+  return (
+    <section className="rounded-lg border border-line bg-panel p-4">
+      <div className="flex items-center gap-3">
+        <ShieldCheck className="h-4 w-4 text-muted" />
+        <span className="text-sm font-medium text-ink">跷跷板避险自动切换</span>
+        <button
+          type="button"
+          disabled={saving}
+          onClick={toggle}
+          className={
+            'ml-auto inline-flex h-7 items-center rounded-md px-3 text-xs font-medium ' +
+            (seesawEnabled ? 'bg-accent text-white' : 'border border-line text-muted hover:text-ink')
+          }
+        >
+          {seesawEnabled ? '已启用' : '未启用'}
+        </button>
+      </div>
+      <p className="mt-2 text-xs text-muted">
+        大盘转入弱势时自动清仓权益并等权买入避险库；恢复后清回现金。当前状态：
+        <span className="text-ink">{inDefensive ? '避险中' : '常态'}</span>
+        。默认仅推荐，需在此显式启用才会自动交易。
+      </p>
+    </section>
+  )
+}
+
 export default function SimulationPage() {
   const [accounts, setAccounts] = React.useState<Account[]>([])
   const [selectedId, setSelectedId] = React.useState<number | null>(null)
@@ -759,6 +806,8 @@ export default function SimulationPage() {
               </section>
 
               <RiskConfigSection account={selected} patchAccount={patchAccount} saving={saving} />
+
+              <SeesawSection account={selected} patchAccount={patchAccount} saving={saving} />
 
               <RiskGuardSection status={riskGuardStatus} takeProfitBreached={takeProfitBreached} />
 
