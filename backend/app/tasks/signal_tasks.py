@@ -13,6 +13,7 @@ from sqlalchemy import text
 from app.backtest.adapter import BacktestContext, KBar
 from app.backtest.strategy_runtime import StrategyExecutionResult, execute_strategy
 from app.data.stock_scope import supported_stock_sql_condition
+from app.data.fundamentals_sql import latest_fundamental_field
 from app.data.providers import DataProviderError
 from app.preferences.service import get_full_kline_sync_concurrency
 from app.realtime.models import RealtimeTick
@@ -147,21 +148,15 @@ async def _active_strategies(session) -> list[dict[str, Any]]:
 
 
 async def _stock_codes(session) -> list[str]:
+    pe_expr = latest_fundamental_field("pe_ttm", "sb")
     result = await session.execute(
         text(
-            """
-            WITH latest_fund AS (
-                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm
-                FROM stock_fundamentals
-                WHERE report_date IS NOT NULL
-                ORDER BY ts_code, report_date DESC
-            )
+            f"""
             SELECT sb.ts_code
             FROM stock_basic sb
-            LEFT JOIN latest_fund f ON f.ts_code = sb.ts_code
             WHERE sb.is_delisted = FALSE
               AND sb.is_st = FALSE
-              AND (f.pe_ttm IS NULL OR f.pe_ttm > 0)
+              AND ({pe_expr} IS NULL OR {pe_expr} > 0)
               AND """ + supported_stock_sql_condition("sb") + """
             ORDER BY sb.symbol
             """

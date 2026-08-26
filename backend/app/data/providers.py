@@ -5,16 +5,18 @@ import random
 import signal
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import FrameType
 from typing import Any, Protocol
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from app.core.config import get_settings
 from app.data.models import DailyKline, FundFlowDaily, StockBasic, StockFundamental, TradeCalendarDay
 from app.data.normalizers import (
     dataframe_records,
@@ -39,6 +41,7 @@ class ProviderCapability:
     FUNDAMENTALS = "fundamentals"
     REALTIME_QUOTE = "realtime_quote"
     FUND_FLOW = "fund_flow"
+    FINANCIAL_REPORTS = "financial_reports"
 
 
 METHOD_CAPABILITIES = {
@@ -47,6 +50,7 @@ METHOD_CAPABILITIES = {
     "fetch_daily_kline": ProviderCapability.DAILY_KLINE,
     "fetch_stock_fundamentals": ProviderCapability.FUNDAMENTALS,
     "fetch_fund_flow": ProviderCapability.FUND_FLOW,
+    "fetch_financial_reports": ProviderCapability.FINANCIAL_REPORTS,
 }
 
 
@@ -139,17 +143,24 @@ def _parse_ohlc_adaptive(item: list) -> tuple[float, float, float, float] | None
     return None
 
 
-def _http_json(url: str, params: dict[str, Any] | None = None, timeout: int = 15) -> dict[str, Any]:
+def _http_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    timeout: int = 15,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     query = urlencode({k: v for k, v in (params or {}).items() if v is not None})
     full_url = f"{url}?{query}" if query else url
     # 东财 push2/push2his 接口对无 Referer 的请求直接断开连接（RemoteDisconnected）——
     # 必须带 quote 页 Referer + 浏览器 UA 才能通过风控。
-    headers = {
+    request_headers = {
         "User-Agent": UA,
         "Referer": "https://quote.eastmoney.com/",
         "Accept": "*/*",
     }
-    request = Request(full_url, headers=headers)
+    if headers:
+        request_headers.update(headers)
+    request = Request(full_url, headers=request_headers)
     try:
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="ignore")
@@ -996,6 +1007,335 @@ class AkShareProvider:
                 logger.debug("silent except in fetch_realtime_quote")
                 pass
         return result
+
+# ---- 同花顺 Financial-API 辅助（数值/比率/Decimal 转换）----
+_SH_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _hithink_num(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hithink_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    try:
+        return numerator / denominator
+    except ZeroDivisionError:
+        return None
+
+
+def _hithink_decimal(value: float | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(round(float(value), 6)))
+    except (TypeError, ValueError):
+        return None
+
+
+@register_provider
+class HiThinkProvider:
+    """同花顺 Financial-API (REST, https://fuyao.aicubes.cn) provider。
+
+    设计要点：
+    - 需 ``HITHINK_FINANCE_API_KEY``（环境变量），经 ``X-api-key`` 请求头传递；缺失即报错。
+    - 默认 ``enabled_default = False``：注册但不进入通用回退链（避免无 key 时拖累 K 线同步）；
+      由专用补数脚本 ``scripts/backfill_fundamentals_hithink.py`` 直接实例化调用，亦可在
+      数据源管理 UI 手动启用后参与 K 线回退。
+    - 覆盖 ``DAILY_KLINE``（历史日 K，adjust=forward 前复权，与回测 qfq 约定一致）与
+      ``FINANCIAL_REPORTS``（利润表/资产负债表/现金流量表多期序列 → 推导 roe/roa/毛利率/
+      资产负债率/营收同比/净利同比/自由现金流，并落库三张报表 JSON）。
+    - **不**实现 ``fetch_stock_fundamentals``（估值快照 pe/pb/market_cap 由 EastMoney/
+      Tencent/Baostock 负责，同花顺快照接口不返回估值），避免抢走估值源。
+    - **不**覆盖基金/ETF（按需求排除）。
+    """
+
+    name = "hithink"
+    display_name = "HiThink (同花顺)"
+    capabilities = frozenset({
+        ProviderCapability.DAILY_KLINE,
+        ProviderCapability.FINANCIAL_REPORTS,
+    })
+    priority_default = 4
+    enabled_default = False
+    # 批量回填遇限流(429)时的最大重试次数；指数退避上限 30s
+    _MAX_RETRIES = 5
+
+    _BASE_URL = "https://fuyao.aicubes.cn"
+
+    def _api_key(self) -> str:
+        key = get_settings().hithink_finance_api_key
+        if not key:
+            raise DataProviderError(
+                "HITHINK_FINANCE_API_KEY 未配置；请在 .env 设置该变量，"
+                "或通过环境变量/凭据库注入（禁止写入代码/日志/git）"
+            )
+        return key
+
+    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        """调用同花顺 REST 接口，返回 ``data`` 字段；code != 0 抛 DataProviderError。
+
+        对限流(HTTP 429)与瞬时网络/超时错误做指数退避重试，避免批量回填被打断；
+        业务错误（如 code=1002 Unknown thscode）属永久性，直接抛出不重试。
+        """
+        params = {k: v for k, v in params.items() if v is not None}
+        url = f"{self._BASE_URL}{path}"
+        last_exc: Exception | None = None
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                payload = _http_json(url, params, headers={"X-api-key": self._api_key()})
+            except Exception as exc:  # noqa: BLE001 - 仅对瞬时错误退避重试
+                from requests.exceptions import ConnectionError as _ReqConnErr
+
+                last_exc = exc
+                msg = str(exc)
+                transient = (
+                    "429" in msg
+                    or "Too Many" in msg
+                    or "timed out" in msg.lower()
+                    or "timeout" in msg.lower()
+                    or isinstance(exc, _ReqConnErr)
+                )
+                if attempt < self._MAX_RETRIES - 1 and transient:
+                    backoff = min(30.0, 2.0 ** attempt) + random.uniform(0, 1.0)
+                    time.sleep(backoff)
+                    continue
+                raise
+            if not isinstance(payload, dict):
+                raise DataProviderError(f"hithink {path}: 响应格式异常（非 JSON 对象）")
+            code = payload.get("code")
+            if code not in (0, None):
+                # code=2001 表示密钥缺失/无效；其余为业务错误（含 1004/1003 参数错误）
+                raise DataProviderError(
+                    f"hithink {path} 返回 code={code} message={payload.get('message')}"
+                )
+            return payload.get("data") or {}
+        # 理论上不可达：循环必在成功或 raise 中结束；兜底抛出最后一次异常
+        assert last_exc is not None
+        raise last_exc
+
+    @staticmethod
+    def _ms_to_date(ms: int | None) -> date | None:
+        if not ms:
+            return None
+        try:
+            return datetime.fromtimestamp(ms / 1000, tz=_SH_TZ).date()
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    @staticmethod
+    def _sh_midnight_ms(d: date) -> int:
+        return int(datetime(d.year, d.month, d.day, tzinfo=_SH_TZ).timestamp() * 1000)
+
+    @staticmethod
+    def _split_windows(start: date, end: date, years: int = 9) -> list[tuple[date, date]]:
+        """财报时间区间模式窗口跨度上限 10 年；超出则按 ``years`` 分片。"""
+        if end < start:
+            return []
+        windows: list[tuple[date, date]] = []
+        cur = start
+        while cur <= end:
+            nxt = min(cur + timedelta(days=years * 365), end)
+            windows.append((cur, nxt))
+            if nxt >= end:
+                break
+            cur = nxt + timedelta(days=1)
+        return windows
+
+    # ---- 通用 Provider 接口（未覆盖的能力显式不支持）----
+    def fetch_stock_basic(self) -> list[StockBasic]:
+        raise _unsupported(self.name, ProviderCapability.STOCK_BASIC)
+
+    def fetch_trade_calendar(self, start_date: date, end_date: date) -> list[TradeCalendarDay]:
+        raise _unsupported(self.name, ProviderCapability.TRADE_CALENDAR)
+
+    def fetch_stock_fundamentals(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        # 估值快照由 EastMoney/Tencent/Baostock 负责；同花顺不返回 pe/pb，故不实现，
+        # 以免进入通用 fundamentals 回退链后丢失估值数据。财报请走 fetch_financial_reports。
+        raise _unsupported(self.name, ProviderCapability.FUNDAMENTALS)
+
+    def fetch_fund_flow(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[FundFlowDaily]:
+        raise _unsupported(self.name, ProviderCapability.FUND_FLOW)
+
+    # ---- K 线（稳定付费源，作为回退候选；需手动启用）----
+    def fetch_daily_kline(self, ts_code: str, start_date: date, end_date: date) -> list[DailyKline]:
+        records: list[DailyKline] = []
+        for w_start, w_end in self._split_windows(start_date, end_date, years=9):
+            s_ms = self._sh_midnight_ms(w_start)
+            e_ms = self._sh_midnight_ms(w_end + timedelta(days=1)) - 1
+            data = self._get(
+                "/api/a-share/prices/historical",
+                {
+                    "thscode": ts_code,
+                    "interval": "1d",
+                    "start": s_ms,
+                    "end": e_ms,
+                    "adjust": "forward",  # 前复权，与回测 qfq 约定一致
+                },
+            )
+            for item in data.get("item") or []:
+                d = self._ms_to_date(item.get("date_ms"))
+                if d is None:
+                    continue
+                records.append(
+                    normalize_daily_kline(
+                        {
+                            "trade_date": d,
+                            "open": item.get("open_price"),
+                            "high": item.get("high_price"),
+                            "low": item.get("low_price"),
+                            "close": item.get("close_price"),
+                            "volume": item.get("volume"),
+                            "amount": item.get("turnover"),
+                        },
+                        self.name,
+                        ts_code=ts_code,
+                    )
+                )
+        return records
+
+    # ---- 财报（核心缺口补足）----
+    def fetch_financial_reports(
+        self, ts_codes: list[str], start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        """拉取利润表/资产负债表/现金流量表多期序列，推导关键指标并落库三张报表。
+
+        返回每条 ``StockFundamental`` 的 ``report_date`` = 报告期末（period_end），
+        便于回测防前视；估值字段（pe/pb 等）留空，由既有估值源负责。
+        """
+        records: list[StockFundamental] = []
+        for ts_code in ts_codes:
+            try:
+                records.extend(self._fetch_one_financials(ts_code, start_date, end_date))
+            except DataProviderError as exc:
+                logger.warning("hithink financials failed for %s: %s", ts_code, exc)
+                continue
+        return records
+
+    def _fetch_one_financials(
+        self, ts_code: str, start_date: date, end_date: date
+    ) -> list[StockFundamental]:
+        income_items: list[dict[str, Any]] = []
+        balance_items: list[dict[str, Any]] = []
+        cash_items: list[dict[str, Any]] = []
+        for w_start, w_end in self._split_windows(start_date, end_date, years=9):
+            s_ms = self._sh_midnight_ms(w_start)
+            e_ms = self._sh_midnight_ms(w_end + timedelta(days=1)) - 1
+            base = {"thscode": ts_code, "period": "quarterly", "start": s_ms, "end": e_ms}
+            inc = self._get("/api/a-share/financials/income-statements", base).get("item") or []
+            bal = self._get("/api/a-share/financials/balance-sheets", base).get("item") or []
+            cf = self._get("/api/a-share/financials/cash-flow-statements", base).get("item") or []
+            income_items.extend(inc)
+            balance_items.extend(bal)
+            cash_items.extend(cf)
+
+        # 按 (财年, 报告期) 合并三表，便于跨表推导与 YoY
+        merged: dict[tuple[int, str], dict[str, Any]] = {}
+        for kind, items in (
+            ("income", income_items),
+            ("balance", balance_items),
+            ("cash", cash_items),
+        ):
+            for it in items:
+                key = (it.get("fiscal_year"), it.get("fiscal_period"))
+                if key[0] is None or key[1] is None:
+                    continue
+                merged.setdefault(key, {})[kind] = it
+
+        out: list[StockFundamental] = []
+        for (fy, fp), blob in merged.items():
+            inc = blob.get("income") or {}
+            bal = blob.get("balance") or {}
+            cf = blob.get("cash") or {}
+            operating_income = _hithink_num(inc.get("operating_income"))
+            operating_costs = _hithink_num(inc.get("operating_costs"))
+            net_profit = _hithink_num(inc.get("parent_holder_net_profit")) or _hithink_num(
+                inc.get("net_profit")
+            )
+            equity = _hithink_num(bal.get("holder_equity_total"))
+            assets = _hithink_num(bal.get("assets_total"))
+            total_debt = _hithink_num(bal.get("total_debt"))
+            cfo = _hithink_num(cf.get("act_cash_flow_net"))
+            capex = _hithink_num(cf.get("pay_fixed_assets_etc_cash"))
+
+            # 部分行业（银行/保险等）operating_costs 为空，毛利率不可得，置空而非崩溃
+            gross_margin = (
+                _hithink_ratio(operating_income - operating_costs, operating_income)
+                if operating_costs is not None
+                else None
+            )
+            roe = _hithink_ratio(net_profit, equity)
+            roa = _hithink_ratio(net_profit, assets)
+            debt_to_equity = _hithink_ratio(total_debt, assets)  # 实际存资产负债率
+            free_cash_flow = (cfo - capex) if (cfo is not None and capex is not None) else cfo
+
+            # YoY：取去年同期同报告期
+            prev = merged.get((fy - 1, fp), {}).get("income") or {}
+            prev_oi = _hithink_num(prev.get("operating_income"))
+            prev_np = _hithink_num(prev.get("parent_holder_net_profit")) or _hithink_num(
+                prev.get("net_profit")
+            )
+            # YoY：取去年同期同报告期；缺失或基期为 0 时无法计算，置空
+            revenue_growth = (
+                _hithink_ratio(operating_income - prev_oi, prev_oi)
+                if prev_oi not in (None, 0)
+                else None
+            )
+            net_profit_growth = (
+                _hithink_ratio(net_profit - prev_np, prev_np)
+                if prev_np not in (None, 0)
+                else None
+            )
+
+            report_date = self._ms_to_date(
+                inc.get("period_end_ms") or bal.get("period_end_ms") or cf.get("period_end_ms")
+            )
+            announce_date = self._ms_to_date(
+                inc.get("report_date_ms") or bal.get("report_date_ms") or cf.get("report_date_ms")
+            )
+            if report_date is None:
+                continue
+
+            out.append(
+                StockFundamental(
+                    ts_code=ts_code,
+                    report_date=report_date,
+                    announce_date=announce_date,
+                    pe_ttm=None,
+                    pb=None,
+                    ps_ttm=None,
+                    pcf_ttm=None,
+                    roe=_hithink_decimal(roe),
+                    roa=_hithink_decimal(roa),
+                    market_cap=None,
+                    float_market_cap=None,
+                    dividend_yield=None,
+                    revenue=_hithink_decimal(operating_income),
+                    net_profit=_hithink_decimal(net_profit),
+                    revenue_growth=_hithink_decimal(revenue_growth),
+                    net_profit_growth=_hithink_decimal(net_profit_growth),
+                    gross_margin=_hithink_decimal(gross_margin),
+                    debt_to_equity=_hithink_decimal(debt_to_equity),
+                    current_ratio=None,
+                    free_cash_flow=_hithink_decimal(free_cash_flow),
+                    income_statement=inc or None,
+                    balance_sheet=bal or None,
+                    cashflow_statement=cf or None,
+                    data_source=self.name,
+                )
+            )
+        return out
+
 
 register_provider(ADataProvider)
 register_provider(BaostockProvider)

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     log_format: str = Field(default="json", alias="LOG_FORMAT")
     metrics_enabled: bool = Field(default=True, alias="METRICS_ENABLED")
     data_max_retries: int = Field(default=3, alias="DATA_MAX_RETRIES")
+    # 同花顺 Financial-API (https://fuyao.aicubes.cn) 访问密钥；经 X-api-key 请求头传递。
+    # 严禁写入代码/日志/git；仅通过环境变量或凭据库注入。为空时 HiThinkProvider 直接报错。
+    hithink_finance_api_key: str | None = Field(default=None, alias="HITHINK_FINANCE_API_KEY")
     # Celery task time limits (seconds). The app-wide defaults bound any task
     # that does not set its own limit.
     celery_task_soft_time_limit: int = Field(

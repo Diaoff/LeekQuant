@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.fetcher import DataProvider, DataProviderError, default_providers, fetch_with_fallback, filter_open_circuits, get_data_proxy_url
+from app.data.fundamentals_sql import fundamental_select_fragment, latest_fundamental_field
 from app.data.normalizers import normalize_ts_code
 from app.data.repository import (
     create_alert,
@@ -156,9 +157,9 @@ def _stock_where(filters: StockFilters, *, include_query: bool = True) -> tuple[
         clauses.append("s.is_st = FALSE")
     if filters.exclude_delisted:
         clauses.append("(s.is_delisted = FALSE AND s.delist_date IS NULL)")
-    _range_filter("f.pe_ttm", filters.pe_min, filters.pe_max, clauses, params, "pe")
-    _range_filter("f.pb", filters.pb_min, filters.pb_max, clauses, params, "pb")
-    _range_filter("f.market_cap", filters.market_cap_min, filters.market_cap_max, clauses, params, "market_cap")
+    _range_filter(latest_fundamental_field("pe_ttm"), filters.pe_min, filters.pe_max, clauses, params, "pe")
+    _range_filter(latest_fundamental_field("pb"), filters.pb_min, filters.pb_max, clauses, params, "pb")
+    _range_filter(latest_fundamental_field("market_cap"), filters.market_cap_min, filters.market_cap_max, clauses, params, "market_cap")
     return clauses, params
 
 
@@ -211,14 +212,8 @@ async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 
     count_result = await session.execute(
         text(
             f"""
-            WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) *
-                FROM stock_fundamentals
-                ORDER BY ts_code, report_date DESC
-            )
             SELECT COUNT(*)
             FROM stock_basic s
-            LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
             {where_sql}
             """
         ),
@@ -229,20 +224,12 @@ async def list_stocks(session: AsyncSession, filters: StockFilters, page: int = 
     rows_result = await session.execute(
         text(
             f"""
-            WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm, pb, ps_ttm, pcf_ttm,
-                       market_cap, float_market_cap, report_date, data_source
-                FROM stock_fundamentals
-                ORDER BY ts_code, report_date DESC
-            ),
-            page_stocks AS (
+            WITH page_stocks AS (
                 SELECT
                     s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
                     s.list_date, s.delist_date, s.is_st, s.is_delisted,
-                    f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
-                    f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source
+                    {fundamental_select_fragment("s")}
                 FROM stock_basic s
-                LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
                 {where_sql}
                 ORDER BY s.symbol
                 LIMIT :limit OFFSET :offset
@@ -282,21 +269,13 @@ async def _list_stocks_with_fuzzy_query(
     result = await session.execute(
         text(
             f"""
-            WITH latest_fundamentals AS (
-                SELECT DISTINCT ON (ts_code) ts_code, pe_ttm, pb, ps_ttm, pcf_ttm,
-                       market_cap, float_market_cap, report_date, data_source
-                FROM stock_fundamentals
-                ORDER BY ts_code, report_date DESC
-            )
             SELECT
                 s.ts_code, s.symbol, s.name, s.market, s.exchange, s.industry, s.area,
                 s.list_date, s.delist_date, s.is_st, s.is_delisted,
-                f.report_date, f.pe_ttm, f.pb, f.ps_ttm, f.pcf_ttm,
-                f.market_cap, f.float_market_cap, f.data_source AS fundamentals_source,
+                {fundamental_select_fragment("s")},
                 k.trade_date AS latest_trade_date, k.close AS latest_close,
                 COALESCE(kc.count, 0) AS daily_kline_count
             FROM stock_basic s
-            LEFT JOIN latest_fundamentals f ON f.ts_code = s.ts_code
             LEFT JOIN LATERAL (
                 SELECT trade_date, close FROM daily_kline
                 WHERE ts_code = s.ts_code ORDER BY trade_date DESC LIMIT 1

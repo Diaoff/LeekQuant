@@ -603,3 +603,296 @@ def test_provider_supports_fund_flow_capability() -> None:
     provider = AkShareFundFlowProvider()
     assert provider_supports(provider, ProviderCapability.FUND_FLOW)
     assert not provider_supports(provider, ProviderCapability.DAILY_KLINE)
+
+
+# ---------------------------------------------------------------------------
+# HiThinkProvider (同花顺 Financial-API) — 集成测试
+# ---------------------------------------------------------------------------
+
+class _FakeSettings:
+    hithink_finance_api_key = "test-key"
+
+
+@pytest.fixture
+def hithink_key(monkeypatch) -> None:
+    monkeypatch.setattr(providers, "get_settings", lambda: _FakeSettings())
+
+
+def test_hithink_missing_api_key_raises(monkeypatch) -> None:
+    class _NoKey:
+        hithink_finance_api_key = None
+
+    monkeypatch.setattr(providers, "get_settings", lambda: _NoKey())
+    from app.data.providers import DataProviderError, HiThinkProvider
+
+    with pytest.raises(DataProviderError):
+        HiThinkProvider().fetch_daily_kline("000001.SZ", date(2026, 1, 1), date(2026, 1, 2))
+
+
+def test_hithink_daily_kline_maps_fields_and_requests_forward_adjust(hithink_key, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        captured["url"] = url
+        captured["params"] = params
+        captured["headers"] = headers
+        return {
+            "code": 0,
+            "data": {
+                "item": [
+                    {
+                        "date_ms": 1_718_601_600_000,  # 2024-06-17 (UTC) → 上海 2024-06-17
+                        "open_price": 10.0,
+                        "high_price": 10.8,
+                        "low_price": 9.9,
+                        "close_price": 10.5,
+                        "volume": 123456,
+                        "turnover": 129530880.0,
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+
+    from app.data.providers import HiThinkProvider
+
+    records = HiThinkProvider().fetch_daily_kline("000001.SZ", date(2024, 6, 17), date(2024, 6, 17))
+
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.ts_code == "000001.SZ"
+    assert rec.trade_date == date(2024, 6, 17)
+    assert rec.open == Decimal("10.0")
+    assert rec.close == Decimal("10.5")
+    assert rec.high == Decimal("10.8")
+    assert rec.low == Decimal("9.9")
+    assert rec.volume == 123456
+    assert rec.amount == Decimal("129530880.0")
+    assert rec.data_source == "hithink"
+    # 前复权约定
+    assert captured["params"]["adjust"] == "forward"
+    assert captured["headers"]["X-api-key"] == "test-key"
+    assert captured["url"].endswith("/api/a-share/prices/historical")
+
+
+def test_hithink_daily_kline_splits_long_windows(hithink_key, monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        calls.append(params)
+        return {"code": 0, "data": {"item": []}}
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+
+    from app.data.providers import HiThinkProvider
+
+    # 跨度 20 年，应被拆成多个 ≤9 年窗口
+    HiThinkProvider().fetch_daily_kline("000001.SZ", date(2000, 1, 1), date(2020, 1, 1))
+
+    assert len(calls) > 1
+    # 每个窗口跨度不超过 ~9 年 + 1 天
+    for params in calls:
+        start_s = params["start"] // 1000
+        end_s = params["end"] // 1000
+        span_days = (end_s - start_s) / 86400
+        assert span_days <= 9 * 365 + 2
+
+
+def test_hithink_financial_reports_derives_fundamentals(hithink_key, monkeypatch) -> None:
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        # 三张表：2023Q4 与 2024Q4 两期，便于算 YoY
+        if url.endswith("/income-statements"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2023, "fiscal_period": "Q4",
+                    "operating_income": 1000.0, "operating_costs": 600.0,
+                    "parent_holder_net_profit": 100.0, "net_profit": 100.0,
+                    "period_end_ms": 1_704_060_800_000, "report_date_ms": 1_706_803_200_000,
+                },
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q4",
+                    "operating_income": 1200.0, "operating_costs": 660.0,
+                    "parent_holder_net_profit": 150.0, "net_profit": 150.0,
+                    "period_end_ms": 1_735_641_600_000, "report_date_ms": 1_738_406_400_000,
+                },
+            ]}}
+        if url.endswith("/balance-sheets"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2023, "fiscal_period": "Q4",
+                    "holder_equity_total": 500.0, "assets_total": 1000.0, "total_debt": 400.0,
+                    "period_end_ms": 1_704_060_800_000,
+                },
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q4",
+                    "holder_equity_total": 600.0, "assets_total": 1100.0, "total_debt": 450.0,
+                    "period_end_ms": 1_735_641_600_000,
+                },
+            ]}}
+        if url.endswith("/cash-flow-statements"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2023, "fiscal_period": "Q4",
+                    "act_cash_flow_net": 80.0, "pay_fixed_assets_etc_cash": 30.0,
+                    "period_end_ms": 1_704_060_800_000,
+                },
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q4",
+                    "act_cash_flow_net": 90.0, "pay_fixed_assets_etc_cash": 40.0,
+                    "period_end_ms": 1_735_641_600_000,
+                },
+            ]}}
+        return {"code": 0, "data": {"item": []}}
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+
+    from app.data.providers import HiThinkProvider
+
+    records = HiThinkProvider().fetch_financial_reports(
+        ["000001.SZ"], date(2023, 1, 1), date(2024, 12, 31)
+    )
+
+    # 两期合并
+    assert len(records) == 2
+    by_year = {r.report_date.year: r for r in records}
+    r2024 = by_year[2024]
+    # 毛利率 = (1200-660)/1200 = 0.45
+    assert r2024.gross_margin == Decimal("0.45")
+    # ROE = 150/600 = 0.25
+    assert r2024.roe == Decimal("0.25")
+    # 资产负债率 = 450/1100 ≈ 0.409091（6 位小数精度）
+    assert r2024.debt_to_equity == Decimal("0.409091")
+    # 自由现金流 = 90 - 40 = 50
+    assert r2024.free_cash_flow == Decimal("50")
+    # 营收同比 = (1200-1000)/1000 = 0.2
+    assert r2024.revenue_growth == Decimal("0.2")
+    # 净利同比 = (150-100)/100 = 0.5
+    assert r2024.net_profit_growth == Decimal("0.5")
+    # 估值字段保持空（由既有估值源负责）
+    assert r2024.pe_ttm is None and r2024.pb is None
+    assert r2024.data_source == "hithink"
+    # 三张报表原始 JSON 已落库
+    assert r2024.income_statement and r2024.balance_sheet and r2024.cashflow_statement
+
+
+def test_hithink_financial_reports_handles_null_operating_costs(hithink_key, monkeypatch) -> None:
+    """银行/保险等行业的 operating_costs 为 None（无 COGS），毛利率不可得，
+    须置空且不得崩溃；ROE/资产负债率/自由现金流等仍可正常推导。"""
+
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        if url.endswith("/income-statements"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q2",
+                    "operating_income": 70617000000.0, "operating_costs": None,
+                    "parent_holder_net_profit": 25696000000.0, "net_profit": 25696000000.0,
+                    "period_end_ms": 1_782_748_800_000, "report_date_ms": 1_786_723_200_000,
+                },
+            ]}}
+        if url.endswith("/balance-sheets"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q2",
+                    "holder_equity_total": 548214000000.0, "assets_total": 6028785000000.0,
+                    "total_debt": 5480571000000.0, "period_end_ms": 1_782_748_800_000,
+                },
+            ]}}
+        if url.endswith("/cash-flow-statements"):
+            return {"code": 0, "data": {"item": [
+                {
+                    "fiscal_year": 2024, "fiscal_period": "Q2",
+                    "act_cash_flow_net": 215012000000.0, "pay_fixed_assets_etc_cash": 666000000.0,
+                    "period_end_ms": 1_782_748_800_000,
+                },
+            ]}}
+        return {"code": 0, "data": {"item": []}}
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+
+    from app.data.providers import HiThinkProvider
+
+    records = HiThinkProvider().fetch_financial_reports(
+        ["000001.SZ"], date(2024, 1, 1), date(2024, 12, 31)
+    )
+    assert len(records) == 1
+    r = records[0]
+    # 毛利率因 operating_costs=None 而置空（非崩溃）
+    assert r.gross_margin is None
+    # 其余指标仍正确推导
+    # ROE = 25696000000 / 548214000000 ≈ 0.046873
+    assert abs(float(r.roe) - 25696000000 / 548214000000) < 1e-6
+    # 资产负债率 = 5480571000000 / 6028785000000 ≈ 0.909110
+    assert abs(float(r.debt_to_equity) - 5480571000000 / 6028785000000) < 1e-6
+    # 自由现金流 = 215012000000 - 666000000 = 214346000000
+    assert r.free_cash_flow == Decimal("214346000000")
+    # 无去年同期 → 同比为空
+    assert r.revenue_growth is None and r.net_profit_growth is None
+
+
+def test_hithink_unsupported_methods_raise(hithink_key) -> None:
+    from app.data.providers import DataProviderError, HiThinkProvider
+
+    provider = HiThinkProvider()
+    # fetch_stock_basic 无参数；fetch_trade_calendar(start, end)；
+    # fetch_stock_fundamentals / fetch_fund_flow(ts_codes, start, end)
+    with pytest.raises(DataProviderError):
+        provider.fetch_stock_basic()
+    with pytest.raises(DataProviderError):
+        provider.fetch_trade_calendar(date(2024, 1, 1), date(2024, 12, 31))
+    for method in (
+        provider.fetch_stock_fundamentals,
+        provider.fetch_fund_flow,
+    ):
+        with pytest.raises(DataProviderError):
+            method(["000001.SZ"], date(2024, 1, 1), date(2024, 12, 31))
+
+
+def test_hithink_registered_and_disabled_by_default() -> None:
+    from app.data.providers import HiThinkProvider, provider_metadata
+
+    meta = {item["name"]: item for item in provider_metadata()}
+    assert "hithink" in meta
+    assert meta["hithink"]["enabled"] is False
+    assert set(meta["hithink"]["capabilities"]) >= {"daily_kline", "financial_reports"}
+    assert not provider_supports(HiThinkProvider(), ProviderCapability.FUNDAMENTALS)
+
+
+def test_hithink_get_retries_on_429_then_succeeds(hithink_key, monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            # 模拟同花顺限流：HTTP 429 被 _http_json 包成 ConnectionError
+            raise RuntimeError("http request failed for %s: HTTP Error 429: Too Many Request" % url)
+        return {"code": 0, "data": {"ok": 1}}
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+    monkeypatch.setattr(providers.time, "sleep", lambda *_a, **_k: None)  # 不真睡
+
+    from app.data.providers import HiThinkProvider
+
+    data = HiThinkProvider()._get("/api/a-share/prices/historical", {"thscode": "000001.SZ"})
+    assert data == {"ok": 1}
+    # 前两次 429 + 第三次成功 = 3 次调用
+    assert calls["n"] == 3
+
+
+def test_hithink_get_does_not_retry_business_error(hithink_key, monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_http_json(url, params=None, _timeout=15, headers=None):
+        calls["n"] += 1
+        # 业务错误（Unknown thscode）属永久性，不应重试
+        return {"code": 1002, "message": "Unknown thscode: 000922.SH", "data": None}
+
+    monkeypatch.setattr(providers, "_http_json", fake_http_json)
+
+    from app.data.providers import DataProviderError, HiThinkProvider
+
+    with pytest.raises(DataProviderError):
+        HiThinkProvider()._get("/api/a-share/financials/income-statements", {"thscode": "000922.SH"})
+    # 只调用一次，未重试
+    assert calls["n"] == 1
+

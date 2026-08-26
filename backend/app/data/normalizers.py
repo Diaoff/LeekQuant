@@ -225,9 +225,11 @@ def normalize_stock_fundamental(
       PE/PB for that trading day) and stamps each row with its own K-line
       date, preserving daily history.
 
-    Both semantics are valid "snapshot date"; the ``latest_fund`` CTE in
-    ``signal_tasks`` relies on ``ORDER BY report_date DESC`` to pick the
-    freshest snapshot, which works for both shapes.
+    Both semantics are valid "snapshot date". Stock queries now resolve
+    fundamentals **field-wise** (a correlated subquery returning the latest
+    *non-null* value per column, see ``app.data.fundamentals_sql``) rather than
+    picking the whole freshest row, so a daily valuation snapshot no longer
+    shadows the financial-report-derived fields (roe / gross_margin / ...).
     """
     row_ts_code = ts_code or first_value(row, "ts_code", "code", "股票代码", "证券代码")
     normalized_code = normalize_ts_code(row_ts_code)
