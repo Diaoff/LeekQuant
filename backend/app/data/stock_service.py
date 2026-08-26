@@ -353,11 +353,6 @@ async def list_watchlist(
     result = await session.execute(
         text(
             f"""
-            WITH latest_kline AS (
-                SELECT DISTINCT ON (ts_code) ts_code, trade_date, close, pre_close
-                FROM daily_kline
-                ORDER BY ts_code, trade_date DESC
-            )
             SELECT
                 w.id, w.group_name, w.ts_code, w.sort_order, w.note, w.added_at,
                 s.name, s.industry, s.market, s.exchange, s.is_st, s.is_delisted,
@@ -366,7 +361,13 @@ async def list_watchlist(
                 ak.close AS added_close
             FROM watchlist w
             JOIN stock_basic s ON s.ts_code = w.ts_code
-            LEFT JOIN latest_kline k ON k.ts_code = w.ts_code
+            LEFT JOIN LATERAL (
+                SELECT trade_date, close, pre_close
+                FROM daily_kline
+                WHERE ts_code = w.ts_code
+                ORDER BY trade_date DESC
+                LIMIT 1
+            ) k ON TRUE
             LEFT JOIN LATERAL (
                 SELECT close
                 FROM daily_kline
